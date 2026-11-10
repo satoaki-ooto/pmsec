@@ -172,6 +172,7 @@ CASES = [
         None,
         {"PMSEC_MISE_VERSION": "2026.10.25"},
         ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml", ".config/mise/miserc.local.toml"]},
     ),
     (
         "enable_mise_reverse_migration_config_dir",
@@ -182,6 +183,7 @@ CASES = [
         None,
         {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_CONFIG_DIR": "<HOME>/mise-custom"},
         ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": ["mise-custom/config.pmsec.toml", "mise-custom/miserc.local.toml"]},
     ),
     (
         "enable_mise_reverse_migration_aliased_global",
@@ -203,6 +205,7 @@ CASES = [
         None,
         {"PMSEC_MISE_VERSION": "2026.11.0", "MISE_GLOBAL_CONFIG_FILE": "<HOME>/custom-global.toml"},
         ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml", ".config/mise/miserc.local.toml"]},
     ),
     (
         "enable_mise_new_mode_shared_env_inherit",
