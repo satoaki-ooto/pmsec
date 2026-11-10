@@ -782,5 +782,29 @@ t_mise_legacy_migration_follows_config_dir() {
 
 T "mise legacy migration follows MISE_CONFIG_DIR" t_mise_legacy_migration_follows_config_dir
 
+# A failed mise cleanup must surface as a failed disable, not a skip: the
+# legacy file keeps its managed key and pmsec exits nonzero.
+t_disable_reports_failed_mise_cleanup() {
+  local home; home=$(setup_home)
+  local mise="$home/.config/mise"
+  mkdir -p "$mise"
+  printf '[settings]\nminimum_release_age = "7d"\n' > "$mise/config.toml"
+  local out rc content
+  chmod 555 "$mise"
+  out=$(run_pmsec "$home" -- --disable --tool mise 2>&1); rc=$?
+  chmod 755 "$mise"
+  content=$(cat "$mise/config.toml")
+  rm -rf -- "$home"
+  assert_eq "disable exits nonzero" "1" "$rc" || return 1
+  assert_match "disable reports FAIL" 'FAIL' "$out" || return 1
+  assert_match "config keeps managed key" '^minimum_release_age = "7d"$' "$content"
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+  printf 'SKIP  disable reports a failed mise cleanup (root bypasses permission bits)\n'
+else
+  T "disable reports a failed mise cleanup" t_disable_reports_failed_mise_cleanup
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

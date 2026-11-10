@@ -1363,6 +1363,8 @@ _mise_buf_only_structure() {
 }
 
 # Remove pmsec-managed keys from a config file. Never deletes it.
+# Returns 0 when keys were removed, 1 when there was nothing to remove, and
+# 2 when a write failed — callers must not treat a failed cleanup as "skip".
 mise_remove_managed_from() {
   local path="$1" ek ev el es esec esafe removed=0
   [ -e "$path" ] || return 1
@@ -1373,11 +1375,12 @@ mise_remove_managed_from() {
     lines_remove_key "$ek" "$es" "$esec" && removed=1
   done < <(tool_extras mise)
   [ "$removed" = "1" ] || return 1
-  lines_dump | write_atomic "$path"
+  if ! lines_dump | write_atomic "$path"; then return 2; fi
+  return 0
 }
 
 # Remove pmsec-managed keys from config.pmsec.toml; delete it when nothing but
-# whitespace / empty section headers remain.
+# whitespace / empty section headers remain. Same 0/1/2 contract.
 mise_remove_managed_config() {
   local path="$1" ek ev el es esec esafe removed=0
   [ -e "$path" ] || return 1
@@ -1388,18 +1391,29 @@ mise_remove_managed_config() {
     lines_remove_key "$ek" "$es" "$esec" && removed=1
   done < <(tool_extras mise)
   [ "$removed" = "1" ] || return 1
-  if _mise_buf_only_structure; then rm -f -- "$path"; else lines_dump | write_atomic "$path"; fi
+  if _mise_buf_only_structure; then
+    rm -f -- "$path" || return 2
+  elif ! lines_dump | write_atomic "$path"; then
+    return 2
+  fi
+  return 0
 }
 
 # Remove the pmsec selector from miserc.local.toml. Other env names/keys survive.
+# 0 = removed, 1 = nothing to remove, 2 = invalid env or failed write.
 mise_remove_selector() {
   local localp="$1" r
   [ -e "$localp" ] || return 1
   lines_load "$localp"
   miserc_parse_env; r=$?
-  [ "$r" = "0" ] || return 1
+  [ "$r" = "0" ] || return 2
   miserc_remove_env_value "pmsec" || return 1
-  if _miserc_buf_empty; then rm -f -- "$localp"; else lines_dump | write_atomic "$localp"; fi
+  if _miserc_buf_empty; then
+    rm -f -- "$localp" || return 2
+  elif ! lines_dump | write_atomic "$localp"; then
+    return 2
+  fi
+  return 0
 }
 
 tool_write_mise() {
@@ -1440,11 +1454,20 @@ tool_write_mise() {
 }
 
 tool_unset_mise() {
-  local legacy pmsec localp removed=0
+  # Print 1 when something was removed, 0 when there was nothing to remove,
+  # and exit 2 when a cleanup write failed: --disable must not report a
+  # successful removal while settings or the selector are still in place.
+  local legacy pmsec localp removed=0 r
   legacy=$(path_mise); pmsec=$(path_mise_pmsec); localp=$(path_mise_local_miserc)
-  mise_remove_managed_from "$legacy" && removed=1
-  mise_remove_managed_config "$pmsec" && removed=1
-  mise_remove_selector "$localp" && removed=1
+  mise_remove_managed_from "$legacy"; r=$?
+  [ "$r" = "2" ] && return 2
+  [ "$r" = "0" ] && removed=1
+  mise_remove_managed_config "$pmsec"; r=$?
+  [ "$r" = "2" ] && return 2
+  [ "$r" = "0" ] && removed=1
+  mise_remove_selector "$localp"; r=$?
+  [ "$r" = "2" ] && return 2
+  [ "$r" = "0" ] && removed=1
   printf '%d' "$removed"
 }
 
