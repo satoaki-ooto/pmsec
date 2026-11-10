@@ -363,10 +363,11 @@ def write(days: int, ctx: Context) -> dict:
         _remove_managed_from(p["legacy"])
         return {"path": str(p["pmsec"]), "warn": _env_warning(ctx)}
 
-    artifacts = _has_new_artifacts(ctx, p)
     settings = _apply_settings(_read(p["legacy"]), days, ctx)
     write_atomic(p["legacy"], settings)
-    if artifacts:
+    # Judged after the write: replacing a hard-linked legacy file leaves the
+    # pmsec link as a distinct file that still holds managed keys.
+    if _has_new_artifacts(ctx, p):
         # Write the destination before cleaning the new generation so an
         # interrupted cleanup cannot create a no-config gap.
         if not _paths_aliased(p):

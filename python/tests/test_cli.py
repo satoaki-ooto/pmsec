@@ -656,6 +656,20 @@ def test_mise_reverse_migration_keeps_case_variant_global_alias():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_mise_legacy_enable_converges_with_hard_linked_configs(tmp_path):
+    d = tmp_path / ".config" / "mise"
+    d.mkdir(parents=True)
+    (d / "config.pmsec.toml").write_text('[settings]\nminimum_release_age = "3d"\n')
+    try:
+        os.link(d / "config.pmsec.toml", d / "config.toml")
+    except OSError as e:
+        pytest.skip(f"cannot create a hard link: {e}")
+    env = {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_GLOBAL_CONFIG_FILE": str(d / "config.toml")}
+    assert run(["--tool", "mise", "--days", "1"], tmp_path, **env)[0] == 0
+    assert re.search(r'^minimum_release_age = "3d"$', (d / "config.toml").read_text(), re.M)
+    assert run(["--tool", "mise", "--check"], tmp_path, **env)[0] == 0
+
+
 def test_mise_reverse_migration_keeps_global_alias_through_linked_config_dir(tmp_path):
     real = tmp_path / "real"
     real.mkdir()

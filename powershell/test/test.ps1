@@ -445,6 +445,24 @@ T 'mise reverse migration keeps a MISE_GLOBAL_CONFIG_FILE alias reached through 
   }
 }
 
+T 'mise legacy enable converges when config.toml is hard-linked to config.pmsec.toml' {
+  $h = NewHome
+  try {
+    $d = PathJoin $h '.config' 'mise'
+    [void](New-Item -ItemType Directory -Path $d -Force)
+    [System.IO.File]::WriteAllText((PathJoin $d 'config.pmsec.toml'), "[settings]`nminimum_release_age = `"3d`"`n")
+    [void](New-Item -ItemType HardLink -Path (PathJoin $d 'config.toml') -Value (PathJoin $d 'config.pmsec.toml'))
+    $vars = @{ PMSEC_MISE_VERSION = '2026.10.25'; MISE_GLOBAL_CONFIG_FILE = (PathJoin $d 'config.toml') }
+    if ($onWindows) { $vars.PMSEC_FAKE_SCOPES = "windows|$h|win32"; $vars.LOCALAPPDATA = (PathJoin $h 'AppData' 'Local') }
+    $r = InvokePmsec $h $vars @('--tool','mise','--days','1')
+    if ($r.Code -ne 0) { $script:LastFail = "enable exit $($r.Code)"; return $false }
+    if (-not (AssertMatch 'legacy keeps stricter value' '(?m)^minimum_release_age = "3d"$' ([System.IO.File]::ReadAllText((PathJoin $d 'config.toml'))))) { return $false }
+    $r = InvokePmsec $h $vars @('--tool','mise','--check')
+    if ($r.Code -ne 0) { $script:LastFail = "check after enable exit $($r.Code)"; return $false }
+    return $true
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
 # Needs a case-insensitive filesystem: the default temp dir on Windows, or
 # PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere.
 $casefoldRoot = if ($env:PMSEC_TEST_CASEFOLD_DIR) { $env:PMSEC_TEST_CASEFOLD_DIR } else { [System.IO.Path]::GetTempPath() }

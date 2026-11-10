@@ -687,6 +687,19 @@ test("mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias"
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
+test("mise legacy enable converges when config.toml is hard-linked to config.pmsec.toml", async () => {
+  const { link } = await import("node:fs/promises");
+  const home = await setupHome();
+  const dir = join(home, ".config", "mise");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "config.pmsec.toml"), '[settings]\nminimum_release_age = "3d"\n');
+  await link(join(dir, "config.pmsec.toml"), join(dir, "config.toml"));
+  const env = { PMSEC_MISE_VERSION: "2026.10.25", MISE_GLOBAL_CONFIG_FILE: join(dir, "config.toml") };
+  assert.equal((await runCli(["--tool", "mise", "--days", "1"], home, "linux", env)).code, 0);
+  assert.match(await readFile(join(dir, "config.toml"), "utf8"), /^minimum_release_age = "3d"$/m);
+  assert.equal((await runCli(["--tool", "mise", "--check"], home, "linux", env)).code, 0);
+});
+
 test("mise reverse migration keeps a MISE_GLOBAL_CONFIG_FILE alias reached through a linked MISE_CONFIG_DIR", async () => {
   const { symlink } = await import("node:fs/promises");
   const home = await setupHome();

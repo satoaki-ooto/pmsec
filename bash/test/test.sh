@@ -826,6 +826,23 @@ t_mise_reverse_migration_linked_config_dir_alias() {
 
 T "mise reverse migration keeps a MISE_GLOBAL_CONFIG_FILE alias reached through a linked MISE_CONFIG_DIR" t_mise_reverse_migration_linked_config_dir_alias
 
+t_mise_legacy_enable_hard_linked_configs() {
+  local home; home=$(mktemp -d)
+  local d="$home/.config/mise" rc
+  mkdir -p "$d"
+  printf '[settings]\nminimum_release_age = "3d"\n' > "$d/config.pmsec.toml"
+  ln "$d/config.pmsec.toml" "$d/config.toml"
+  local env=(PMSEC_MISE_VERSION=2026.10.25 MISE_GLOBAL_CONFIG_FILE="$d/config.toml")
+  run_pmsec "$home" "${env[@]}" -- --tool mise --days 1 >/dev/null 2>&1; rc=$?
+  assert_eq "enable exit" "0" "$rc" || { rm -rf -- "$home"; return 1; }
+  assert_match "legacy keeps stricter value" '^minimum_release_age = "3d"$' "$(cat "$d/config.toml" 2>/dev/null)" || { rm -rf -- "$home"; return 1; }
+  run_pmsec "$home" "${env[@]}" -- --tool mise --check >/dev/null 2>&1; rc=$?
+  assert_eq "check after enable" "0" "$rc" || { rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+
+T "mise legacy enable converges when config.toml is hard-linked to config.pmsec.toml" t_mise_legacy_enable_hard_linked_configs
+
 if CASEFOLD_ROOT=$(casefold_root); then
   T "mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias" t_mise_reverse_migration_case_variant_alias "$CASEFOLD_ROOT"
 else
