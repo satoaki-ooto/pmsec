@@ -1127,6 +1127,22 @@ _miserc_skip() {
   done
 }
 
+# Print the UTF-8 encoding of a codepoint. printf %b expands the octal
+# escapes; bash cannot hold NUL, so codepoint 0 contributes nothing.
+_miserc_utf8() {
+  local cp="$1" esc
+  if [ "$cp" -lt 128 ]; then
+    esc=$(printf '\\%03o' "$cp")
+  elif [ "$cp" -lt 2048 ]; then
+    esc=$(printf '\\%03o\\%03o' "$(( (cp >> 6) | 192 ))" "$(( (cp & 63) | 128 ))")
+  elif [ "$cp" -lt 65536 ]; then
+    esc=$(printf '\\%03o\\%03o\\%03o' "$(( (cp >> 12) | 224 ))" "$(( ((cp >> 6) & 63) | 128 ))" "$(( (cp & 63) | 128 ))")
+  else
+    esc=$(printf '\\%03o\\%03o\\%03o\\%03o' "$(( (cp >> 18) | 240 ))" "$(( ((cp >> 12) & 63) | 128 ))" "$(( ((cp >> 6) & 63) | 128 ))" "$(( (cp & 63) | 128 ))")
+  fi
+  printf '%b' "$esc"
+}
+
 _miserc_parse_array() {
   local line ch quote val closed
   _miserc_skip || return 1
@@ -1146,7 +1162,30 @@ _miserc_parse_array() {
       if [ "$MISERC_K" -ge "${#line}" ]; then MISERC_J=$((MISERC_J+1)); MISERC_K=0; continue; fi
       ch="${line:MISERC_K:1}"
       if [ "$quote" = '"' ] && [ "$ch" = "\\" ]; then
-        MISERC_K=$((MISERC_K+1)); ch="${line:MISERC_K:1}"; val+="$ch"; MISERC_K=$((MISERC_K+1)); continue
+        # Decode TOML basic-string escapes so an escaped env name survives
+        # enable unchanged; invalid hex contributes nothing, matching the
+        # node/python decoders.
+        MISERC_K=$((MISERC_K+1))
+        if [ "$MISERC_K" -ge "${#line}" ]; then MISERC_ERR='miserc env has an unterminated escape'; return 1; fi
+        ch="${line:MISERC_K:1}"
+        case "$ch" in
+          [uU])
+            local w=4 hex
+            [ "$ch" = "U" ] && w=8
+            hex="${line:$((MISERC_K+1)):$w}"
+            MISERC_K=$((MISERC_K+1+w))
+            if [ "${#hex}" = "$w" ] && [[ "$hex" =~ ^[0-9A-Fa-f]+$ ]]; then
+              val+="$(_miserc_utf8 $((16#$hex)))"
+            fi
+            ;;
+          b) val+=$'\b'; MISERC_K=$((MISERC_K+1)) ;;
+          t) val+=$'\t'; MISERC_K=$((MISERC_K+1)) ;;
+          n) val+=$'\n'; MISERC_K=$((MISERC_K+1)) ;;
+          f) val+=$'\f'; MISERC_K=$((MISERC_K+1)) ;;
+          r) val+=$'\r'; MISERC_K=$((MISERC_K+1)) ;;
+          *) val+="$ch"; MISERC_K=$((MISERC_K+1)) ;;
+        esac
+        continue
       fi
       if [ "$ch" = "$quote" ]; then MISERC_K=$((MISERC_K+1)); closed=1; break; fi
       val+="$ch"; MISERC_K=$((MISERC_K+1))

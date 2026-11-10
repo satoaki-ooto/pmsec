@@ -1085,8 +1085,31 @@ function MisercParseArray {
       if ($script:MsK -ge $line.Length) { $script:MsJ++; $script:MsK = 0; continue }
       $c = $line[$script:MsK]
       if ($quote -eq '"' -and "$c" -eq '\') {
+        # Decode TOML basic-string escapes so an escaped env name survives
+        # enable unchanged; invalid hex contributes nothing, matching the
+        # node/python decoders.
         $script:MsK++
-        if ($script:MsK -lt $line.Length) { [void]$val.Append($line[$script:MsK]) }
+        if ($script:MsK -ge $line.Length) { $script:MisercErr = 'miserc env has an unterminated escape'; return $null }
+        $e = [string]$line[$script:MsK]
+        if ($e -eq 'u' -or $e -ceq 'U') {
+          $w = 4; if ($e -ceq 'U') { $w = 8 }
+          $script:MsK += 1 + $w
+          if ($script:MsK -le $line.Length) {
+            $hex = $line.Substring($script:MsK - $w, $w)
+            if ($hex.Length -eq $w -and $hex -match '^[0-9A-Fa-f]+$') {
+              try { [void]$val.Append([char]::ConvertFromUtf32([Convert]::ToInt32($hex, 16))) } catch {}
+            }
+          }
+          continue
+        }
+        switch -CaseSensitive ($e) {
+          'b' { [void]$val.Append([char]8) }
+          't' { [void]$val.Append("`t") }
+          'n' { [void]$val.Append("`n") }
+          'f' { [void]$val.Append([char]12) }
+          'r' { [void]$val.Append("`r") }
+          default { [void]$val.Append($e) }
+        }
         $script:MsK++
         continue
       }
