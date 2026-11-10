@@ -284,6 +284,13 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "enable_mise_new_mode_mise_env_unsafe_inherited_name",
+        {".config/mise/miserc.local.toml": 'env = ["work.dev"]\n'},
+        None,
+        {**NEW_MODE, "MISE_ENV": "pmsec"},
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
         "check_mise_legacy_shadowed_selector",
         {
             ".config/mise/miserc.local.toml": 'env = ["work"]\n',

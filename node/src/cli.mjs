@@ -189,9 +189,10 @@ function runDoctor(targets, json, ctx, out) {
     const row = { tool: t.name, key: t.key, ...probe };
     if (paths.extraPaths?.length) {
       row.extraPaths = paths.extraPaths;
-      // pmsec also writes these (legacy cleanup, miserc selector), so an
-      // unwritable one blocks the run just like the primary path.
-      row.blockedExtraPaths = paths.extraPaths.filter(e => !probePath(e, uid).parentWritable);
+      // Extra paths pmsec will write (miserc selector, legacy cleanup) block
+      // the run just like the primary path when unwritable.
+      const blocking = paths.blockingExtraPaths ?? paths.extraPaths;
+      row.blockedExtraPaths = blocking.filter(e => !probePath(e, uid).parentWritable);
     }
     return row;
   });

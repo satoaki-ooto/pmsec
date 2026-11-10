@@ -1613,13 +1613,34 @@ mise_paths_aliased() {
   [ "$(mise_canonical_path "$1")" = "$(mise_canonical_path "$2")" ]
 }
 
+# True when the file holds a pmsec-managed key (in-memory check, no write).
+mise_has_managed_keys() {
+  local path="$1" ek ev el es esec esafe
+  [ -f "$path" ] || return 1
+  lines_load "$path"
+  lines_remove_key "minimum_release_age" "=" "settings" && return 0
+  while IFS='|' read -r ek ev el es esec esafe; do
+    [ -z "$ek" ] && continue
+    lines_remove_key "$ek" "$es" "$esec" && return 0
+  done < <(tool_extras mise)
+  return 1
+}
+
 mise_doctor_paths() {
   if mise_supports_new_mode; then
     MISE_DOCTOR_PATH=$(path_mise_pmsec)
     MISE_DOCTOR_EXTRA=("$(path_mise)" "$(path_mise_local_miserc)")
+    # The selector is always written; the legacy config only when cleanup
+    # has managed keys to strip from it.
+    if mise_has_managed_keys "$(path_mise)"; then
+      MISE_DOCTOR_BLOCKING=("$(path_mise)" "$(path_mise_local_miserc)")
+    else
+      MISE_DOCTOR_BLOCKING=("$(path_mise_local_miserc)")
+    fi
   else
     MISE_DOCTOR_PATH=$(path_mise)
     MISE_DOCTOR_EXTRA=()
+    MISE_DOCTOR_BLOCKING=()
   fi
 }
 
@@ -2500,8 +2521,10 @@ cmd_doctor() {
         for ep in "${MISE_DOCTOR_EXTRA[@]}"; do
           [ "$first_ep" = "1" ] || extra_members+=", "
           first_ep=0; extra_members+=$(json_str "$ep")
-          # pmsec also writes these (legacy cleanup, miserc selector), so an
-          # unwritable one blocks the run just like the primary path.
+        done
+        # Extra paths pmsec will write (miserc selector, legacy cleanup)
+        # block the run just like the primary path when unwritable.
+        for ep in "${MISE_DOCTOR_BLOCKING[@]}"; do
           set -- $(_pmsec_probe_path "$ep")
           if [ "$4" = "0" ]; then
             blocked_extra+=("$ep")

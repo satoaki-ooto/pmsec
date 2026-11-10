@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -241,7 +241,9 @@ export async function read(ctx) {
       // write keeps ahead of pmsec in the persistent selector.
       const envs = new Set([...envListFrom(ctx.env.MISE_ENV), ...(await firstEnv(p)).values]);
       for (const name of envs) {
-        if (name === "pmsec") continue;
+        // Names that cannot map to a config.<env>.toml path are skipped, as
+        // in the bash/powershell ports; write still keeps them in the selector.
+        if (name === "pmsec" || !/^[A-Za-z0-9_-]+$/.test(name)) continue;
         files.push(miseEnvConfigPath(name, ctx.env, ctx.home));
       }
     }
@@ -311,8 +313,19 @@ export async function unset(ctx) {
   };
 }
 
+function hasManagedKeys(file) {
+  let text;
+  try { text = readFileSync(file, "utf8"); } catch { return false; }
+  return removeKey(text, key, { section }).removed || removeExtras(text, extras).removed;
+}
+
 export function doctorPaths(ctx) {
   const p = paths(ctx);
-  if (supportsNewMode(ctx)) return { path: p.pmsec, extraPaths: [p.legacy, p.local] };
+  if (supportsNewMode(ctx)) {
+    // The selector is always written; the legacy config only when cleanup
+    // has managed keys to strip from it.
+    const blockingExtraPaths = hasManagedKeys(p.legacy) ? [p.legacy, p.local] : [p.local];
+    return { path: p.pmsec, extraPaths: [p.legacy, p.local], blockingExtraPaths };
+  }
   return { path: p.legacy, extraPaths: [] };
 }

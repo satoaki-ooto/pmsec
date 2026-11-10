@@ -138,8 +138,13 @@ function Get-MiseWslRoot {
 function Get-MiseScopeEnv([string]$Name) {
   $value = [Environment]::GetEnvironmentVariable($Name)
   if (-not $value -or -not (Get-MiseWslRoot)) { return $value }
+  # /w entries only flow WSL -> Win32; every other entry (no flag, /p, /l,
+  # /u) is passed when Windows launches the distro.
   foreach ($entry in (([string]$env:WSLENV) -split ':')) {
-    if (($entry -replace '/.*$', '') -ieq $Name) { return $value }
+    $parts = $entry -split '/', 2
+    if ($parts[0] -ine $Name) { continue }
+    if ($parts.Count -gt 1 -and $parts[1] -match 'w') { continue }
+    return $value
   }
   return $null
 }
@@ -1464,6 +1469,17 @@ function MiseBufOnlyStructure {
 }
 
 # Remove pmsec-managed keys from a config file (never deletes it).
+# True when the file holds a pmsec-managed key (in-memory check, no write).
+function MiseHasManagedKeys([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  LinesLoad $Path
+  if (LinesRemoveKey 'minimum_release_age' '=' 'settings') { return $true }
+  foreach ($e in (ToolExtras 'mise')) {
+    if (LinesRemoveKey $e.Key $e.Sep $e.Section) { return $true }
+  }
+  return $false
+}
+
 function MiseRemoveManagedFrom([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   LinesLoad $Path
@@ -2280,14 +2296,18 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
     foreach ($t in $Targets) {
       $p = ToolPath $t
       $extraPaths = @()
+      $blockingExtra = @()
       if ($t -eq 'mise' -and (MiseSupportsNewMode)) {
         $p = Get-MisePmsecPath
         $extraPaths = @((Get-MisePath), (Get-MiseLocalMiserc))
+        # The selector is always written; the legacy config only when cleanup
+        # has managed keys to strip from it.
+        $blockingExtra = @(Get-MiseLocalMiserc)
+        if (MiseHasManagedKeys (Get-MisePath)) { $blockingExtra = $extraPaths }
       }
       $probe = ProbePath $p
-      # pmsec also writes these (legacy cleanup, miserc selector), so an
-      # unwritable one blocks the run just like the primary path.
-      $blockedExtra = @($extraPaths | Where-Object { -not (ProbePath $_).ParentWritable })
+      # Extra paths pmsec will write block the run just like the primary path.
+      $blockedExtra = @($blockingExtra | Where-Object { -not (ProbePath $_).ParentWritable })
       $rows.Add(@{
         Scope = $scope.Label
         Tool = $t; Key = (ToolKey $t)

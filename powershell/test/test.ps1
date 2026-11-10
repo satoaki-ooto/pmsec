@@ -1008,6 +1008,10 @@ $script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
     if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\.config\mise') { $script:LastFail = "unforwarded MISE_CONFIG_DIR applied: $($r.Dir)"; return $false }
     if ($r.System -ne '\\wsl$\Ubuntu\etc\mise\miserc.toml') { $script:LastFail = "system miserc not on the distro: $($r.System)"; return $false }
     if ($null -ne $r.MiseEnv) { $script:LastFail = "host MISE_ENV leaked into the WSL scope: $($r.MiseEnv)"; return $false }
+    $env:WSLENV = 'MISE_ENV/w:MISE_CONFIG_DIR/pw'
+    $r = & $probe
+    if ($null -ne $r.MiseEnv) { $script:LastFail = 'WSL->Win32-only MISE_ENV treated as reaching the distro'; return $false }
+    if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\.config\mise') { $script:LastFail = "WSL->Win32-only MISE_CONFIG_DIR applied: $($r.Dir)"; return $false }
     $env:WSLENV = 'FOO:MISE_CONFIG_DIR/up:MISE_SYSTEM_CONFIG_DIR/u:MISE_ENV'
     $r = & $probe
     if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\mise') { $script:LastFail = "forwarded MISE_CONFIG_DIR not mapped to UNC: $($r.Dir)"; return $false }
@@ -1020,19 +1024,27 @@ $script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
   }
 }
 
-T 'doctor blocks mise when a selector/legacy extra path is not writable' {
+T 'doctor blocks mise on an unwritable legacy config only when cleanup must rewrite it' {
   $h = NewHome
+  $legacyDir = PathJoin $h 'AppData' 'Local' 'mise'
   try {
-    $local = PathJoin $h 'AppData' 'Local'
-    New-Item -ItemType Directory -Force -Path $local | Out-Null
     if ($IsWindows) { return $true }
-    chmod 555 $local
-    $r = InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = "windows|$h|win32"; PMSEC_MISE_VERSION = '2026.11.0' } @('--doctor','--json','--tool','mise')
+    New-Item -ItemType Directory -Force -Path $legacyDir | Out-Null
+    $legacy = PathJoin $legacyDir 'config.toml'
+    $extra = @{ LOCALAPPDATA = (PathJoin $h 'AppData' 'Local'); PMSEC_FAKE_SCOPES = "windows|$h|win32"; PMSEC_MISE_VERSION = '2026.11.0' }
+    [System.IO.File]::WriteAllText($legacy, "[settings]`nexperimental = true`n")
+    chmod 555 $legacyDir
+    $d = (InvokePmsec $h $extra @('--doctor','--json','--tool','mise')).Out | ConvertFrom-Json
+    if (-not $d.ok -or @($d.tools[0].blockedExtraPaths).Count -ne 0) { $script:LastFail = 'unmanaged legacy config blocked doctor'; return $false }
+    chmod 755 $legacyDir
+    [System.IO.File]::WriteAllText($legacy, "[settings]`nminimum_release_age = `"7d`"`n")
+    chmod 555 $legacyDir
+    $r = InvokePmsec $h $extra @('--doctor','--json','--tool','mise')
     $d = $r.Out | ConvertFrom-Json
     $t = $d.tools[0]
-    if ($d.ok -or @($t.blockedExtraPaths).Count -ne 1 -or -not $t.parentWritable) { $script:LastFail = "doctor ignored unwritable extra path`n$($r.Out)"; return $false }
+    if ($d.ok -or @($t.blockedExtraPaths).Count -ne 1 -or -not $t.parentWritable) { $script:LastFail = "doctor ignored unwritable managed legacy config`n$($r.Out)"; return $false }
     return $true
-  } finally { if (-not $IsWindows) { chmod 755 (PathJoin $h 'AppData' 'Local') }; Remove-Item -Recurse -Force -LiteralPath $h }
+  } finally { if (-not $IsWindows -and (Test-Path -LiteralPath $legacyDir)) { chmod 755 $legacyDir }; Remove-Item -Recurse -Force -LiteralPath $h }
 }
 
 # ---------- summary ----------

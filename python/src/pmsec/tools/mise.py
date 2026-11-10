@@ -297,7 +297,9 @@ def read(ctx: Context) -> dict:
             # layers that write keeps ahead of pmsec in the persistent selector.
             envs = dict.fromkeys(env_list_from(ctx.env.get("MISE_ENV")) + _first_env(p)["values"])
             for name in envs:
-                if name == "pmsec":
+                # Names that cannot map to a config.<env>.toml path are skipped,
+                # as in the bash/powershell ports; write keeps them in the selector.
+                if name == "pmsec" or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
                     continue
                 files.append(mise_env_config_path(name, ctx.env, ctx.home))
         merged = _merge_reads(_read_files(files))
@@ -362,8 +364,22 @@ def unset(ctx: Context) -> dict:
     }
 
 
+def _has_managed_keys(p: Path) -> bool:
+    text = _read(p)
+    if text == "":
+        return False
+    return remove_key(text, KEY, section=SECTION)[1] or remove_extras(text, EXTRAS)[1]
+
+
 def doctor_paths(ctx: Context) -> dict:
     p = paths(ctx)
     if _supports_new_mode(ctx):
-        return {"path": str(p["pmsec"]), "extraPaths": [str(p["legacy"]), str(p["local"])]}
+        # The selector is always written; the legacy config only when cleanup
+        # has managed keys to strip from it.
+        blocking = [p["legacy"], p["local"]] if _has_managed_keys(p["legacy"]) else [p["local"]]
+        return {
+            "path": str(p["pmsec"]),
+            "extraPaths": [str(p["legacy"]), str(p["local"])],
+            "blockingExtraPaths": [str(b) for b in blocking],
+        }
     return {"path": str(p["legacy"]), "extraPaths": []}

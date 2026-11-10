@@ -207,10 +207,11 @@ def _doctor(args, targets, ctx: Context, out) -> int:
         row = {"tool": t.NAME, "key": t.KEY, **probe}
         if paths.get("extraPaths"):
             row["extraPaths"] = paths["extraPaths"]
-            # pmsec also writes these (legacy cleanup, miserc selector), so an
-            # unwritable one blocks the run just like the primary path.
+            # Extra paths pmsec will write (miserc selector, legacy cleanup)
+            # block the run just like the primary path when unwritable.
+            blocking = paths.get("blockingExtraPaths", paths["extraPaths"])
             row["blockedExtraPaths"] = [
-                e for e in paths["extraPaths"] if not _probe_path(Path(e), uid)["parentWritable"]
+                e for e in blocking if not _probe_path(Path(e), uid)["parentWritable"]
             ]
         tools.append(row)
     # doctor.ok is intentionally narrow: parent must be writable as the
