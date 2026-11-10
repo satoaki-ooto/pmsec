@@ -575,3 +575,42 @@ def test_doctor_never_claims_pmsec_home_support(tmp_path):
     assert report["pmsecHome"] is None
     assert report["pmsecHomeSource"] == "HOME"
     assert "PMSEC_HOME is ignored" in err
+
+
+def test_mise_new_mode_keeps_win32_config_under_dot_config(tmp_path):
+    local = tmp_path / "AppData" / "Local"
+    code, out, _ = run(["--doctor", "--json", "--tool", "mise"], tmp_path, "win32",
+                       PMSEC_MISE_VERSION="2026.11.0", LOCALAPPDATA=str(local))
+    assert code == 0
+    row = json.loads(out)["tools"][0]
+    assert row["path"] == str(tmp_path / ".config" / "mise" / "config.pmsec.toml")
+    assert row["extraPaths"] == [
+        str(local / "mise" / "config.toml"),
+        str(tmp_path / ".config" / "mise" / "miserc.local.toml"),
+    ]
+
+
+def test_mise_legacy_win32_mode_uses_localappdata(tmp_path):
+    local = tmp_path / "AppData" / "Local"
+    _, out, _ = run(["--doctor", "--json", "--tool", "mise"], tmp_path, "win32",
+                    PMSEC_MISE_VERSION="2026.10.25", LOCALAPPDATA=str(local))
+    assert json.loads(out)["tools"][0]["path"] == str(local / "mise" / "config.toml")
+
+
+def test_mise_new_mode_honors_xdg_and_config_dir(tmp_path):
+    xdg = tmp_path / "xdg"
+    _, out, _ = run(["--doctor", "--json", "--tool", "mise"], tmp_path, "linux",
+                    PMSEC_MISE_VERSION="2026.11.0", XDG_CONFIG_HOME=str(xdg))
+    assert json.loads(out)["tools"][0]["path"] == str(xdg / "mise" / "config.pmsec.toml")
+    custom = tmp_path / "mise-custom"
+    _, out, _ = run(["--doctor", "--json", "--tool", "mise"], tmp_path, "linux",
+                    PMSEC_MISE_VERSION="2026.11.0", XDG_CONFIG_HOME=str(xdg),
+                    MISE_CONFIG_DIR=str(custom))
+    assert json.loads(out)["tools"][0]["path"] == str(custom / "config.pmsec.toml")
+
+
+def test_win32_system_miserc_sits_under_drive_root():
+    from pmsec.util.paths import mise_system_miserc_path
+    assert mise_system_miserc_path({"MISE_SYSTEM_CONFIG_DIR": "D:/mise-etc"}, Path("C:/Users/me"), "win32") == Path("D:/mise-etc/miserc.toml")
+    if os.name == "nt":
+        assert mise_system_miserc_path({}, Path("C:/Users/me"), "win32") == Path("C:/etc/mise/miserc.toml")

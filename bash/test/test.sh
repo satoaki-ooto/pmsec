@@ -31,10 +31,12 @@ run_pmsec() {
   if [ "${#extra[@]}" -eq 0 ]; then
     env -i PATH="$PATH" HOME="$home" XDG_CONFIG_HOME="$home/.config" \
       PMSEC_PNPM_VERSION=none PMSEC_BUNDLER_VERSION=none \
+      PMSEC_MISE_VERSION=none MISE_SYSTEM_CONFIG_DIR="$home/etc-mise" \
       bash "$PMSEC" "$@"
   else
     env -i PATH="$PATH" HOME="$home" XDG_CONFIG_HOME="$home/.config" \
       PMSEC_PNPM_VERSION=none PMSEC_BUNDLER_VERSION=none \
+      PMSEC_MISE_VERSION=none MISE_SYSTEM_CONFIG_DIR="$home/etc-mise" \
       "${extra[@]}" bash "$PMSEC" "$@"
   fi
 }

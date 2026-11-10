@@ -53,7 +53,8 @@ function InvokePmsec([string]$HomeDir, [hashtable]$Extra, [string[]]$Argv) {
     'PMSEC_NPM_VERSION','PMSEC_PNPM_VERSION','PMSEC_YARN_VERSION',
     'PMSEC_BUN_VERSION','PMSEC_CARGO_VERSION','PMSEC_MISE_VERSION','PMSEC_UV_VERSION',
     'PMSEC_AUBE_VERSION',
-    'PMSEC_BUNDLER_VERSION','PMSEC_COMPOSER_VERSION'
+    'PMSEC_BUNDLER_VERSION','PMSEC_COMPOSER_VERSION',
+    'MISE_CONFIG_DIR','MISE_SYSTEM_CONFIG_DIR','MISE_ENV'
   )
   $saved = @{}
   foreach ($k in $envKeys) {
@@ -381,6 +382,36 @@ T 'Windows mise path uses LOCALAPPDATA' {
     $local = PathJoin $h 'AppData' 'Local'
     [void](InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = "windows|$h|win32" } @('--tool','mise'))
     return (AssertMatch 'mise key' '(?m)^minimum_release_age = "1d"$' ([System.IO.File]::ReadAllText((PathJoin $local 'mise' 'config.toml'))))
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+T 'Windows mise new mode writes config.pmsec.toml under .config' {
+  $h = NewHome
+  try {
+    $local = PathJoin $h 'AppData' 'Local'
+    [void](InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = "windows|$h|win32"; PMSEC_MISE_VERSION = '2026.11.0' } @('--tool','mise'))
+    $ok = Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'config.pmsec.toml')
+    $ok = $ok -and (Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'miserc.local.toml'))
+    $ok = $ok -and -not (Test-Path -LiteralPath (PathJoin $local 'mise' 'config.toml'))
+    if (-not $ok) { $script:LastFail = 'new-mode mise files not under .config' }
+    return $ok
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+T 'Windows mise new mode reverse-migrates when the version drops' {
+  $h = NewHome
+  try {
+    $local = PathJoin $h 'AppData' 'Local'
+    $scope = "windows|$h|win32"
+    [void](InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = $scope; PMSEC_MISE_VERSION = '2026.11.0' } @('--tool','mise'))
+    $r = InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = $scope; PMSEC_MISE_VERSION = '2026.10.25' } @('--tool','mise','--check','--json')
+    if ($r.Code -eq 0) { $script:LastFail = 'legacy check must fail while both generations exist'; return $false }
+    $r = InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = $scope; PMSEC_MISE_VERSION = '2026.10.25' } @('--tool','mise')
+    if ($r.Code -ne 0) { $script:LastFail = "reverse migration exit $($r.Code)"; return $false }
+    $ok = Test-Path -LiteralPath (PathJoin $local 'mise' 'config.toml')
+    $ok = $ok -and -not (Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'config.pmsec.toml'))
+    if (-not $ok) { $script:LastFail = 'reverse migration left the new generation behind' }
+    return $ok
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
 }
 

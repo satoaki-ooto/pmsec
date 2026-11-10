@@ -596,3 +596,57 @@ test("--doctor never claims PMSEC_HOME support and warns when it is set", async 
   assert.equal(report.pmsecHomeSource, "HOME");
   assert.match(err, /PMSEC_HOME is ignored/);
 });
+
+test("mise new mode keeps win32 config under .config, not LOCALAPPDATA", async () => {
+  const home = await setupHome();
+  const local = join(home, "AppData", "Local");
+  const { out } = await runCli(["--doctor", "--json", "--tool", "mise"], home, "win32", {
+    PMSEC_MISE_VERSION: "2026.11.0",
+    LOCALAPPDATA: local,
+  });
+  const row = JSON.parse(out).tools[0];
+  assert.equal(row.path, join(home, ".config", "mise", "config.pmsec.toml"));
+  assert.deepEqual(row.extraPaths, [
+    join(local, "mise", "config.toml"),
+    join(home, ".config", "mise", "miserc.local.toml"),
+  ]);
+});
+
+test("mise legacy win32 mode still uses LOCALAPPDATA", async () => {
+  const home = await setupHome();
+  const local = join(home, "AppData", "Local");
+  const { out } = await runCli(["--doctor", "--json", "--tool", "mise"], home, "win32", {
+    PMSEC_MISE_VERSION: "2026.10.25",
+    LOCALAPPDATA: local,
+  });
+  assert.equal(JSON.parse(out).tools[0].path, join(local, "mise", "config.toml"));
+});
+
+test("mise new mode honors XDG_CONFIG_HOME and MISE_CONFIG_DIR", async () => {
+  const home = await setupHome();
+  const xdg = join(home, "xdg");
+  let { out } = await runCli(["--doctor", "--json", "--tool", "mise"], home, "linux", {
+    PMSEC_MISE_VERSION: "2026.11.0",
+    XDG_CONFIG_HOME: xdg,
+  });
+  assert.equal(JSON.parse(out).tools[0].path, join(xdg, "mise", "config.pmsec.toml"));
+  const custom = join(home, "mise-custom");
+  ({ out } = await runCli(["--doctor", "--json", "--tool", "mise"], home, "linux", {
+    PMSEC_MISE_VERSION: "2026.11.0",
+    XDG_CONFIG_HOME: xdg,
+    MISE_CONFIG_DIR: custom,
+  }));
+  assert.equal(JSON.parse(out).tools[0].path, join(custom, "config.pmsec.toml"));
+});
+
+test("win32 system miserc default sits under the current drive root", async () => {
+  const { miseSystemMisercPath } = await import("../src/util/paths.mjs");
+  assert.equal(
+    miseSystemMisercPath({}, "C:\\Users\\me", "win32"),
+    join("C:\\", "etc", "mise", "miserc.toml"),
+  );
+  assert.equal(
+    miseSystemMisercPath({ MISE_SYSTEM_CONFIG_DIR: "D:\\mise-etc" }, "C:\\Users\\me", "win32"),
+    join("D:\\mise-etc", "miserc.toml"),
+  );
+});
