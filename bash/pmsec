@@ -1323,7 +1323,20 @@ mise_inherited_env() {
   return 0
 }
 
-mise_env_list() { local IFS=','; set -f; set -- $1; set +f; printf '%s\n' "$@"; }
+mise_env_list() {
+  # Trim each entry and drop empties, matching the node/python envListFrom —
+  # "work, pmsec" must select pmsec, not " pmsec".
+  local IFS=',' raw e
+  set -f
+  set -- $1
+  set +f
+  for raw in "$@"; do
+    e="${raw#"${raw%%[![:space:]]*}"}"
+    e="${e%"${e##*[![:space:]]}"}"
+    [ -n "$e" ] && printf '%s\n' "$e"
+  done
+  return 0
+}
 
 mise_env_warning() {
   local e v
