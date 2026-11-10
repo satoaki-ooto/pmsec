@@ -46,7 +46,13 @@ def env_for(impl: str, home: Path) -> dict[str, str]:
         # Composer uses Application Support on macOS instead of XDG. Pin its
         # home so one case exercises the same path on every runner.
         "COMPOSER_HOME": str(home / ".config" / "composer"),
+        # Keep mise's system/shared miserc reads inside the case's tempdir so a
+        # host /etc/mise/miserc.toml cannot leak into the selector result.
+        "MISE_SYSTEM_CONFIG_DIR": str(home / "etc-mise"),
     }
+    # MISE_CONFIG_DIR and MISE_ENV are deliberately absent from this dict:
+    # they would redirect mise's config dir or override the miserc selector
+    # from the host and must not influence a case.
     # Hide every host-installed package manager so version-aware preflight
     # warnings are deterministic (otherwise CI runners that ship npm/yarn/etc
     # leak a tool-specific 'warn' string into the JSON, breaking the cases).
@@ -87,7 +93,9 @@ def run_case(impl: str, case_path: Path) -> tuple[bool, str]:
     home = Path(tempfile.mkdtemp(prefix="pmsec-conf-"))
     try:
         env = env_for(impl, home)
-        env.update(case.get("env", {}))
+        # Cases address the temp home with a literal <HOME> token so a value
+        # like MISE_CONFIG_DIR can point inside it from portable JSON.
+        env.update({k: v.replace("<HOME>", str(home)) for k, v in case.get("env", {}).items()})
         for rel, body in case.get("setup", {}).items():
             target = home / rel
             target.parent.mkdir(parents=True, exist_ok=True)
