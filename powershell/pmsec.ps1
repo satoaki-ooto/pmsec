@@ -24,6 +24,9 @@ $script:PmsecVersion = '2026.11.8'
 # Default cooldown for the hardening bundle. Override per-invocation with
 # `--days N`; the default tracks the safest value we'd recommend.
 $script:BundleDays = 1
+# Active CLI mode; mise reads every generation on enable and only the active
+# one on check.
+$script:Action = 'enable'
 $script:Tools = @('npm','pnpm','yarn','bun','cargo','mise','uv','bundler','aube','composer')
 
 # ---------- scope / platform / paths ----------
@@ -128,6 +131,29 @@ function Get-MisePath {
     return (PathJoin $base 'mise' 'config.toml')
   }
   return (PathJoin (Get-PmsecHome) '.config' 'mise' 'config.toml')
+}
+# mise's global config directory (https://mise.jdx.dev/directories.html).
+# Unlike the legacy single-file path above this is the same on every OS:
+# win32 uses %USERPROFILE%/.config/mise, not %LOCALAPPDATA%/mise.
+function Get-MiseDir {
+  if ((Get-PmsecPlatform) -eq 'win32') {
+    if ($env:MISE_CONFIG_DIR) { return $env:MISE_CONFIG_DIR }
+    if ($env:XDG_CONFIG_HOME) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
+  }
+  return (PathJoin (Get-PmsecHome) '.config' 'mise')
+}
+function Get-MiseBasePath { return (PathJoin (Get-MiseDir) 'config.toml') }
+function Get-MisePmsecPath { return (PathJoin (Get-MiseDir) 'config.pmsec.toml') }
+function Get-MiseLocalMiserc { return (PathJoin (Get-MiseDir) 'miserc.local.toml') }
+function Get-MiseSharedMiserc { return (PathJoin (Get-MiseDir) 'miserc.toml') }
+function Get-MiseSystemMiserc {
+  if ((Get-PmsecPlatform) -eq 'win32') {
+    if ($env:MISE_SYSTEM_CONFIG_DIR) { return (PathJoin $env:MISE_SYSTEM_CONFIG_DIR 'miserc.toml') }
+    $root = [System.IO.Path]::GetPathRoot((Get-PmsecHome))
+    if (-not $root) { $root = 'C:\' }
+    return (PathJoin $root 'etc' 'mise' 'miserc.toml')
+  }
+  return '/etc/mise/miserc.toml'
 }
 # Bundler's global config. BUNDLE_USER_CONFIG points at the file directly;
 # BUNDLE_USER_HOME points at the home dir (config = <home>/config). Both
@@ -987,6 +1013,250 @@ function ParseDaysDw([string]$Value, [bool]$ExtraUnits = $false) {
 
 function ParseDaysMise([string]$Value) { ParseDaysDw $Value $true }
 
+# ---------- mise: mode, miserc env selector, generations ----------
+
+$script:MiseMigrationWarn = 'a previous new-style mise configuration exists (config.pmsec.toml or the pmsec miserc selector); run `pmsec` to consolidate it'
+$script:MiseEnvWarn = 'MISE_ENV overrides miserc and the pmsec environment is not active in this shell'
+
+# supportsNewMode = detected mise >= 2026.11.0 AND no MISE_GLOBAL_CONFIG_FILE
+# (the override only reaches the Windows host scope; a WSL distro reads its
+# own environment).
+function MiseSupportsNewMode {
+  if ((Get-PmsecPlatform) -eq 'win32' -and $env:MISE_GLOBAL_CONFIG_FILE) { return $false }
+  # WSL scopes would have to detect inside the distro; without an explicit
+  # override the version is unknown, which the plan resolves to legacy mode.
+  if ((Get-PmsecPlatform) -ne 'win32' -and -not $env:PMSEC_MISE_VERSION) { return $false }
+  $v = VersionDetect 'mise'
+  if ($null -eq $v) { return $false }
+  return (VersionGte $v @(2026, 11, 0))
+}
+
+$script:MsJ = 0
+$script:MsK = 0
+
+function MisercSkip {
+  while ($true) {
+    if ($script:MsJ -ge $script:LinesBuf.Count) { return $null }
+    $line = [string]$script:LinesBuf[$script:MsJ]
+    if ($script:MsK -ge $line.Length) { $script:MsJ++; $script:MsK = 0; continue }
+    $ch = $line[$script:MsK]
+    if ("$ch" -eq '#') { $script:MsJ++; $script:MsK = 0; continue }
+    if ([char]::IsWhiteSpace($ch)) { $script:MsK++; continue }
+    return $ch
+  }
+}
+
+# Parse the array value starting at the current cursor. Returns the values or
+# $null when the text is not a well-formed string array.
+function MisercParseArray {
+  $values = [System.Collections.Generic.List[string]]::new()
+  $ch = MisercSkip
+  if ($null -eq $ch -or "$ch" -ne '[') { return $null }
+  $script:MsK++
+  while ($true) {
+    $ch = MisercSkip
+    if ($null -eq $ch) { return $null }
+    if ("$ch" -eq ']') { $script:MsK++; break }
+    if ("$ch" -eq ',') { $script:MsK++; continue }
+    if ("$ch" -ne '"' -and "$ch" -ne "'") { return $null }
+    $quote = "$ch"
+    $script:MsK++
+    $val = [System.Text.StringBuilder]::new()
+    $closed = $false
+    while ($script:MsJ -lt $script:LinesBuf.Count) {
+      $line = [string]$script:LinesBuf[$script:MsJ]
+      if ($script:MsK -ge $line.Length) { $script:MsJ++; $script:MsK = 0; continue }
+      $c = $line[$script:MsK]
+      if ($quote -eq '"' -and "$c" -eq '\') {
+        $script:MsK++
+        if ($script:MsK -lt $line.Length) { [void]$val.Append($line[$script:MsK]) }
+        $script:MsK++
+        continue
+      }
+      if ("$c" -eq $quote) { $script:MsK++; $closed = $true; break }
+      [void]$val.Append($c)
+      $script:MsK++
+    }
+    if (-not $closed) { return $null }
+    [void]$values.Add($val.ToString())
+  }
+  return @{ Values = $values.ToArray() }
+}
+
+# Parse the top-level `env = [...]` assignment in the loaded buffer.
+# Returns @{ Defined; Values; Start; End } or throws on an invalid array.
+function MisercParseEnv {
+  for ($i = 0; $i -lt $script:LinesBuf.Count; $i++) {
+    if (LinesIsSection $script:LinesBuf[$i]) { break }
+    if ("$($script:LinesBuf[$i])" -notmatch '^\s*env\s*=') { continue }
+    $line = [string]$script:LinesBuf[$i]
+    $prefixLen = $line.IndexOf('=')
+    $script:MsJ = $i
+    $script:MsK = $prefixLen + 1
+    $parsed = MisercParseArray
+    if ($null -eq $parsed) { throw 'miserc env must be an array of string names' }
+    return @{ Defined = $true; Values = $parsed.Values; Start = $i; End = $script:MsJ }
+  }
+  return @{ Defined = $false; Values = @(); Start = -1; End = -1 }
+}
+
+function MisercQuote([string]$S) {
+  return '"' + ($S -replace '\\', '\\\\' -replace '"', '\"') + '"'
+}
+
+# Replace/insert the top-level env assignment in the loaded buffer.
+function MisercSetEnvValues([string[]]$Values, $Parsed) {
+  $line = 'env = [' + (($Values | ForEach-Object { MisercQuote $_ }) -join ', ') + ']'
+  if ($Parsed.Defined) {
+    $script:LinesBuf.RemoveRange($Parsed.Start, $Parsed.End - $Parsed.Start + 1)
+    $script:LinesBuf.Insert($Parsed.Start, $line)
+    return
+  }
+  LinesScanView
+  $first = LinesFirstSectionIdx
+  if ($first -lt 0) { [void]$script:LinesBuf.Add($line) }
+  elseif ($first -gt 0 -and $script:LinesBuf[$first - 1] -eq '') { $script:LinesBuf.Insert($first - 1, $line) }
+  else { $script:LinesBuf.Insert($first, $line) }
+}
+
+# Remove $Name from the env assignment. Returns $true when the buffer changed.
+function MisercRemoveEnvValue([string]$Name, $Parsed) {
+  if (-not $Parsed.Defined) { return $false }
+  $kept = [System.Collections.Generic.List[string]]::new()
+  $changed = $false
+  foreach ($v in $Parsed.Values) {
+    if ($v -ceq $Name) { $changed = $true } else { [void]$kept.Add($v) }
+  }
+  if (-not $changed) { return $false }
+  if ($kept.Count -gt 0) {
+    $line = 'env = [' + (($kept | ForEach-Object { MisercQuote $_ }) -join ', ') + ']'
+    $script:LinesBuf.RemoveRange($Parsed.Start, $Parsed.End - $Parsed.Start + 1)
+    $script:LinesBuf.Insert($Parsed.Start, $line)
+    return $true
+  }
+  $script:LinesBuf.RemoveRange($Parsed.Start, $Parsed.End - $Parsed.Start + 1)
+  return $true
+}
+
+function MisercBufEmpty {
+  foreach ($l in $script:LinesBuf) {
+    if ("$l" -match '\S') { return $false }
+  }
+  return $true
+}
+
+# Load the first miserc file (local -> shared -> system) that defines env.
+# Throws on an invalid env array so callers can fail before writing anything.
+function MiseInheritedEnv {
+  $script:MiseBaseEnv = @()
+  foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+    LinesLoad $p
+    $parsed = MisercParseEnv
+    if (-not $parsed.Defined) { continue }
+    $script:MiseBaseEnv = @($parsed.Values)
+    return
+  }
+}
+
+function MiseEnvList([string]$Raw) {
+  return @($Raw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+}
+
+function MiseEnvWarning {
+  if (-not $env:MISE_ENV) { return $null }
+  foreach ($e in (MiseEnvList $env:MISE_ENV)) {
+    if ($e -ceq 'pmsec') { return $null }
+  }
+  return $script:MiseEnvWarn
+}
+
+function MiseHasNewArtifacts {
+  if (Test-Path -LiteralPath (Get-MisePmsecPath) -PathType Leaf) { return $true }
+  $localp = Get-MiseLocalMiserc
+  if (-not (Test-Path -LiteralPath $localp -PathType Leaf)) { return $false }
+  LinesLoad $localp
+  $parsed = $null
+  try { $parsed = MisercParseEnv } catch { return $false }
+  return ($parsed.Defined -and $parsed.Values -ccontains 'pmsec')
+}
+
+function MiseSelectorState {
+  $result = @{ Path = $null; Env = @(); Wired = $false }
+  if ($env:MISE_ENV) {
+    $result.Path = 'MISE_ENV'
+    $result.Env = @(MiseEnvList $env:MISE_ENV)
+    $result.Wired = ($result.Env -ccontains 'pmsec')
+    return $result
+  }
+  foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+    LinesLoad $p
+    $parsed = MisercParseEnv
+    if (-not $parsed.Defined) { continue }
+    $result.Path = $p
+    $result.Env = @($parsed.Values)
+    $result.Wired = (@($parsed.Values) -ccontains 'pmsec')
+    return $result
+  }
+  $result.Path = (Get-MiseLocalMiserc)
+  return $result
+}
+
+# Read across the given files; the strictest valid cooldown wins and a safe
+# extra value in any file counts as kept-state (ok) for check.
+function MiseReadFiles([string[]]$Files) {
+  $best = $null
+  $fallback = $null
+  $filesSeen = [System.Collections.Generic.List[string]]::new()
+  $results = [System.Collections.Generic.List[hashtable]]::new()
+  foreach ($p in $Files) {
+    if ($filesSeen -ccontains $p) { continue }
+    [void]$filesSeen.Add($p)
+    LinesLoad $p
+    $cur = @{ Path = $p; Configured = $null; Days = $null; Extras = $null }
+    [void]$results.Add($cur)
+    $val = LinesReadKey 'minimum_release_age' '=' 'settings'
+    if ($null -ne $val) {
+      $cur.Configured = $val
+      if (-not $fallback) { $fallback = $cur }
+      $days = ParseDaysMise $val
+      if ($null -ne $days) {
+        $cur.Days = $days
+        if ($null -eq $best -or $days -gt $best.Days) { $best = $cur }
+      }
+    }
+    $extras = [System.Collections.Generic.List[hashtable]]::new()
+    foreach ($e in (ToolExtras 'mise')) {
+      $curE = LinesReadKey $e.Key $e.Sep $e.Section
+      $safe = if ($e.ContainsKey('SafeValues')) { @($e.SafeValues) } else { @($e.Expected) }
+      [void]$extras.Add(@{ Key = $e.Key; Configured = $curE; Expected = $e.Expected; Ok = ($null -ne $curE -and $safe -ccontains $curE) })
+    }
+    $cur.Extras = $extras.ToArray()
+  }
+  $chosen = if ($null -ne $best) { $best } else { $fallback }
+  $extraDefs = @(ToolExtras 'mise')
+  $mergedExtras = [System.Collections.Generic.List[hashtable]]::new()
+  for ($i = 0; $i -lt $extraDefs.Count; $i++) {
+    $okOne = $null; $definedOne = $null
+    for ($j = 0; $j -lt $results.Count; $j++) {
+      $e = $results[$j].Extras[$i]
+      if ($null -eq $e) { continue }
+      if ($null -eq $okOne -and $e.Ok) { $okOne = $e }
+      if ($null -eq $definedOne -and $null -ne $e.Configured) { $definedOne = $e }
+    }
+    if ($okOne) { [void]$mergedExtras.Add($okOne) }
+    elseif ($definedOne) { [void]$mergedExtras.Add($definedOne) }
+    else { [void]$mergedExtras.Add(@{ Key = $extraDefs[$i].Key; Configured = $null; Expected = $extraDefs[$i].Expected; Ok = $false }) }
+  }
+  $path = if ($null -ne $chosen) { $chosen.Path } else { $Files[0] }
+  $configured = if ($null -ne $chosen) { $chosen.Configured } else { $null }
+  $days = if ($null -ne $best) { $best.Days } else { $null }
+  return @{ Path = $path; Configured = $configured; Days = $days; Extras = $mergedExtras.ToArray() }
+}
+
+
+
 function ParseDaysUv([string]$Value) {
   if ($Value -match '^"\s*(\d+)\s*(day|days|d|week|weeks|w)\s*"$') {
     $n = [int]$Matches[1]
@@ -1069,8 +1339,137 @@ function ToolUnsetComposer {
   return @{ Path = $path; Removed = $removed }
 }
 
+function MiseBufOnlyStructure {
+  foreach ($l in $script:LinesBuf) {
+    $t = "$l".Trim()
+    if ($t -eq '') { continue }
+    if ($t.StartsWith('#')) { continue }
+    if (LinesIsSection "$l") { continue }
+    return $false
+  }
+  return $true
+}
+
+# Remove pmsec-managed keys from a config file (never deletes it).
+function MiseRemoveManagedFrom([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  LinesLoad $Path
+  $removed = [bool](LinesRemoveKey 'minimum_release_age' '=' 'settings')
+  foreach ($e in (ToolExtras 'mise')) {
+    if (LinesRemoveKey $e.Key $e.Sep $e.Section) { $removed = $true }
+  }
+  if ($removed) { WriteAtomic $Path (LinesDump) }
+  return $removed
+}
+
+# Remove pmsec-managed keys from config.pmsec.toml; delete it when only
+# whitespace / empty section headers remain.
+function MiseRemoveManagedConfig([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  LinesLoad $Path
+  $removed = [bool](LinesRemoveKey 'minimum_release_age' '=' 'settings')
+  foreach ($e in (ToolExtras 'mise')) {
+    if (LinesRemoveKey $e.Key $e.Sep $e.Section) { $removed = $true }
+  }
+  if (-not $removed) { return $false }
+  if (MiseBufOnlyStructure) { Remove-Item -LiteralPath $Path -Force }
+  else { WriteAtomic $Path (LinesDump) }
+  return $true
+}
+
+# Remove the pmsec selector from miserc.local.toml. Other names/keys survive.
+function MiseRemoveSelector([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  LinesLoad $Path
+  $parsed = MisercParseEnv
+  if (-not (MisercRemoveEnvValue 'pmsec' $parsed)) { return $false }
+  if (MisercBufEmpty) { Remove-Item -LiteralPath $Path -Force }
+  else { WriteAtomic $Path (LinesDump) }
+  return $true
+}
+
+function ToolReadMise {
+  $legacy = Get-MisePath
+  $base = Get-MiseBasePath
+  $pmsec = Get-MisePmsecPath
+  $action = $script:Action
+  $warn = $null
+  $rowFail = $false
+  $selector = $null
+  if (MiseSupportsNewMode) {
+    $files = if ($action -eq 'enable') { @($legacy, $base, $pmsec) } else { @($pmsec) }
+    $r = MiseReadFiles $files
+    try {
+      $selector = MiseSelectorState
+    } catch {
+      # An unparseable selector can never be reported as wired.
+      $selector = @{ Path = (Get-MiseLocalMiserc); Env = @(); Wired = $false }
+      $warn = "invalid mise miserc env: $($_.Exception.Message)"
+    }
+    if (-not $selector.Wired) { $rowFail = $true }
+    if (-not $warn) { $warn = MiseEnvWarning }
+  } else {
+    $artifacts = MiseHasNewArtifacts
+    $files = if ($action -eq 'enable' -and $artifacts) { @($legacy, $base, $pmsec) } else { @($legacy) }
+    $r = MiseReadFiles $files
+    if ($artifacts) { $warn = $script:MiseMigrationWarn; $rowFail = $true }
+  }
+  return @{
+    Key = 'minimum_release_age'; Path = $r.Path; Configured = $r.Configured; Days = $r.Days
+    Extras = $r.Extras; Warn = $warn; RowFail = $rowFail; Selector = $selector
+  }
+}
+
+function ToolWriteMise([int]$Days) {
+  $legacy = Get-MisePath
+  $base = Get-MiseBasePath
+  $pmsec = Get-MisePmsecPath
+  $localp = Get-MiseLocalMiserc
+  $line = 'minimum_release_age = "' + $Days + 'd"'
+  if (MiseSupportsNewMode) {
+    # Resolve the selector before writing anything: an invalid env array must
+    # not leave a half-migrated pair of generations.
+    MiseInheritedEnv
+    $values = @($script:MiseBaseEnv | Where-Object { $_ -cne 'pmsec' })
+    $values += 'pmsec'
+    LinesLoad $localp
+    [void](MisercParseEnv)
+
+    ToolWriteFile $pmsec 'minimum_release_age' $line '=' 'settings' 'mise' $false
+    LinesLoad $localp
+    $parsed = MisercParseEnv
+    MisercSetEnvValues $values $parsed
+    WriteAtomic $localp (LinesDump)
+    # A distinct baseConfig is left untouched; only the legacy write target
+    # loses pmsec-managed keys.
+    [void](MiseRemoveManagedFrom $legacy)
+    return @{ Path = $pmsec; Warn = (MiseEnvWarning) }
+  }
+
+  ToolWriteFile $legacy 'minimum_release_age' $line '=' 'settings' 'mise' $false
+  if (MiseHasNewArtifacts) {
+    # Write the destination before cleaning the new generation so an
+    # interrupted cleanup cannot create a no-config gap.
+    [void](MiseRemoveManagedConfig $pmsec)
+    [void](MiseRemoveSelector $localp)
+  }
+  return @{ Path = $legacy; Warn = $null }
+}
+
+function ToolUnsetMise {
+  $legacy = Get-MisePath
+  $pmsec = Get-MisePmsecPath
+  $localp = Get-MiseLocalMiserc
+  $removed = $false
+  if (MiseRemoveManagedFrom $legacy) { $removed = $true }
+  if (MiseRemoveManagedConfig $pmsec) { $removed = $true }
+  if (MiseRemoveSelector $localp) { $removed = $true }
+  return @{ Path = (if (MiseSupportsNewMode) { $pmsec } else { $legacy }); Removed = $removed }
+}
+
 function ToolRead([string]$Tool) {
   if ($Tool -eq 'composer') { return (ToolReadComposer) }
+  if ($Tool -eq 'mise') { return (ToolReadMise) }
   $toolVersion = $null
   # Version detection runs the local binary; only meaningful for the host
   # scope. For a WSL scope we'd have to shell into the distro and that's not
@@ -1165,6 +1564,7 @@ function ToolWriteFile([string]$Path, [string]$Key, [string]$Line, [string]$Sep,
 
 function ToolWrite([string]$Tool, [int]$Days) {
   if ($Tool -eq 'composer') { return (ToolWriteComposer $Days) }
+  if ($Tool -eq 'mise') { return (ToolWriteMise $Days) }
   $path = ToolPath $Tool
   $line = ToolWriteValueLine $Tool $Days
   ToolWriteFile $path (ToolKey $Tool) $line (ToolSep $Tool) (ToolSection $Tool) $Tool $false
@@ -1195,6 +1595,7 @@ function ToolUnsetFile([string]$Path, [string]$Tool, [bool]$YamlExtras) {
 
 function ToolUnset([string]$Tool) {
   if ($Tool -eq 'composer') { return (ToolUnsetComposer) }
+  if ($Tool -eq 'mise') { return (ToolUnsetMise) }
   $path = ToolPath $Tool
   $removed = ToolUnsetFile $path $Tool $false
   if ($Tool -eq 'pnpm') {
@@ -1386,18 +1787,24 @@ function CmdCheck($Targets, [bool]$Json, [int]$Days, [array]$Scopes) {
   $rows = New-Object System.Collections.Generic.List[hashtable]
   $failing = 0
   $failingExtras = 0
+  $failingRows = 0
+  $unwired = 0
+  $script:Action = 'check'
   foreach ($scope in $Scopes) {
     $script:Scope = $scope
     foreach ($t in $Targets) {
       $r = ToolRead $t
       $warn = ToolPreflight $t
+      if ($r.Warn) { $warn = if ($warn) { "$warn $($r.Warn)" } else { $r.Warn } }
       if ($null -eq $r.Days -or $r.Days -lt $Days) { $failing++ }
       foreach ($e in $r.Extras) { if (-not $e.Ok) { $failingExtras++ } }
+      if ($r.RowFail) { $failingRows++ }
+      if ($r.Selector -and -not $r.Selector.Wired) { $unwired++ }
       $rows.Add(@{
         Scope = $scope.Label
         Tool = $t; Key = $r.Key; Path = $r.Path
         Configured = $r.Configured; Days = $r.Days; Warn = $warn
-        Extras = $r.Extras
+        Extras = $r.Extras; Selector = $r.Selector
       })
     }
   }
@@ -1413,6 +1820,11 @@ function CmdCheck($Targets, [bool]$Json, [int]$Days, [array]$Scopes) {
       $cfg     = JsonStrOrNull $r.Configured
       $daysCol = JsonIntOrNull $r.Days
       $warn    = JsonStrOrNull $r.Warn
+      $selectorJson = ''
+      if ($r.Selector) {
+        $envJson = (@($r.Selector.Env | ForEach-Object { JsonString $_ }) -join ', ')
+        $selectorJson = " ""selector"": {""path"": $(JsonString $r.Selector.Path), ""env"": [$envJson], ""wired"": $(JsonBool $r.Selector.Wired)},"
+      }
       $extrasJson = '['
       $first = $true
       foreach ($e in $r.Extras) {
@@ -1425,12 +1837,12 @@ function CmdCheck($Targets, [bool]$Json, [int]$Days, [array]$Scopes) {
       }
       $extrasJson += ']'
       $scopePrefix = if ($multiScope) { """scope"": $(JsonString $r.Scope), " } else { '' }
-      $entry = "    {$scopePrefix""tool"": $(JsonString $r.Tool), ""key"": $(JsonString $r.Key), ""path"": $(JsonString $r.Path), ""configured"": $cfg, ""days"": $daysCol, ""warn"": $warn, ""extras"": $extrasJson}"
+      $entry = "    {$scopePrefix""tool"": $(JsonString $r.Tool), ""key"": $(JsonString $r.Key), ""path"": $(JsonString $r.Path), ""configured"": $cfg, ""days"": $daysCol,$selectorJson ""warn"": $warn, ""extras"": $extrasJson}"
       if ($i -lt $rows.Count - 1) { $entry += ',' }
       [void]$sb.AppendLine($entry)
     }
     [void]$sb.AppendLine('  ],')
-    [void]$sb.AppendLine("  ""ok"": $(JsonBool ($failing -eq 0 -and $failingExtras -eq 0))")
+    [void]$sb.AppendLine("  ""ok"": $(JsonBool ($failing -eq 0 -and $failingExtras -eq 0 -and $failingRows -eq 0))")
     [void]$sb.Append('}')
     StdOut $sb.ToString()
   } else {
@@ -1444,6 +1856,9 @@ function CmdCheck($Targets, [bool]$Json, [int]$Days, [array]$Scopes) {
       $disp = if ($null -eq $r.Configured) { '(unset)' } else { $r.Configured }
       StdOut ('{0} {1} {2} = {3}  [{4}]' -f $status, (Pad4 $r.Tool), $r.Key, $disp, $r.Path)
       if ($r.Warn) { StdOut ('       ' + $script:WarnGlyph + ' ' + $r.Warn) }
+      elseif ($r.Selector -and -not $r.Selector.Wired) {
+        StdOut ('       ' + $script:WarnGlyph + ' pmsec env not selected  [' + $r.Selector.Path + ']')
+      }
       foreach ($e in $r.Extras) {
         $exStatus = if ($e.Ok) { 'OK     ' } elseif ($null -eq $e.Configured) { 'MISSING' } else { 'STALE  ' }
         $exDisp = if ($e.DefaultEnforced) { "(default $($script:EmDash) runtime enforces $($e.Expected))" }
@@ -1455,7 +1870,8 @@ function CmdCheck($Targets, [bool]$Json, [int]$Days, [array]$Scopes) {
   }
   if ($failing -gt 0) { StdErr ("pmsec: $failing tool(s) below $Days days " + $script:EmDash + " run ``pmsec``") }
   if ($failingExtras -gt 0) { StdErr ("pmsec: $failingExtras hardening setting(s) not at safe value " + $script:EmDash + " run ``pmsec``") }
-  if ($failing -gt 0 -or $failingExtras -gt 0) { return 1 }
+  if ($unwired -gt 0) { StdErr ('pmsec: pmsec environment not selected by mise miserc ' + $script:EmDash + ' run ``pmsec``') }
+  if ($failing -gt 0 -or $failingExtras -gt 0 -or $failingRows -gt 0) { return 1 }
   return 0
 }
 
@@ -1496,11 +1912,11 @@ function CmdEnable($Targets, [bool]$Json, [int]$Days, [bool]$Force, [array]$Scop
   $failures = New-Object System.Collections.Generic.List[string]
   $warnCount = 0
   $script:Force = [bool]$Force
+  $script:Action = 'enable'
   foreach ($scope in $Scopes) {
     $script:Scope = $scope
     foreach ($t in $Targets) {
       $warn = ToolPreflight $t
-      if ($warn) { $warnCount++ }
       $err = $null
       $path = ToolPath $t
       if ($Force) {
@@ -1517,10 +1933,12 @@ function CmdEnable($Targets, [bool]$Json, [int]$Days, [bool]$Force, [array]$Scop
       try {
         $w = ToolWrite $t $effective
         $path = $w.Path
+        if ($w.Warn) { $warn = if ($warn) { "$warn $($w.Warn)" } else { $w.Warn } }
       } catch {
         $err = ExplainFsError $t $_
         $failures.Add($err)
       }
+      if ($warn) { $warnCount++ }
       $results.Add(@{
         Scope = $scope.Label
         Tool = $t; Path = $path; Days = $effective; Requested = $Days; Kept = $kept
@@ -1710,6 +2128,11 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
     $script:Scope = $scope
     foreach ($t in $Targets) {
       $p = ToolPath $t
+      $extraPaths = @()
+      if ($t -eq 'mise' -and (MiseSupportsNewMode)) {
+        $p = Get-MisePmsecPath
+        $extraPaths = @((Get-MisePath), (Get-MiseLocalMiserc))
+      }
       $probe = ProbePath $p
       $rows.Add(@{
         Scope = $scope.Label
@@ -1717,7 +2140,7 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
         Path = $probe.Path; Parent = $probe.Parent
         Exists = $probe.Exists; Writable = $probe.Writable
         ParentExists = $probe.ParentExists; ParentWritable = $probe.ParentWritable
-        Owner = $probe.Owner
+        Owner = $probe.Owner; ExtraPaths = $extraPaths
       })
     }
   }
@@ -1750,7 +2173,11 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
     [void]$sb.AppendLine('  "tools": [')
     for ($i = 0; $i -lt $rows.Count; $i++) {
       $r = $rows[$i]
-      $entry = "    {""scope"": $(JsonString $r.Scope), ""tool"": $(JsonString $r.Tool), ""key"": $(JsonString $r.Key), ""path"": $(JsonString $r.Path), ""parent"": $(JsonString $r.Parent), ""exists"": $(JsonBool $r.Exists), ""writable"": $(JsonBool $r.Writable), ""parentExists"": $(JsonBool $r.ParentExists), ""parentWritable"": $(JsonBool $r.ParentWritable), ""owner"": $(JsonStrOrNull $r.Owner)}"
+      $extraJson = ''
+      if ($r.ExtraPaths -and $r.ExtraPaths.Count -gt 0) {
+        $extraJson = ', ""extraPaths"": [' + ((@($r.ExtraPaths) | ForEach-Object { JsonString $_ }) -join ', ') + ']'
+      }
+      $entry = "    {""scope"": $(JsonString $r.Scope), ""tool"": $(JsonString $r.Tool), ""key"": $(JsonString $r.Key), ""path"": $(JsonString $r.Path), ""parent"": $(JsonString $r.Parent), ""exists"": $(JsonBool $r.Exists), ""writable"": $(JsonBool $r.Writable), ""parentExists"": $(JsonBool $r.ParentExists), ""parentWritable"": $(JsonBool $r.ParentWritable), ""owner"": $(JsonStrOrNull $r.Owner)$extraJson}"
       if ($i -lt $rows.Count - 1) { $entry += ',' }
       [void]$sb.AppendLine($entry)
     }
@@ -1774,6 +2201,7 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
       $flag = if ($r.ParentWritable) { 'ok    ' } else { 'BLOCK ' }
       $ownerSuffix = if ($r.Exists -and $r.Owner) { " (owner=$($r.Owner))" } else { '' }
       StdOut ('{0} {1} {2}{3}' -f $flag, (Pad4 $r.Tool), $r.Path, $ownerSuffix)
+      if ($r.ExtraPaths) { foreach ($ep in @($r.ExtraPaths)) { StdOut "         also: $ep" } }
       if (-not $r.ParentWritable) {
         StdOut ('         no writable ancestor for ' + $r.Parent)
       }
