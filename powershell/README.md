@@ -107,6 +107,10 @@ identify the failing step.
 | `AUBE_CONFIG_FILE` | aube config path. |
 | `COMPOSER_HOME` | Composer home; writes `$COMPOSER_HOME\config.json`. |
 
+The three `MISE_*` path overrides describe the Windows host's mise. On a WSL
+scope they apply only when the value is POSIX-rooted, since the distro's mise
+reads its own environment and cannot follow a drive-lettered path.
+
 ## Tests
 
 ```powershell

@@ -444,6 +444,24 @@ T 'Windows scope ignores XDG_CONFIG_HOME for uv' {
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
 }
 
+T 'WSL scope resolves mise from the distro env, not the Windows env' {
+  $h = NewHome
+  try {
+    $wslHome = PathJoin $h 'wsl-home'
+    $posixDir = PathJoin $h 'posix-mise'
+    $scope = "ubuntu|$wslHome|linux"
+    # Windows-rooted overrides cannot name a path inside the distro.
+    [void](InvokePmsec $h @{ MISE_CONFIG_DIR = 'C:\win-mise'; MISE_GLOBAL_CONFIG_FILE = 'C:\win-mise\config.toml'; PMSEC_FAKE_SCOPES = $scope; PMSEC_MISE_VERSION = '2026.11.0' } @('--tool','mise'))
+    $ok = Test-Path -LiteralPath (PathJoin $wslHome '.config' 'mise' 'config.pmsec.toml')
+    if (-not $ok) { $script:LastFail = 'WSL scope followed Windows-rooted mise overrides'; return $false }
+    # A POSIX-rooted override can name a path inside the distro and is honored.
+    [void](InvokePmsec $h @{ MISE_CONFIG_DIR = $posixDir; PMSEC_FAKE_SCOPES = $scope; PMSEC_MISE_VERSION = '2026.11.0' } @('--tool','mise'))
+    $ok = Test-Path -LiteralPath (PathJoin $posixDir 'config.pmsec.toml')
+    if (-not $ok) { $script:LastFail = 'WSL scope ignored a POSIX-rooted MISE_CONFIG_DIR' }
+    return $ok
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
 T '--json emits parseable JSON for check' {
   $h = NewHome
   try {

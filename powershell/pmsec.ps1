@@ -125,23 +125,32 @@ function Get-CargoPath {
   return (PathJoin (Get-PmsecHome) '.cargo' 'config.toml')
 }
 function Get-MisePath {
-  if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
-  # mise reads its global config from MISE_CONFIG_DIR when set, so the legacy
-  # destination must follow it; a default-path write would leave the active
-  # config without the bundle after a downgrade migration.
-  if ($env:MISE_CONFIG_DIR) { return (PathJoin $env:MISE_CONFIG_DIR 'config.toml') }
+  # Windows-side mise env vars describe the host's mise; a WSL distro's mise
+  # reads its own environment and cannot resolve a drive-lettered path. On a
+  # non-win32 scope honor an override only when it is POSIX-rooted (the same
+  # convention Get-BunPath uses).
   if ((Get-PmsecPlatform) -eq 'win32') {
+    if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
+    if ($env:MISE_CONFIG_DIR) { return (PathJoin $env:MISE_CONFIG_DIR 'config.toml') }
     $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-PmsecHome) 'AppData' 'Local' }
     return (PathJoin $base 'mise' 'config.toml')
   }
+  if ($env:MISE_GLOBAL_CONFIG_FILE -and $env:MISE_GLOBAL_CONFIG_FILE.StartsWith('/')) { return $env:MISE_GLOBAL_CONFIG_FILE }
+  if ($env:MISE_CONFIG_DIR -and $env:MISE_CONFIG_DIR.StartsWith('/')) { return (PathJoin $env:MISE_CONFIG_DIR 'config.toml') }
   return (PathJoin (Get-PmsecHome) '.config' 'mise' 'config.toml')
 }
 # mise's global config directory (https://mise.jdx.dev/directories.html).
 # Unlike the legacy single-file path above this is the same on every OS:
-# win32 uses %USERPROFILE%/.config/mise, not %LOCALAPPDATA%/mise.
+# win32 uses %USERPROFILE%/.config/mise, not %LOCALAPPDATA%/mise. WSL scopes
+# read the distro's own env, so only POSIX-rooted overrides apply there.
 function Get-MiseDir {
-  if ($env:MISE_CONFIG_DIR) { return $env:MISE_CONFIG_DIR }
-  if ($env:XDG_CONFIG_HOME) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
+  if ((Get-PmsecPlatform) -eq 'win32') {
+    if ($env:MISE_CONFIG_DIR) { return $env:MISE_CONFIG_DIR }
+    if ($env:XDG_CONFIG_HOME) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
+    return (PathJoin (Get-PmsecHome) '.config' 'mise')
+  }
+  if ($env:MISE_CONFIG_DIR -and $env:MISE_CONFIG_DIR.StartsWith('/')) { return $env:MISE_CONFIG_DIR }
+  if ($env:XDG_CONFIG_HOME -and $env:XDG_CONFIG_HOME.StartsWith('/')) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
   return (PathJoin (Get-PmsecHome) '.config' 'mise')
 }
 function Get-MiseBasePath { return (PathJoin (Get-MiseDir) 'config.toml') }
@@ -149,12 +158,15 @@ function Get-MisePmsecPath { return (PathJoin (Get-MiseDir) 'config.pmsec.toml')
 function Get-MiseLocalMiserc { return (PathJoin (Get-MiseDir) 'miserc.local.toml') }
 function Get-MiseSharedMiserc { return (PathJoin (Get-MiseDir) 'miserc.toml') }
 function Get-MiseSystemMiserc {
-  if ($env:MISE_SYSTEM_CONFIG_DIR) { return (PathJoin $env:MISE_SYSTEM_CONFIG_DIR 'miserc.toml') }
   if ((Get-PmsecPlatform) -eq 'win32') {
+    if ($env:MISE_SYSTEM_CONFIG_DIR) { return (PathJoin $env:MISE_SYSTEM_CONFIG_DIR 'miserc.toml') }
     $root = [System.IO.Path]::GetPathRoot((Get-PmsecHome))
     if (-not $root) { $root = 'C:\' }
     return (PathJoin $root 'etc' 'mise' 'miserc.toml')
   }
+  # A Windows-rooted override cannot name a path inside the distro; a
+  # POSIX-rooted one can and keeps working on every scope.
+  if ($env:MISE_SYSTEM_CONFIG_DIR -and $env:MISE_SYSTEM_CONFIG_DIR.StartsWith('/')) { return (PathJoin $env:MISE_SYSTEM_CONFIG_DIR 'miserc.toml') }
   return '/etc/mise/miserc.toml'
 }
 # Bundler's global config. BUNDLE_USER_CONFIG points at the file directly;
@@ -1020,11 +1032,12 @@ function ParseDaysMise([string]$Value) { ParseDaysDw $Value $true }
 $script:MiseMigrationWarn = 'a previous new-style mise configuration exists (config.pmsec.toml or the pmsec miserc selector); run `pmsec` to consolidate it'
 $script:MiseEnvWarn = 'MISE_ENV overrides miserc and the pmsec environment is not active in this shell'
 
-# supportsNewMode = detected mise >= 2026.11.0 AND no MISE_GLOBAL_CONFIG_FILE
-# (the override only reaches the Windows host scope; a WSL distro reads its
-# own environment).
+# supportsNewMode = detected mise >= 2026.11.0 AND no effective
+# MISE_GLOBAL_CONFIG_FILE. A Windows-rooted override only reaches the Windows
+# host scope; a WSL distro reads its own environment, so there the override
+# counts only when it is POSIX-rooted (matching Get-MisePath).
 function MiseSupportsNewMode {
-  if ($env:MISE_GLOBAL_CONFIG_FILE) { return $false }
+  if ($env:MISE_GLOBAL_CONFIG_FILE -and ((Get-PmsecPlatform) -eq 'win32' -or $env:MISE_GLOBAL_CONFIG_FILE.StartsWith('/'))) { return $false }
   # WSL scopes would have to detect inside the distro; without an explicit
   # override the version is unknown, which the plan resolves to legacy mode.
   if ((Get-PmsecPlatform) -ne 'win32' -and -not $env:PMSEC_MISE_VERSION) { return $false }
@@ -1721,6 +1734,9 @@ Environment:
   MISE_CONFIG_DIR         Override the global mise config dir (also used
                           for config.pmsec.toml and miserc.local.toml).
   MISE_SYSTEM_CONFIG_DIR  Read the system miserc.toml from here.
+                          On WSL scopes these three apply only when the value
+                          is POSIX-rooted: the distro's mise reads its own
+                          environment, not the Windows one.
   MISE_ENV                Replaces the miserc env list; when set without
                           `pmsec`, --check reports the layer as inactive.
   AUBE_CONFIG_FILE        Override the aube config file path.
