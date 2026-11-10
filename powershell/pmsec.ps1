@@ -145,8 +145,8 @@ function Get-MisePmsecPath { return (PathJoin (Get-MiseDir) 'config.pmsec.toml')
 function Get-MiseLocalMiserc { return (PathJoin (Get-MiseDir) 'miserc.local.toml') }
 function Get-MiseSharedMiserc { return (PathJoin (Get-MiseDir) 'miserc.toml') }
 function Get-MiseSystemMiserc {
+  if ($env:MISE_SYSTEM_CONFIG_DIR) { return (PathJoin $env:MISE_SYSTEM_CONFIG_DIR 'miserc.toml') }
   if ((Get-PmsecPlatform) -eq 'win32') {
-    if ($env:MISE_SYSTEM_CONFIG_DIR) { return (PathJoin $env:MISE_SYSTEM_CONFIG_DIR 'miserc.toml') }
     $root = [System.IO.Path]::GetPathRoot((Get-PmsecHome))
     if (-not $root) { $root = 'C:\' }
     return (PathJoin $root 'etc' 'mise' 'miserc.toml')

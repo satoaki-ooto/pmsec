@@ -99,7 +99,10 @@ identify the failing step.
 | `YARN_RC_FILENAME` | yarn config path. |
 | `BUN_CONFIG_FILE` | bun config path. |
 | `CARGO_HOME` | cargo home; writes `$CARGO_HOME\config.toml`. |
-| `MISE_GLOBAL_CONFIG_FILE` | mise config path. |
+| `MISE_GLOBAL_CONFIG_FILE` | Force legacy mise mode: write this one file, not `config.pmsec.toml`. |
+| `MISE_CONFIG_DIR` | mise global config dir (holds `config.pmsec.toml` and `miserc.local.toml`). |
+| `MISE_SYSTEM_CONFIG_DIR` | System `miserc.toml` dir read for inherited env names. |
+| `MISE_ENV` | Replaces the `miserc` env list; when set without `pmsec`, `--check` fails. |
 | `UV_CONFIG_FILE` | uv config path. |
 | `AUBE_CONFIG_FILE` | aube config path. |
 | `COMPOSER_HOME` | Composer home; writes `$COMPOSER_HOME\config.json`. |
