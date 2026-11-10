@@ -1144,7 +1144,9 @@ function MisercParseEnv {
   # migration replaces the existing assignment instead of adding a duplicate.
   for ($i = 0; $i -lt $script:LinesBuf.Count; $i++) {
     if (LinesIsSection $script:LinesScan[$i]) { break }
-    if ("$($script:LinesScan[$i])" -notmatch '^\s*(''env''|"env"|env)\s*=') { continue }
+    # -cnotmatch, not -notmatch: TOML keys are case-sensitive and -match folds
+    # case, so an `ENV = [...]` line must never be taken for the selector.
+    if ("$($script:LinesScan[$i])" -cnotmatch '^\s*(''env''|"env"|env)\s*=') { continue }
     $line = [string]$script:LinesBuf[$i]
     $prefixLen = $line.IndexOf('=')
     $script:MsJ = $i

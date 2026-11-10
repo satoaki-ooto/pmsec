@@ -264,6 +264,13 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "check_mise_new_mode_uppercase_env_key",
+        {".config/mise/miserc.local.toml": 'ENV = ["pmsec"]\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+    ),
+    (
         "enable_mise_new_mode_moves_pmsec_last",
         {".config/mise/miserc.local.toml": 'env = ["pmsec", "work"]\nother = 1\n'},
         None,
