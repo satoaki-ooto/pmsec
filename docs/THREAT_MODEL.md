@@ -86,10 +86,13 @@ On mise >= 2026.11.0 pmsec keeps its settings in `config.pmsec.toml` and
 activates that layer by adding `pmsec` to the global `miserc` environment
 list. Two properties matter:
 
-- `MISE_ENV` (or `-E`) replaces the global `miserc` environment list rather
-  than adding to it, so a user or script that sets `MISE_ENV` without `pmsec`
-  silently drops the hardened layer. pmsec cannot prevent this; `--check`
-  reports `selector.wired=false` and fails so the bypass is visible.
+- `MISE_ENV` and mise's per-command `-E` flag replace the global `miserc`
+  environment list rather than adding to it, so an environment without
+  `pmsec` silently drops the hardened layer. pmsec cannot prevent this and
+  can only see what its own process inherited: a `MISE_ENV` inherited by
+  pmsec without `pmsec` is reported by `--check` (`selector.wired=false`,
+  non-zero exit), but a per-command `mise -E work …` invocation is invisible
+  to pmsec and bypasses the layer silently.
 - Before 2026.11.0 a project-level `miserc` could override the global list.
   The new-mode threshold requires 2026.11.0, where the global environment
   survives a project `miserc`, so the selector cannot be neutralised by a
