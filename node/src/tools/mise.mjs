@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { unlink } from "node:fs/promises";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   miseConfigPath, miseConfigDir, miseBaseConfigPath, misePmsecConfigPath,
   miseEnvConfigPath, miseLocalMisercPath, miseSharedMisercPath, miseSystemMisercPath,
@@ -79,13 +79,17 @@ async function hasNewArtifacts(ctx, p) {
   // selected anywhere is inert — mise loads the layer only when the pmsec
   // environment is active — so legacy mode must converge instead of failing
   // forever on a file the cleanup intentionally keeps. An artifact is an
-  // active selector (MISE_ENV or any miserc) or managed keys in the file.
+  // active selector (MISE_ENV or the effective miserc) or managed keys in the
+  // file. Only the first miserc that defines env counts: a pmsec name in a
+  // lower-precedence miserc is shadowed and never selects the layer.
   if (envListFrom(ctx.env.MISE_ENV).includes("pmsec")) return true;
   for (const file of [p.local, p.shared, p.system]) {
     if (!existsSync(file)) continue;
-    try {
-      if (parseEnv(await readSafe(file)).values.includes("pmsec")) return true;
-    } catch { /* a malformed selector is surfaced by the selector paths */ }
+    let parsed;
+    try { parsed = parseEnv(await readSafe(file)); } catch { continue; /* surfaced by the selector paths */ }
+    if (!parsed.defined) continue;
+    if (parsed.values.includes("pmsec")) return true;
+    break;
   }
   try {
     const r = readOne(await readSafe(p.pmsec));
@@ -97,8 +101,15 @@ async function hasNewArtifacts(ctx, p) {
 // MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
 // then the legacy destination IS the new generation and the reverse-migration
 // cleanup must not remove what it just wrote (or delete the global config).
+// Absolute path with the directory's symlinks resolved, so different
+// spellings of the same file (relative, via a symlinked dir) compare equal.
+function canonicalPath(file) {
+  const abs = resolve(file);
+  try { return join(realpathSync(dirname(abs)), basename(abs)); } catch { return abs; }
+}
+
 function pathsAliased(p) {
-  return resolve(p.legacy) === resolve(p.pmsec);
+  return canonicalPath(p.legacy) === canonicalPath(p.pmsec);
 }
 
 function readOne(raw) {
@@ -225,9 +236,10 @@ export async function read(ctx) {
     let files = action === "enable" ? [p.legacy, p.base, p.pmsec] : [p.pmsec];
     if (action === "enable") {
       // Later environments override earlier keys, so a stricter cooldown in
-      // any layer that stays active after enable must be preserved too.
-      const fromVar = envListFrom(ctx.env.MISE_ENV);
-      const envs = fromVar.length ? fromVar : (await firstEnv(p)).values;
+      // any layer that stays active after enable must be preserved too: both
+      // the MISE_ENV layers of this shell and the inherited miserc layers that
+      // write keeps ahead of pmsec in the persistent selector.
+      const envs = new Set([...envListFrom(ctx.env.MISE_ENV), ...(await firstEnv(p)).values]);
       for (const name of envs) {
         if (name === "pmsec") continue;
         files.push(miseEnvConfigPath(name, ctx.env, ctx.home));

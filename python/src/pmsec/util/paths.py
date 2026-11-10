@@ -72,17 +72,19 @@ def bundle_config_path(env: dict[str, str], home: Path) -> Path:
 
 
 def mise_config_path(env: dict[str, str], home: Path, platform: str) -> Path:
-    if "MISE_GLOBAL_CONFIG_FILE" in env:
+    # An empty override is unset for mise (and the other ports); Path("")
+    # would otherwise resolve against the working directory.
+    if env.get("MISE_GLOBAL_CONFIG_FILE"):
         return Path(env["MISE_GLOBAL_CONFIG_FILE"])
     # mise reads its global config from MISE_CONFIG_DIR when set, so the legacy
     # destination must follow it; a default-path write would leave the active
     # config without the bundle after a downgrade migration.
-    if "MISE_CONFIG_DIR" in env:
+    if env.get("MISE_CONFIG_DIR"):
         return Path(env["MISE_CONFIG_DIR"]) / "config.toml"
     if platform == "win32":
-        base = Path(env["LOCALAPPDATA"]) if "LOCALAPPDATA" in env else home / "AppData" / "Local"
+        base = Path(env["LOCALAPPDATA"]) if env.get("LOCALAPPDATA") else home / "AppData" / "Local"
         return base / "mise" / "config.toml"
-    base = Path(env["XDG_CONFIG_HOME"]) if "XDG_CONFIG_HOME" in env else home / ".config"
+    base = Path(env["XDG_CONFIG_HOME"]) if env.get("XDG_CONFIG_HOME") else home / ".config"
     return base / "mise" / "config.toml"
 
 
@@ -92,9 +94,9 @@ def mise_config_dir(env: dict[str, str], home: Path) -> Path:
     Unlike the legacy single-file path above this is the same on every OS:
     win32 uses %USERPROFILE%\\.config\\mise, not %LOCALAPPDATA%\\mise.
     """
-    if "MISE_CONFIG_DIR" in env:
+    if env.get("MISE_CONFIG_DIR"):
         return Path(env["MISE_CONFIG_DIR"])
-    if "XDG_CONFIG_HOME" in env:
+    if env.get("XDG_CONFIG_HOME"):
         return Path(env["XDG_CONFIG_HOME"]) / "mise"
     return home / ".config" / "mise"
 
@@ -126,7 +128,7 @@ def mise_shared_miserc_path(env: dict[str, str], home: Path) -> Path:
 
 
 def mise_system_miserc_path(env: dict[str, str], home: Path, platform: str) -> Path:
-    if "MISE_SYSTEM_CONFIG_DIR" in env:
+    if env.get("MISE_SYSTEM_CONFIG_DIR"):
         return Path(env["MISE_SYSTEM_CONFIG_DIR"]) / "miserc.toml"
     if platform == "win32":
         # `home` may be a simulated Windows path on a POSIX test runner, so

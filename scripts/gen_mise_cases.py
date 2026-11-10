@@ -274,6 +274,42 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "enable_mise_new_mode_mise_env_keeps_inherited_layer",
+        {
+            ".config/mise/miserc.local.toml": 'env = ["work"]\n',
+            ".config/mise/config.work.toml": '[settings]\nminimum_release_age = "30d"\n',
+        },
+        None,
+        {**NEW_MODE, "MISE_ENV": "pmsec"},
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "check_mise_legacy_shadowed_selector",
+        {
+            ".config/mise/miserc.local.toml": 'env = ["work"]\n',
+            ".config/mise/miserc.toml": 'env = ["pmsec"]\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+        {"pre": [["--tool", "mise", "--days", "1", "--json"]]},
+    ),
+    (
+        "disable_mise_miserc_without_env",
+        {".config/mise/miserc.local.toml": "other = 1\n"},
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--disable", "--json"],
+        {"pre": [["--tool", "mise", "--days", "1", "--json"]]},
+    ),
+    (
+        "enable_mise_legacy_empty_config_dir",
+        {},
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_CONFIG_DIR": "", "MISE_GLOBAL_CONFIG_FILE": ""},
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
         "check_mise_new_mode_uppercase_env_key",
         {".config/mise/miserc.local.toml": 'ENV = ["pmsec"]\n'},
         None,

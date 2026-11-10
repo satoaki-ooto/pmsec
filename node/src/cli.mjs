@@ -187,12 +187,17 @@ function runDoctor(targets, json, ctx, out) {
     const paths = typeof t.doctorPaths === "function" ? t.doctorPaths(ctx) : { path: t.path(ctx), extraPaths: [] };
     const probe = probePath(paths.path, uid);
     const row = { tool: t.name, key: t.key, ...probe };
-    if (paths.extraPaths?.length) row.extraPaths = paths.extraPaths;
+    if (paths.extraPaths?.length) {
+      row.extraPaths = paths.extraPaths;
+      // pmsec also writes these (legacy cleanup, miserc selector), so an
+      // unwritable one blocks the run just like the primary path.
+      row.blockedExtraPaths = paths.extraPaths.filter(e => !probePath(e, uid).parentWritable);
+    }
     return row;
   });
   // doctor.ok is intentionally narrow: the parent directory must be writable
   // by the running uid. Everything else is informational.
-  const okFlag = tools.every(t => t.parentWritable);
+  const okFlag = tools.every(t => t.parentWritable && !t.blockedExtraPaths?.length);
   const report = {
     doctor: true,
     version: VERSION,
@@ -216,7 +221,7 @@ function runDoctor(targets, json, ctx, out) {
   out.write(`  HOME       : ${ctx.home}\n`);
   out.write(`  PMSEC_HOME : (not supported by this port — using HOME)\n\n`);
   for (const t of tools) {
-    const flag = t.parentWritable ? "ok    " : "BLOCK ";
+    const flag = t.parentWritable && !t.blockedExtraPaths?.length ? "ok    " : "BLOCK ";
     const ownerSuffix = t.exists && t.owner !== null ? ` (uid=${t.owner})` : "";
     out.write(`${flag} ${t.tool.padEnd(4)} ${t.path}${ownerSuffix}\n`);
     if (t.extraPaths) {
@@ -227,6 +232,7 @@ function runDoctor(targets, json, ctx, out) {
       // mkdir -p can fix it" is the common case and isn't worth a line.
       out.write(`         no writable ancestor for ${t.parent}\n`);
     }
+    for (const extra of t.blockedExtraPaths ?? []) out.write(`         no writable ancestor for ${dirname(extra)}\n`);
   }
   if (!okFlag) out.write(`\npmsec doctor: at least one parent directory is not writable as uid ${uid ?? "(non-POSIX)"}.\n`);
   return okFlag ? 0 : 1;

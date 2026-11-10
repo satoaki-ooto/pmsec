@@ -124,33 +124,62 @@ function Get-CargoPath {
   if ((Get-PmsecPlatform) -eq 'win32' -and $env:CARGO_HOME) { return (PathJoin $env:CARGO_HOME 'config.toml') }
   return (PathJoin (Get-PmsecHome) '.cargo' 'config.toml')
 }
+# A real WSL scope is reached through a `\\wsl$\<distro>\...` (or
+# `\\wsl.localhost\<distro>\...`) home. Windows filesystem calls cannot
+# resolve a POSIX path inside it, and the distro's mise only sees a Windows
+# env var that WSLENV forwards. Fake scopes with a POSIX home (tests) run on
+# the same machine as the process, so their env and paths apply verbatim.
+function Get-MiseWslRoot {
+  if ((Get-PmsecPlatform) -eq 'win32') { return $null }
+  $m = [regex]::Match([string](Get-PmsecHome), '^\\\\wsl(\$|\.localhost)\\[^\\/]+', 'IgnoreCase')
+  if ($m.Success) { return $m.Value }
+  return $null
+}
+function Get-MiseScopeEnv([string]$Name) {
+  $value = [Environment]::GetEnvironmentVariable($Name)
+  if (-not $value -or -not (Get-MiseWslRoot)) { return $value }
+  foreach ($entry in (([string]$env:WSLENV) -split ':')) {
+    if (($entry -replace '/.*$', '') -ieq $Name) { return $value }
+  }
+  return $null
+}
+# Map a POSIX path inside the distro to the path this process can open.
+function ConvertTo-MiseScopePath([string]$PosixPath) {
+  $root = Get-MiseWslRoot
+  if ($root) { return (PathJoin $root $PosixPath) }
+  return $PosixPath
+}
 function Get-MisePath {
   # Windows-side mise env vars describe the host's mise; a WSL distro's mise
   # reads its own environment and cannot resolve a drive-lettered path. On a
-  # non-win32 scope honor an override only when it is POSIX-rooted (the same
-  # convention Get-BunPath uses).
+  # non-win32 scope honor an override only when it reaches the distro and is
+  # POSIX-rooted (the same convention Get-BunPath uses).
   if ((Get-PmsecPlatform) -eq 'win32') {
     if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
     if ($env:MISE_CONFIG_DIR) { return (PathJoin $env:MISE_CONFIG_DIR 'config.toml') }
     $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-PmsecHome) 'AppData' 'Local' }
     return (PathJoin $base 'mise' 'config.toml')
   }
-  if ($env:MISE_GLOBAL_CONFIG_FILE -and $env:MISE_GLOBAL_CONFIG_FILE.StartsWith('/')) { return $env:MISE_GLOBAL_CONFIG_FILE }
-  if ($env:MISE_CONFIG_DIR -and $env:MISE_CONFIG_DIR.StartsWith('/')) { return (PathJoin $env:MISE_CONFIG_DIR 'config.toml') }
+  $globalFile = Get-MiseScopeEnv 'MISE_GLOBAL_CONFIG_FILE'
+  $configDir = Get-MiseScopeEnv 'MISE_CONFIG_DIR'
+  if ($globalFile -and $globalFile.StartsWith('/')) { return (ConvertTo-MiseScopePath $globalFile) }
+  if ($configDir -and $configDir.StartsWith('/')) { return (PathJoin (ConvertTo-MiseScopePath $configDir) 'config.toml') }
   return (PathJoin (Get-PmsecHome) '.config' 'mise' 'config.toml')
 }
 # mise's global config directory (https://mise.jdx.dev/directories.html).
 # Unlike the legacy single-file path above this is the same on every OS:
 # win32 uses %USERPROFILE%/.config/mise, not %LOCALAPPDATA%/mise. WSL scopes
-# read the distro's own env, so only POSIX-rooted overrides apply there.
+# read the distro's own env, so only forwarded POSIX-rooted overrides apply.
 function Get-MiseDir {
   if ((Get-PmsecPlatform) -eq 'win32') {
     if ($env:MISE_CONFIG_DIR) { return $env:MISE_CONFIG_DIR }
     if ($env:XDG_CONFIG_HOME) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
     return (PathJoin (Get-PmsecHome) '.config' 'mise')
   }
-  if ($env:MISE_CONFIG_DIR -and $env:MISE_CONFIG_DIR.StartsWith('/')) { return $env:MISE_CONFIG_DIR }
-  if ($env:XDG_CONFIG_HOME -and $env:XDG_CONFIG_HOME.StartsWith('/')) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
+  $configDir = Get-MiseScopeEnv 'MISE_CONFIG_DIR'
+  $xdg = Get-MiseScopeEnv 'XDG_CONFIG_HOME'
+  if ($configDir -and $configDir.StartsWith('/')) { return (ConvertTo-MiseScopePath $configDir) }
+  if ($xdg -and $xdg.StartsWith('/')) { return (PathJoin (ConvertTo-MiseScopePath $xdg) 'mise') }
   return (PathJoin (Get-PmsecHome) '.config' 'mise')
 }
 function Get-MiseBasePath { return (PathJoin (Get-MiseDir) 'config.toml') }
@@ -165,9 +194,10 @@ function Get-MiseSystemMiserc {
     return (PathJoin $root 'etc' 'mise' 'miserc.toml')
   }
   # A Windows-rooted override cannot name a path inside the distro; a
-  # POSIX-rooted one can and keeps working on every scope.
-  if ($env:MISE_SYSTEM_CONFIG_DIR -and $env:MISE_SYSTEM_CONFIG_DIR.StartsWith('/')) { return (PathJoin $env:MISE_SYSTEM_CONFIG_DIR 'miserc.toml') }
-  return '/etc/mise/miserc.toml'
+  # forwarded POSIX-rooted one can and keeps working on every scope.
+  $systemDir = Get-MiseScopeEnv 'MISE_SYSTEM_CONFIG_DIR'
+  if ($systemDir -and $systemDir.StartsWith('/')) { return (PathJoin (ConvertTo-MiseScopePath $systemDir) 'miserc.toml') }
+  return (ConvertTo-MiseScopePath '/etc/mise/miserc.toml')
 }
 # Bundler's global config. BUNDLE_USER_CONFIG points at the file directly;
 # BUNDLE_USER_HOME points at the home dir (config = <home>/config). Both
@@ -1037,7 +1067,8 @@ $script:MiseEnvWarn = 'MISE_ENV overrides miserc and the pmsec environment is no
 # host scope; a WSL distro reads its own environment, so there the override
 # counts only when it is POSIX-rooted (matching Get-MisePath).
 function MiseSupportsNewMode {
-  if ($env:MISE_GLOBAL_CONFIG_FILE -and ((Get-PmsecPlatform) -eq 'win32' -or $env:MISE_GLOBAL_CONFIG_FILE.StartsWith('/'))) { return $false }
+  $globalFile = Get-MiseScopeEnv 'MISE_GLOBAL_CONFIG_FILE'
+  if ($globalFile -and ((Get-PmsecPlatform) -eq 'win32' -or $globalFile.StartsWith('/'))) { return $false }
   # WSL scopes would have to detect inside the distro; without an explicit
   # override the version is unknown, which the plan resolves to legacy mode.
   if ((Get-PmsecPlatform) -ne 'win32' -and -not $env:PMSEC_MISE_VERSION) { return $false }
@@ -1222,8 +1253,9 @@ function MiseEnvList([string]$Raw) {
 }
 
 function MiseEnvWarning {
-  if (-not $env:MISE_ENV) { return $null }
-  foreach ($e in (MiseEnvList $env:MISE_ENV)) {
+  $miseEnv = Get-MiseScopeEnv 'MISE_ENV'
+  if (-not $miseEnv) { return $null }
+  foreach ($e in (MiseEnvList $miseEnv)) {
     if ($e -ceq 'pmsec') { return $null }
   }
   return $script:MiseEnvWarn
@@ -1234,15 +1266,19 @@ function MiseHasNewArtifacts {
   # selected anywhere is inert — mise loads the layer only when the pmsec
   # environment is active — so legacy mode must converge instead of failing
   # forever on a file the cleanup intentionally keeps. An artifact is an
-  # active selector (MISE_ENV or any miserc) or managed keys in the file.
-  foreach ($e in (MiseEnvList $env:MISE_ENV)) {
+  # active selector (MISE_ENV or the effective miserc) or managed keys in the
+  # file. Only the first miserc that defines env counts: a pmsec name in a
+  # lower-precedence miserc is shadowed and never selects the layer.
+  foreach ($e in (MiseEnvList (Get-MiseScopeEnv 'MISE_ENV'))) {
     if ($e -ceq 'pmsec') { return $true }
   }
   foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
     LinesLoad $p
     try { $parsed = MisercParseEnv } catch { continue }
-    if ($parsed.Defined -and (@($parsed.Values) -ccontains 'pmsec')) { return $true }
+    if (-not $parsed.Defined) { continue }
+    if (@($parsed.Values) -ccontains 'pmsec') { return $true }
+    break
   }
   $pmsec = Get-MisePmsecPath
   if (-not (Test-Path -LiteralPath $pmsec -PathType Leaf)) { return $false }
@@ -1259,9 +1295,10 @@ function MiseSelectorState {
   # pmsec is only the effective layer when it loads last: later environments
   # override earlier ones, so membership alone cannot prove the hardened
   # values win.
-  if ($env:MISE_ENV) {
+  $miseEnv = Get-MiseScopeEnv 'MISE_ENV'
+  if ($miseEnv) {
     $result.Path = 'MISE_ENV'
-    $result.Env = @(MiseEnvList $env:MISE_ENV)
+    $result.Env = @(MiseEnvList $miseEnv)
     $result.Wired = ($result.Env.Count -gt 0 -and $result.Env[-1] -ceq 'pmsec')
     return $result
   }
@@ -1476,12 +1513,11 @@ function ToolReadMise {
     $files = if ($action -eq 'enable') { @($legacy, $base, $pmsec) } else { @($pmsec) }
     if ($action -eq 'enable') {
       # Later environments override earlier keys, so a stricter cooldown in
-      # any layer that stays active after enable must be preserved too.
-      $envs = @()
-      if ($env:MISE_ENV) { $envs = @(MiseEnvList $env:MISE_ENV) }
-      else {
-        try { MiseInheritedEnv; $envs = @($script:MiseBaseEnv) } catch { $envs = @() }
-      }
+      # any layer that stays active after enable must be preserved too: both
+      # the MISE_ENV layers of this shell and the inherited miserc layers that
+      # write keeps ahead of pmsec in the persistent selector.
+      $envs = @(MiseEnvList (Get-MiseScopeEnv 'MISE_ENV'))
+      try { MiseInheritedEnv; $envs += @($script:MiseBaseEnv) } catch { }
       foreach ($name in $envs) {
         if ($name -ceq 'pmsec' -or $name -notmatch '^[A-Za-z0-9_-]+$') { continue }
         $files += (PathJoin (Get-MiseDir) "config.$name.toml")
@@ -2249,19 +2285,22 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
         $extraPaths = @((Get-MisePath), (Get-MiseLocalMiserc))
       }
       $probe = ProbePath $p
+      # pmsec also writes these (legacy cleanup, miserc selector), so an
+      # unwritable one blocks the run just like the primary path.
+      $blockedExtra = @($extraPaths | Where-Object { -not (ProbePath $_).ParentWritable })
       $rows.Add(@{
         Scope = $scope.Label
         Tool = $t; Key = (ToolKey $t)
         Path = $probe.Path; Parent = $probe.Parent
         Exists = $probe.Exists; Writable = $probe.Writable
         ParentExists = $probe.ParentExists; ParentWritable = $probe.ParentWritable
-        Owner = $probe.Owner; ExtraPaths = $extraPaths
+        Owner = $probe.Owner; ExtraPaths = $extraPaths; BlockedExtraPaths = $blockedExtra
       })
     }
   }
   $script:Scope = $null
   $okFlag = $true
-  foreach ($r in $rows) { if (-not $r.ParentWritable) { $okFlag = $false } }
+  foreach ($r in $rows) { if (-not $r.ParentWritable -or $r.BlockedExtraPaths.Count -gt 0) { $okFlag = $false } }
   $multiScope = $Scopes.Count -gt 1
   $username = $null
   try { $username = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch {}
@@ -2290,7 +2329,8 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
       $r = $rows[$i]
       $extraJson = ''
       if ($r.ExtraPaths -and $r.ExtraPaths.Count -gt 0) {
-        $extraJson = ', ""extraPaths"": [' + ((@($r.ExtraPaths) | ForEach-Object { JsonString $_ }) -join ', ') + ']'
+        $extraJson = ', "extraPaths": [' + ((@($r.ExtraPaths) | ForEach-Object { JsonString $_ }) -join ', ') + ']'
+        $extraJson += ', "blockedExtraPaths": [' + ((@($r.BlockedExtraPaths) | ForEach-Object { JsonString $_ }) -join ', ') + ']'
       }
       $entry = "    {""scope"": $(JsonString $r.Scope), ""tool"": $(JsonString $r.Tool), ""key"": $(JsonString $r.Key), ""path"": $(JsonString $r.Path), ""parent"": $(JsonString $r.Parent), ""exists"": $(JsonBool $r.Exists), ""writable"": $(JsonBool $r.Writable), ""parentExists"": $(JsonBool $r.ParentExists), ""parentWritable"": $(JsonBool $r.ParentWritable), ""owner"": $(JsonStrOrNull $r.Owner)$extraJson}"
       if ($i -lt $rows.Count - 1) { $entry += ',' }
@@ -2313,13 +2353,14 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
         StdOut ('[' + $r.Scope + ']')
         $lastScope = $r.Scope
       }
-      $flag = if ($r.ParentWritable) { 'ok    ' } else { 'BLOCK ' }
+      $flag = if ($r.ParentWritable -and $r.BlockedExtraPaths.Count -eq 0) { 'ok    ' } else { 'BLOCK ' }
       $ownerSuffix = if ($r.Exists -and $r.Owner) { " (owner=$($r.Owner))" } else { '' }
       StdOut ('{0} {1} {2}{3}' -f $flag, (Pad4 $r.Tool), $r.Path, $ownerSuffix)
       if ($r.ExtraPaths) { foreach ($ep in @($r.ExtraPaths)) { StdOut "         also: $ep" } }
       if (-not $r.ParentWritable) {
         StdOut ('         no writable ancestor for ' + $r.Parent)
       }
+      foreach ($ep in @($r.BlockedExtraPaths)) { StdOut ('         no writable ancestor for ' + [IO.Path]::GetDirectoryName($ep)) }
     }
     if (-not $okFlag) {
       StdOut ''

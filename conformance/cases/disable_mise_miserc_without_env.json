@@ -1,0 +1,39 @@
+{
+  "setup": {
+    ".config/mise/miserc.local.toml": "other = 1\n"
+  },
+  "env": {
+    "PMSEC_MISE_VERSION": "2026.10.25"
+  },
+  "args": [
+    "--tool",
+    "mise",
+    "--disable",
+    "--json"
+  ],
+  "pre": [
+    [
+      "--tool",
+      "mise",
+      "--days",
+      "1",
+      "--json"
+    ]
+  ],
+  "expected_exit": 0,
+  "expected_json": {
+    "results": [
+      {
+        "tool": "mise",
+        "path": "<HOME>/.config/mise/config.toml",
+        "removed": true,
+        "ok": true
+      }
+    ],
+    "ok": true
+  },
+  "expected_files": {
+    ".config/mise/config.toml": "[settings]\n",
+    ".config/mise/miserc.local.toml": "other = 1\n"
+  }
+}

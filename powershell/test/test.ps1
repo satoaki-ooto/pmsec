@@ -54,7 +54,7 @@ function InvokePmsec([string]$HomeDir, [hashtable]$Extra, [string[]]$Argv) {
     'PMSEC_BUN_VERSION','PMSEC_CARGO_VERSION','PMSEC_MISE_VERSION','PMSEC_UV_VERSION',
     'PMSEC_AUBE_VERSION',
     'PMSEC_BUNDLER_VERSION','PMSEC_COMPOSER_VERSION',
-    'MISE_CONFIG_DIR','MISE_SYSTEM_CONFIG_DIR','MISE_ENV'
+    'MISE_CONFIG_DIR','MISE_SYSTEM_CONFIG_DIR','MISE_ENV','WSLENV'
   )
   $saved = @{}
   foreach ($k in $envKeys) {
@@ -976,6 +976,63 @@ T 'composer preserves unrelated JSON keys and honors COMPOSER_HOME' {
     if ($text -match '"period"') { $script:LastFail = 'composer cooldown not removed'; return $false }
     return (AssertMatch 'preferred-install kept after disable' '"preferred-install": "dist"' $text)
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+T 'real WSL scope reads only forwarded POSIX mise env and maps it to the UNC home' {
+  # A `\\wsl$\<distro>` home cannot be opened on a non-Windows test host, so
+  # load the resolver functions from pmsec.ps1 and drive them directly.
+  $tokens = $null; $parseErrors = $null
+  $ast = [System.Management.Automation.Language.Parser]::ParseFile($Pmsec, [ref]$tokens, [ref]$parseErrors)
+  $names = @('Get-PmsecPlatform','Get-PmsecHome','Get-MiseWslRoot','Get-MiseScopeEnv','ConvertTo-MiseScopePath','Get-MiseDir','Get-MisePath','Get-MiseSystemMiserc')
+  $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name }, $false) | ForEach-Object { $_.Extent.Text }
+  $probe = [scriptblock]::Create(($defs -join "`n") + @'
+
+function PathJoin {
+  $parts = @(([string]$args[0]).TrimEnd('\', '/')) + @($args | Select-Object -Skip 1 | ForEach-Object { ([string]$_).Trim('\', '/') })
+  ($parts -join '\') -replace '/', '\'
+}
+$script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
+@{
+  Dir = Get-MiseDir; Path = Get-MisePath; System = Get-MiseSystemMiserc
+  MiseEnv = Get-MiseScopeEnv 'MISE_ENV'
+}
+'@)
+  $keys = @('MISE_CONFIG_DIR','MISE_GLOBAL_CONFIG_FILE','MISE_SYSTEM_CONFIG_DIR','MISE_ENV','XDG_CONFIG_HOME','WSLENV')
+  $saved = @{}
+  foreach ($k in $keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $null) }
+  try {
+    $env:MISE_CONFIG_DIR = '/home/alice/mise'
+    $env:MISE_SYSTEM_CONFIG_DIR = '/opt/mise'
+    $env:MISE_ENV = 'pmsec'
+    $r = & $probe
+    if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\.config\mise') { $script:LastFail = "unforwarded MISE_CONFIG_DIR applied: $($r.Dir)"; return $false }
+    if ($r.System -ne '\\wsl$\Ubuntu\etc\mise\miserc.toml') { $script:LastFail = "system miserc not on the distro: $($r.System)"; return $false }
+    if ($null -ne $r.MiseEnv) { $script:LastFail = "host MISE_ENV leaked into the WSL scope: $($r.MiseEnv)"; return $false }
+    $env:WSLENV = 'FOO:MISE_CONFIG_DIR/up:MISE_SYSTEM_CONFIG_DIR/u:MISE_ENV'
+    $r = & $probe
+    if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\mise') { $script:LastFail = "forwarded MISE_CONFIG_DIR not mapped to UNC: $($r.Dir)"; return $false }
+    if ($r.Path -ne '\\wsl$\Ubuntu\home\alice\mise\config.toml') { $script:LastFail = "legacy path not mapped to UNC: $($r.Path)"; return $false }
+    if ($r.System -ne '\\wsl$\Ubuntu\opt\mise\miserc.toml') { $script:LastFail = "forwarded system dir not mapped: $($r.System)"; return $false }
+    if ($r.MiseEnv -ne 'pmsec') { $script:LastFail = 'forwarded MISE_ENV ignored'; return $false }
+    return $true
+  } finally {
+    foreach ($k in $keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+  }
+}
+
+T 'doctor blocks mise when a selector/legacy extra path is not writable' {
+  $h = NewHome
+  try {
+    $local = PathJoin $h 'AppData' 'Local'
+    New-Item -ItemType Directory -Force -Path $local | Out-Null
+    if ($IsWindows) { return $true }
+    chmod 555 $local
+    $r = InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = "windows|$h|win32"; PMSEC_MISE_VERSION = '2026.11.0' } @('--doctor','--json','--tool','mise')
+    $d = $r.Out | ConvertFrom-Json
+    $t = $d.tools[0]
+    if ($d.ok -or @($t.blockedExtraPaths).Count -ne 1 -or -not $t.parentWritable) { $script:LastFail = "doctor ignored unwritable extra path`n$($r.Out)"; return $false }
+    return $true
+  } finally { if (-not $IsWindows) { chmod 755 (PathJoin $h 'AppData' 'Local') }; Remove-Item -Recurse -Force -LiteralPath $h }
 }
 
 # ---------- summary ----------

@@ -104,7 +104,7 @@ def _read(p: Path) -> str:
 
 def _supports_new_mode(ctx: Context) -> bool:
     v = detect_version("mise", env=ctx.env, override_key="PMSEC_MISE_VERSION")
-    return gte(v, NEW_MODE_MIN) is True and "MISE_GLOBAL_CONFIG_FILE" not in ctx.env
+    return gte(v, NEW_MODE_MIN) is True and not ctx.env.get("MISE_GLOBAL_CONFIG_FILE")
 
 
 def _has_new_artifacts(ctx: Context, p: dict[str, Path]) -> bool:
@@ -112,17 +112,23 @@ def _has_new_artifacts(ctx: Context, p: dict[str, Path]) -> bool:
     selected anywhere is inert — mise loads the layer only when the pmsec
     environment is active — so legacy mode must converge instead of failing
     forever on a file the cleanup intentionally keeps. An artifact is an
-    active selector (MISE_ENV or any miserc) or managed keys in the file."""
+    active selector (MISE_ENV or the effective miserc) or managed keys in the
+    file. Only the first miserc that defines env counts: a pmsec name in a
+    lower-precedence miserc is shadowed and never selects the layer."""
     if "pmsec" in env_list_from(ctx.env.get("MISE_ENV")):
         return True
     for f in (p["local"], p["shared"], p["system"]):
         if not f.exists():
             continue
         try:
-            if "pmsec" in parse_env(_read(f))["values"]:
-                return True
+            parsed = parse_env(_read(f))
         except ValueError:
             continue
+        if not parsed["defined"]:
+            continue
+        if "pmsec" in parsed["values"]:
+            return True
+        break
     try:
         r = _read_one(_read(p["pmsec"]))
         if r["configured"] is not None or any(e["configured"] is not None for e in r["extras"]):
@@ -268,8 +274,15 @@ def _paths_aliased(p: dict[str, Path]) -> bool:
     """MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
     then the legacy destination IS the new generation and the reverse-migration
     cleanup must not remove what it just wrote (or delete the global config)."""
-    norm = lambda v: os.path.normpath(str(v))
-    return norm(p["legacy"]) == norm(p["pmsec"])
+    return _canonical_path(p["legacy"]) == _canonical_path(p["pmsec"])
+
+
+def _canonical_path(file: Path) -> str:
+    """Absolute path with the directory's symlinks resolved, so different
+    spellings of the same file (relative, via a symlinked dir) compare equal."""
+    absolute = os.path.abspath(str(file))
+    head, tail = os.path.split(absolute)
+    return os.path.join(os.path.realpath(head) if os.path.isdir(head) else head, tail)
 
 
 def read(ctx: Context) -> dict:
@@ -279,9 +292,10 @@ def read(ctx: Context) -> dict:
         files = [p["legacy"], p["base"], p["pmsec"]] if action == "enable" else [p["pmsec"]]
         if action == "enable":
             # Later environments override earlier keys, so a stricter cooldown
-            # in any layer that stays active after enable must be preserved.
-            from_var = env_list_from(ctx.env.get("MISE_ENV"))
-            envs = from_var if from_var else _first_env(p)["values"]
+            # in any layer that stays active after enable must be preserved:
+            # both the MISE_ENV layers of this shell and the inherited miserc
+            # layers that write keeps ahead of pmsec in the persistent selector.
+            envs = dict.fromkeys(env_list_from(ctx.env.get("MISE_ENV")) + _first_env(p)["values"])
             for name in envs:
                 if name == "pmsec":
                     continue

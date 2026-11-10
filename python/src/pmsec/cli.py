@@ -207,10 +207,15 @@ def _doctor(args, targets, ctx: Context, out) -> int:
         row = {"tool": t.NAME, "key": t.KEY, **probe}
         if paths.get("extraPaths"):
             row["extraPaths"] = paths["extraPaths"]
+            # pmsec also writes these (legacy cleanup, miserc selector), so an
+            # unwritable one blocks the run just like the primary path.
+            row["blockedExtraPaths"] = [
+                e for e in paths["extraPaths"] if not _probe_path(Path(e), uid)["parentWritable"]
+            ]
         tools.append(row)
     # doctor.ok is intentionally narrow: parent must be writable as the
     # running uid. Everything else is informational.
-    ok_flag = all(t["parentWritable"] for t in tools)
+    ok_flag = all(t["parentWritable"] and not t.get("blockedExtraPaths") for t in tools)
     # This port resolves paths from HOME only; PMSEC_HOME is a bash/powershell
     # feature (it needs the root->owner chown handback those ports implement).
     pmsec_home = None
@@ -238,13 +243,15 @@ def _doctor(args, targets, ctx: Context, out) -> int:
     out.write(f"  HOME       : {ctx.home}\n")
     out.write("  PMSEC_HOME : (not supported by this port — using HOME)\n\n")
     for t in tools:
-        flag = "ok    " if t["parentWritable"] else "BLOCK "
+        flag = "ok    " if t["parentWritable"] and not t.get("blockedExtraPaths") else "BLOCK "
         owner_suffix = f" (uid={t['owner']})" if t["exists"] and t["owner"] is not None else ""
         out.write(f"{flag} {t['tool']:<4} {t['path']}{owner_suffix}\n")
         for extra in t.get("extraPaths", []):
             out.write(f"         also: {extra}\n")
         if not t["parentWritable"]:
             out.write(f"         no writable ancestor for {t['parent']}\n")
+        for extra in t.get("blockedExtraPaths", []):
+            out.write(f"         no writable ancestor for {os.path.dirname(extra)}\n")
     if not ok_flag:
         uid_label = uid if uid is not None else "(non-POSIX)"
         out.write(f"\npmsec doctor: at least one parent directory is not writable as uid {uid_label}.\n")
