@@ -146,6 +146,70 @@ CASES = [
         {"PMSEC_MISE_VERSION": "2026.11.0", "MISE_GLOBAL_CONFIG_FILE": "<HOME>/custom-global.toml"},
         ["--tool", "mise", "--days", "1", "--json"],
     ),
+    (
+        "enable_mise_new_mode_shared_env_inherit",
+        {".config/mise/miserc.toml": 'env = ["shared"]\nkept = true\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_system_env_inherit",
+        {"etc-mise/miserc.toml": 'env = ["system-wide"]\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_moves_pmsec_last",
+        {".config/mise/miserc.local.toml": 'env = ["pmsec", "work"]\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_idempotent",
+        {},
+        "enable_mise_new_mode_fresh",
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+        {"pre": [["--tool", "mise", "--days", "1", "--json"]]},
+    ),
+    (
+        "disable_mise_selector_only",
+        {".config/mise/miserc.local.toml": 'env = ["work", "pmsec"]\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--disable", "--json"],
+    ),
+    (
+        "enable_mise_reverse_migration_selector_only",
+        {".config/mise/miserc.local.toml": 'env = ["pmsec"]\n'},
+        None,
+        {"PMSEC_MISE_VERSION": "none"},
+        ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/miserc.local.toml"]},
+    ),
+    (
+        "enable_mise_legacy_global_file_no_artifacts",
+        {},
+        None,
+        {"PMSEC_MISE_VERSION": "2026.11.0", "MISE_GLOBAL_CONFIG_FILE": "<HOME>/custom-global.toml"},
+        ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml", ".config/mise/miserc.local.toml"]},
+    ),
+    (
+        "check_mise_after_reverse_migration",
+        {
+            ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',
+            ".config/mise/miserc.local.toml": 'env = ["pmsec"]\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "none"},
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+        {"pre": [["--tool", "mise", "--days", "1", "--json"]],
+         "missing": [".config/mise/config.pmsec.toml", ".config/mise/miserc.local.toml"]},
+    ),
 ]
 
 
@@ -173,7 +237,7 @@ def normalize(value, home: Path):
     return value
 
 
-def run_case(name, setup, setup_from, env_overrides, args, generated):
+def run_case(name, setup, setup_from, env_overrides, args, generated, pre=(), missing=()):
     home = Path(tempfile.mkdtemp(prefix="pmsec-gen-"))
     try:
         effective = dict(setup)
@@ -183,35 +247,48 @@ def run_case(name, setup, setup_from, env_overrides, args, generated):
             target = home / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(body.replace("<HOME>", str(home)))
+        env = env_for(home, env_overrides)
+        for step in pre:
+            subprocess.run(
+                ["node", str(REPO / "node" / "bin" / "cli.mjs"), *step],
+                env=env, cwd=REPO, capture_output=True, text=True, check=True,
+            )
         proc = subprocess.run(
             ["node", str(REPO / "node" / "bin" / "cli.mjs"), *args],
-            env=env_for(home, env_overrides), cwd=REPO, capture_output=True, text=True,
+            env=env, cwd=REPO, capture_output=True, text=True,
         )
         out = proc.stdout[proc.stdout.index("{"):]
         files = {}
         for path in sorted(home.rglob("*")):
             if not path.is_file() or path.name.endswith(".bak"):
                 continue
-            rel = path.relative_to(home).as_posix()
-            if rel.startswith("etc-mise/"):
-                continue
-            files[rel] = normalize(path.read_text(), home)
-        return {
+            files[path.relative_to(home).as_posix()] = normalize(path.read_text(), home)
+        gone = [rel for rel in missing if not (home / rel).exists()]
+        if len(gone) != len(missing):
+            raise SystemExit(f"{name}: expected missing files were present: {sorted(set(missing) - set(gone))}")
+        case = {
             "setup": effective,
             "env": env_overrides,
             "args": args,
+        }
+        if pre:
+            case["pre"] = list(pre)
+        case.update({
             "expected_exit": proc.returncode,
             "expected_json": normalize(json.loads(out), home),
             "expected_files": files,
-        }
+        })
+        if missing:
+            case["expected_missing"] = list(missing)
+        return case
     finally:
         shutil.rmtree(home, ignore_errors=True)
 
 
 def main():
     generated = {}
-    for name, setup, setup_from, env_overrides, args in CASES:
-        case = run_case(name, setup, setup_from, env_overrides, args, generated)
+    for name, setup, setup_from, env_overrides, args, *rest in CASES:
+        case = run_case(name, setup, setup_from, env_overrides, args, generated, **(rest[0] if rest else {}))
         path = REPO / "conformance" / "cases" / f"{name}.json"
         path.write_text(json.dumps(case, indent=2) + "\n")
         generated[name] = case

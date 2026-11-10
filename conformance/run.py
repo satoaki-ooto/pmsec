@@ -127,6 +127,9 @@ def run_case(impl: str, case_path: Path) -> tuple[bool, str]:
             got = (home / rel).read_bytes().decode("utf-8") if (home / rel).exists() else None
             if got != body:
                 return False, f"file mismatch: {rel}\n  expected: {body!r}\n  actual:   {got!r}"
+        for rel in case.get("expected_missing", []):
+            if (home / rel).exists():
+                return False, f"file should have been removed: {rel}"
         return True, ""
     finally:
         shutil.rmtree(home, ignore_errors=True)

@@ -1,0 +1,29 @@
+{
+  "setup": {
+    ".config/mise/miserc.local.toml": "env = [\"work\", \"pmsec\"]\n"
+  },
+  "env": {
+    "PMSEC_MISE_VERSION": "2026.11.0"
+  },
+  "args": [
+    "--tool",
+    "mise",
+    "--disable",
+    "--json"
+  ],
+  "expected_exit": 0,
+  "expected_json": {
+    "results": [
+      {
+        "tool": "mise",
+        "path": "<HOME>/.config/mise/config.pmsec.toml",
+        "removed": true,
+        "ok": true
+      }
+    ],
+    "ok": true
+  },
+  "expected_files": {
+    ".config/mise/miserc.local.toml": "env = [\"work\"]\n"
+  }
+}
