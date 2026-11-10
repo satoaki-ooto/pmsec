@@ -318,7 +318,10 @@ def _disable(args, targets, ctx: Context, out, err):
         try:
             r = t.unset(ctx)
             results.append({"tool": t.NAME, "path": r["path"], "removed": r["removed"], "ok": True})
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError: a malformed miserc selector raises while cleaning up,
+            # potentially after earlier files were already modified — report a
+            # failed result instead of a traceback, like the enable path.
             msg = _explain_fs_error(exc, t.NAME)
             failures.append(msg)
             results.append({"tool": t.NAME, "path": getattr(exc, "filename", None), "removed": False, "ok": False, "error": msg})

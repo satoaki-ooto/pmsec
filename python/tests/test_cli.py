@@ -609,6 +609,17 @@ def test_mise_new_mode_honors_xdg_and_config_dir(tmp_path):
     assert json.loads(out)["tools"][0]["path"] == str(custom / "config.pmsec.toml")
 
 
+def test_disable_reports_malformed_selector(tmp_path):
+    (tmp_path / ".config" / "mise").mkdir(parents=True)
+    (tmp_path / ".config" / "mise" / "miserc.local.toml").write_text("env = [1]\n")
+    code, out, err = run(["--disable", "--tool", "mise", "--json"], tmp_path)
+    data = json.loads(out)
+    assert code != 0
+    assert data["ok"] is False
+    assert data["results"][0]["ok"] is False
+    assert "miserc env may only contain string names" in data["results"][0]["error"]
+
+
 def test_mise_legacy_migration_follows_config_dir(tmp_path):
     custom = tmp_path / "mise-custom"
     run(["--tool", "mise", "--days", "1"], tmp_path, PMSEC_MISE_VERSION="2026.11.0",
