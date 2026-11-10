@@ -1199,11 +1199,14 @@ _miserc_parse_array() {
 
 miserc_parse_env() {
   MISE_ENVDEF=0; MISE_ENV_START=-1; MISE_ENV_END=-1; MISE_ENV_VALUES=()
+  # TOML treats "env", 'env', and env as the same key; recognize all three so
+  # migration replaces the existing assignment instead of adding a duplicate.
+  local env_key_re="^[[:space:]]*(\"env\"|'env'|env)[[:space:]]*="
   lines_scan
   local n=${#LINES_BUF[@]} i line prefix
   for ((i=0; i<n; i++)); do
     lines_is_section "${SCAN_BUF[i]}" && break
-    [[ "${SCAN_BUF[i]}" =~ ^[[:space:]]*env[[:space:]]*= ]] || continue
+    [[ "${SCAN_BUF[i]}" =~ $env_key_re ]] || continue
     line="${LINES_BUF[i]}"; prefix="${line%%=*}"
     MISE_ENV_START="$i"
     MISERC_J="$i"; MISERC_K=$((${#prefix}+1))

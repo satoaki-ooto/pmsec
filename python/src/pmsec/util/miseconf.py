@@ -8,7 +8,9 @@ from .lines import scan_view
 # pmsec-owned `config.pmsec.toml` layer. Only the pieces pmsec needs are
 # modelled: a single top-level `env = [...]` array of environment names.
 
-_ENV_KEY = re.compile(r"^\s*env\s*=\s*(.*)$")
+# TOML treats "env", 'env', and env as the same key; recognize all three so
+# migration replaces the existing assignment instead of adding a duplicate.
+_ENV_KEY = re.compile(r'^\s*(?:"env"|\'env\'|env)\s*=\s*(.*)$')
 _SECTION = re.compile(r"^\s*\[")
 
 

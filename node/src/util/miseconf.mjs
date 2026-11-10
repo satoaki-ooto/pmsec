@@ -4,7 +4,9 @@
 
 import { scanView } from "./lines.mjs";
 
-const ENV_KEY = /^\s*env\s*=\s*(.*)$/;
+// TOML treats "env", 'env', and env as the same key; recognize all three so
+// migration replaces the existing assignment instead of adding a duplicate.
+const ENV_KEY = /^\s*(?:"env"|'env'|env)\s*=\s*(.*)$/;
 const SECTION = /^\s*\[/;
 
 function decodeBasicString(s) {

@@ -208,6 +208,13 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "enable_mise_new_mode_quoted_env_key",
+        {".config/mise/miserc.local.toml": '"env" = ["work"]\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
         "enable_mise_new_mode_moves_pmsec_last",
         {".config/mise/miserc.local.toml": 'env = ["pmsec", "work"]\nother = 1\n'},
         None,
