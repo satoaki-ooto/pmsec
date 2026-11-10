@@ -134,16 +134,19 @@ async function firstEnv(p) {
   return { values: [], path: null };
 }
 
+// pmsec is only the effective layer when it loads last: later environments
+// override earlier ones, so membership alone cannot prove the hardened
+// values win.
 async function selectorState(ctx, p) {
   const fromVar = envListFrom(ctx.env.MISE_ENV);
   if (fromVar.length) {
-    return { path: "MISE_ENV", env: fromVar, wired: fromVar.includes("pmsec") };
+    return { path: "MISE_ENV", env: fromVar, wired: fromVar[fromVar.length - 1] === "pmsec" };
   }
   const inherited = await firstEnv(p);
   return {
     path: inherited.path ?? p.local,
     env: inherited.values,
-    wired: inherited.values.includes("pmsec"),
+    wired: inherited.values[inherited.values.length - 1] === "pmsec",
   };
 }
 

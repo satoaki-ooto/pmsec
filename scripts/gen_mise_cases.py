@@ -81,6 +81,13 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--check", "--json"],
     ),
     (
+        "check_mise_new_mode_mise_env_pmsec_not_last",
+        {},
+        "enable_mise_new_mode_fresh",
+        {**NEW_MODE, "MISE_ENV": "pmsec,work"},
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+    ),
+    (
         "enable_mise_new_mode_mise_env_warns",
         {},
         "enable_mise_new_mode_fresh",

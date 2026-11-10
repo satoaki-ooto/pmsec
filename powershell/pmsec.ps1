@@ -1239,10 +1239,13 @@ function MiseHasNewArtifacts {
 
 function MiseSelectorState {
   $result = @{ Path = $null; Env = @(); Wired = $false }
+  # pmsec is only the effective layer when it loads last: later environments
+  # override earlier ones, so membership alone cannot prove the hardened
+  # values win.
   if ($env:MISE_ENV) {
     $result.Path = 'MISE_ENV'
     $result.Env = @(MiseEnvList $env:MISE_ENV)
-    $result.Wired = ($result.Env -ccontains 'pmsec')
+    $result.Wired = ($result.Env.Count -gt 0 -and $result.Env[-1] -ceq 'pmsec')
     return $result
   }
   foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
@@ -1252,7 +1255,7 @@ function MiseSelectorState {
     if (-not $parsed.Defined) { continue }
     $result.Path = $p
     $result.Env = @($parsed.Values)
-    $result.Wired = (@($parsed.Values) -ccontains 'pmsec')
+    $result.Wired = ($result.Env.Count -gt 0 -and $result.Env[-1] -ceq 'pmsec')
     return $result
   }
   $result.Path = (Get-MiseLocalMiserc)

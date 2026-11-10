@@ -169,12 +169,12 @@ def _first_env(p: dict[str, Path]) -> dict:
 def _selector_state(ctx: Context, p: dict[str, Path]) -> dict:
     from_var = env_list_from(ctx.env.get("MISE_ENV"))
     if from_var:
-        return {"path": "MISE_ENV", "env": from_var, "wired": "pmsec" in from_var}
+        return {"path": "MISE_ENV", "env": from_var, "wired": bool(from_var) and from_var[-1] == "pmsec"}
     inherited = _first_env(p)
     return {
         "path": str(inherited["path"] or p["local"]),
         "env": inherited["values"],
-        "wired": "pmsec" in inherited["values"],
+        "wired": bool(inherited["values"]) and inherited["values"][-1] == "pmsec",
     }
 
 
