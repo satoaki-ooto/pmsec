@@ -103,6 +103,28 @@ path_mise() {
   fi
   printf '%s/mise/config.toml' "${XDG_CONFIG_HOME:-$home/.config}"
 }
+# mise's global config directory (https://mise.jdx.dev/directories.html).
+# Unlike the legacy single-file path above this is the same on every OS:
+# win32 uses %USERPROFILE%/.config/mise, not %LOCALAPPDATA%/mise.
+path_mise_dir() {
+  local home; home=$(_pmsec_home)
+  if [ -n "${MISE_CONFIG_DIR:-}" ]; then printf '%s' "$MISE_CONFIG_DIR"; return; fi
+  if [ -n "${XDG_CONFIG_HOME:-}" ]; then printf '%s/mise' "$XDG_CONFIG_HOME"; return; fi
+  printf '%s/.config/mise' "$home"
+}
+path_mise_base() { printf '%s/config.toml' "$(path_mise_dir)"; }
+path_mise_pmsec() { printf '%s/config.pmsec.toml' "$(path_mise_dir)"; }
+path_mise_local_miserc() { printf '%s/miserc.local.toml' "$(path_mise_dir)"; }
+path_mise_shared_miserc() { printf '%s/miserc.toml' "$(path_mise_dir)"; }
+path_mise_system_miserc() {
+  local home
+  if [ -n "${MISE_SYSTEM_CONFIG_DIR:-}" ]; then printf '%s/miserc.toml' "$MISE_SYSTEM_CONFIG_DIR"; return; fi
+  if [ "${PMSEC_PLATFORM:-}" = "win32" ]; then
+    home=$(_pmsec_home)
+    if [[ "$home" == [A-Za-z]:* ]]; then printf '%s/etc/mise/miserc.toml' "${home:0:2}"; return; fi
+  fi
+  printf '/etc/mise/miserc.toml'
+}
 path_aube() {
   local home; home=$(_pmsec_home)
   if [ -n "${AUBE_CONFIG_FILE:-}" ]; then printf '%s' "$AUBE_CONFIG_FILE"; return; fi
@@ -1054,6 +1076,385 @@ parse_days_dw() {
 # mise additionally accepts months/years.
 parse_days_mise() { parse_days_dw "$1" 1; }
 
+# ---------- mise: mode, miserc env selector, generations ----------
+
+MISE_MIGRATION_WARN='a previous new-style mise configuration exists (config.pmsec.toml or the pmsec miserc selector); run `pmsec` to consolidate it'
+MISE_ENV_WARN='MISE_ENV overrides miserc and the pmsec environment is not active in this shell'
+
+# supportsNewMode = detected mise >= 2026.11.0 AND no MISE_GLOBAL_CONFIG_FILE.
+mise_supports_new_mode() {
+  [ -z "${MISE_GLOBAL_CONFIG_FILE:-}" ] || return 1
+  local v; v=$(version_detect mise) || return 1
+  set -- $v
+  version_gte "$1" "$2" "$3" 2026 11 0
+}
+
+mise_has_new_artifacts() {
+  if [ -e "$(path_mise_pmsec)" ]; then return 0; fi
+  local localp; localp=$(path_mise_local_miserc)
+  [ -e "$localp" ] || return 1
+  lines_load "$localp"
+  miserc_parse_env || return 1
+  [ "$MISE_ENVDEF" = "1" ] || return 1
+  local v
+  for v in "${MISE_ENV_VALUES[@]}"; do
+    [ "$v" = "pmsec" ] && return 0
+  done
+  return 1
+}
+
+# Parse the top-level `env = [...]` assignment currently in LINES_BUF.
+# Sets MISE_ENVDEF=1, MISE_ENV_START/END (line indexes), and MISE_ENV_VALUES.
+# Returns 0 when defined, 1 when absent/not top-level, 2 when invalid.
+MISERC_J=0; MISERC_K=0; MISERC_CH=""
+_miserc_skip() {
+  local line ch
+  while :; do
+    if [ "$MISERC_J" -ge "${#LINES_BUF[@]}" ]; then MISERC_CH=""; return 1; fi
+    line="${LINES_BUF[MISERC_J]}"
+    if [ "$MISERC_K" -ge "${#line}" ]; then MISERC_J=$((MISERC_J+1)); MISERC_K=0; continue; fi
+    ch="${line:MISERC_K:1}"
+    if [ "$ch" = "#" ]; then MISERC_J=$((MISERC_J+1)); MISERC_K=0; continue; fi
+    if [[ "$ch" =~ [[:space:]] ]]; then MISERC_K=$((MISERC_K+1)); continue; fi
+    MISERC_CH="$ch"; return 0
+  done
+}
+
+_miserc_parse_array() {
+  local line ch quote val closed
+  _miserc_skip || return 1
+  [ "$MISERC_CH" = "[" ] || return 1
+  MISERC_K=$((MISERC_K+1))
+  while :; do
+    _miserc_skip || return 1
+    case "$MISERC_CH" in
+      "]") MISERC_K=$((MISERC_K+1)); break ;;
+      ",") MISERC_K=$((MISERC_K+1)); continue ;;
+      '"'|"'") quote="$MISERC_CH"; MISERC_K=$((MISERC_K+1)) ;;
+      *) return 1 ;;
+    esac
+    val=""; closed=0
+    while [ "$MISERC_J" -lt "${#LINES_BUF[@]}" ]; do
+      line="${LINES_BUF[MISERC_J]}"
+      if [ "$MISERC_K" -ge "${#line}" ]; then MISERC_J=$((MISERC_J+1)); MISERC_K=0; continue; fi
+      ch="${line:MISERC_K:1}"
+      if [ "$quote" = '"' ] && [ "$ch" = "\\" ]; then
+        MISERC_K=$((MISERC_K+1)); ch="${line:MISERC_K:1}"; val+="$ch"; MISERC_K=$((MISERC_K+1)); continue
+      fi
+      if [ "$ch" = "$quote" ]; then MISERC_K=$((MISERC_K+1)); closed=1; break; fi
+      val+="$ch"; MISERC_K=$((MISERC_K+1))
+    done
+    [ "$closed" = "1" ] || return 1
+    MISE_ENV_VALUES[${#MISE_ENV_VALUES[@]}]="$val"
+  done
+  MISE_ENV_END="$MISERC_J"
+  return 0
+}
+
+miserc_parse_env() {
+  MISE_ENVDEF=0; MISE_ENV_START=-1; MISE_ENV_END=-1; MISE_ENV_VALUES=()
+  local n=${#LINES_BUF[@]} i line prefix
+  for ((i=0; i<n; i++)); do
+    lines_is_section "${LINES_BUF[i]}" && break
+    [[ "${LINES_BUF[i]}" =~ ^[[:space:]]*env[[:space:]]*= ]] || continue
+    line="${LINES_BUF[i]}"; prefix="${line%%=*}"
+    MISE_ENV_START="$i"
+    MISERC_J="$i"; MISERC_K=$((${#prefix}+1))
+    _miserc_parse_array || return 2
+    MISE_ENVDEF=1
+    return 0
+  done
+  return 1
+}
+
+miserc_quote() {
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# Replace/insert the top-level env assignment in LINES_BUF with the given names.
+miserc_set_env_values() {
+  local line="env = [" v first=1 idx
+  for v in "$@"; do
+    [ "$first" = "1" ] || line+=", "
+    first=0; line+="$(miserc_quote "$v")"
+  done
+  line+="]"
+  if [ "$MISE_ENVDEF" = "1" ]; then
+    _lines_splice_out "$MISE_ENV_START" $((MISE_ENV_END - MISE_ENV_START + 1))
+    _lines_splice_in "$MISE_ENV_START" "$line"
+    return 0
+  fi
+  lines_scan
+  idx=$(lines_first_section_idx)
+  if [ "$idx" = "-1" ]; then
+    LINES_BUF[${#LINES_BUF[@]}]="$line"
+  elif [ "$idx" -gt 0 ] && [ -z "${LINES_BUF[idx-1]}" ]; then
+    _lines_splice_in $((idx-1)) "$line"
+  else
+    _lines_splice_in "$idx" "$line"
+  fi
+}
+
+# Remove $1 (pmsec) from the env assignment in LINES_BUF. Returns 0 if changed.
+miserc_remove_env_value() {
+  local name="$1" v line kept=() changed=0
+  [ "$MISE_ENVDEF" = "1" ] || return 1
+  for v in "${MISE_ENV_VALUES[@]}"; do
+    if [ "$v" = "$name" ]; then changed=1; else kept[${#kept[@]}]="$v"; fi
+  done
+  [ "$changed" = "1" ] || return 1
+  if [ "${#kept[@]}" -eq 0 ]; then
+    _lines_splice_out "$MISE_ENV_START" $((MISE_ENV_END - MISE_ENV_START + 1))
+    return 0
+  fi
+  # Rebuild in place (MISE_ENVDEF still points at the original assignment).
+  line="env = ["; local first=1
+  for v in "${kept[@]}"; do
+    [ "$first" = "1" ] || line+=", "
+    first=0; line+="$(miserc_quote "$v")"
+  done
+  line+="]"
+  _lines_splice_out "$MISE_ENV_START" $((MISE_ENV_END - MISE_ENV_START + 1))
+  _lines_splice_in "$MISE_ENV_START" "$line"
+  return 0
+}
+
+_miserc_buf_empty() {
+  local l
+  for l in "${LINES_BUF[@]}"; do [ -n "${l//[[:space:]]/}" ] && return 1; done
+  return 0
+}
+
+# Load the first miserc file (local -> shared -> system) that defines env into
+# MISE_BASE_ENV_VALUES. Invalid env fails before any write.
+mise_inherited_env() {
+  local p r i
+  MISE_BASE_ENV_VALUES=()
+  for p in "$(path_mise_local_miserc)" "$(path_mise_shared_miserc)" "$(path_mise_system_miserc)"; do
+    [ -e "$p" ] || continue
+    lines_load "$p"
+    miserc_parse_env; r=$?
+    if [ "$r" = "2" ]; then
+      printf 'pmsec: invalid mise miserc env in %s\n' "$p" >&2
+      return 1
+    fi
+    [ "$r" = "0" ] || continue
+    for ((i=0; i<${#MISE_ENV_VALUES[@]}; i++)); do MISE_BASE_ENV_VALUES[i]="${MISE_ENV_VALUES[i]}"; done
+    return 0
+  done
+  return 0
+}
+
+mise_env_list() { local IFS=','; set -f; set -- $1; set +f; printf '%s\n' "$@"; }
+
+mise_env_warning() {
+  local e v
+  [ -n "${MISE_ENV:-}" ] || return 0
+  while IFS= read -r e; do
+    [ "$e" = "pmsec" ] && return 0
+  done < <(mise_env_list "$MISE_ENV")
+  printf '%s' "$MISE_ENV_WARN"
+}
+
+MISE_SELECTOR_PATH=""; MISE_SELECTOR_WIRED=0; MISE_SELECTOR_VALUES=()
+mise_selector_state() {
+  local p r i e
+  MISE_SELECTOR_PATH=""; MISE_SELECTOR_WIRED=0; MISE_SELECTOR_VALUES=()
+  if [ -n "${MISE_ENV:-}" ]; then
+    MISE_SELECTOR_PATH="MISE_ENV"
+    while IFS= read -r e; do
+      [ -n "$e" ] || continue
+      MISE_SELECTOR_VALUES[${#MISE_SELECTOR_VALUES[@]}]="$e"
+      [ "$e" = "pmsec" ] && MISE_SELECTOR_WIRED=1
+    done < <(mise_env_list "$MISE_ENV")
+    return 0
+  fi
+  for p in "$(path_mise_local_miserc)" "$(path_mise_shared_miserc)" "$(path_mise_system_miserc)"; do
+    [ -e "$p" ] || continue
+    lines_load "$p"
+    miserc_parse_env; r=$?
+    [ "$r" = "2" ] && return 2
+    [ "$r" = "0" ] || continue
+    MISE_SELECTOR_PATH="$p"
+    for ((i=0; i<${#MISE_ENV_VALUES[@]}; i++)); do
+      MISE_SELECTOR_VALUES[i]="${MISE_ENV_VALUES[i]}"
+      [ "${MISE_ENV_VALUES[i]}" = "pmsec" ] && MISE_SELECTOR_WIRED=1
+    done
+    return 0
+  done
+  MISE_SELECTOR_PATH="$(path_mise_local_miserc)"
+  return 0
+}
+
+mise_read_merged() {
+  local p q dup val d best=-1 bestval="" fallback=""
+  MISE_READ_FILES=()
+  for p in "$@"; do
+    dup=0
+    for q in "${MISE_READ_FILES[@]}"; do [ "$q" = "$p" ] && dup=1; done
+    [ "$dup" = "1" ] && continue
+    MISE_READ_FILES[${#MISE_READ_FILES[@]}]="$p"
+    lines_load "$p"
+    if val=$(lines_read_key "minimum_release_age" "=" "settings"); then
+      [ -z "$fallback" ] && fallback="$val"
+      if d=$(parse_days_mise "$val"); then
+        if [ "$best" -lt 0 ] || [ "$d" -gt "$best" ]; then best="$d"; bestval="$val"; fi
+      fi
+    fi
+  done
+  if [ -n "$bestval" ]; then MISE_READ_CONFIGURED="$bestval"; else MISE_READ_CONFIGURED="$fallback"; fi
+  if [ "$best" -ge 0 ]; then MISE_READ_DAYS="$best"; else MISE_READ_DAYS=""; fi
+}
+
+MISE_READ_PATH=""; MISE_READ_WARN=""; MISE_READ_ROWFAIL=0; MISE_READ_FILES=()
+MISE_READ_CONFIGURED=""; MISE_READ_DAYS=""
+# Read mise into the MISE_READ_* globals. Echoes "configured|days" for callers
+# that still use command substitution; cmd_check calls this directly so the
+# metadata survives (command substitution runs in a subshell).
+tool_read_mise() {
+  local legacy base pmsec action r
+  legacy=$(path_mise); base=$(path_mise_base); pmsec=$(path_mise_pmsec)
+  action="${MODE:-enable}"
+  MISE_READ_WARN=""; MISE_READ_ROWFAIL=0
+  if mise_supports_new_mode; then
+    if [ "$action" = "enable" ]; then
+      mise_read_merged "$legacy" "$base" "$pmsec"
+    else
+      mise_read_merged "$pmsec"
+    fi
+    MISE_READ_PATH="$pmsec"
+    mise_selector_state; r=$?
+    if [ "$r" = "2" ]; then
+      printf 'pmsec: invalid mise miserc env\n' >&2
+      return 1
+    fi
+    MISE_READ_WARN=$(mise_env_warning)
+    [ "$MISE_SELECTOR_WIRED" = "1" ] || MISE_READ_ROWFAIL=1
+  else
+    if mise_has_new_artifacts && [ "$action" = "enable" ]; then
+      mise_read_merged "$legacy" "$base" "$pmsec"
+    else
+      mise_read_merged "$legacy"
+    fi
+    MISE_READ_PATH="$legacy"
+    if mise_has_new_artifacts; then
+      MISE_READ_WARN="$MISE_MIGRATION_WARN"; MISE_READ_ROWFAIL=1
+    fi
+  fi
+  printf '%s|%s' "$MISE_READ_CONFIGURED" "$MISE_READ_DAYS"
+}
+
+_mise_buf_only_structure() {
+  local l t
+  for l in "${LINES_BUF[@]}"; do
+    t="${l//[[:space:]]/}"
+    [ -z "$t" ] && continue
+    [ "${t:0:1}" = "#" ] && continue
+    lines_is_section "$l" && continue
+    return 1
+  done
+  return 0
+}
+
+# Remove pmsec-managed keys from a config file. Never deletes it.
+mise_remove_managed_from() {
+  local path="$1" ek ev el es esec esafe removed=0
+  [ -e "$path" ] || return 1
+  lines_load "$path"
+  lines_remove_key "minimum_release_age" "=" "settings" && removed=1
+  while IFS='|' read -r ek ev el es esec esafe; do
+    [ -z "$ek" ] && continue
+    lines_remove_key "$ek" "$es" "$esec" && removed=1
+  done < <(tool_extras mise)
+  [ "$removed" = "1" ] || return 1
+  lines_dump | write_atomic "$path"
+}
+
+# Remove pmsec-managed keys from config.pmsec.toml; delete it when nothing but
+# whitespace / empty section headers remain.
+mise_remove_managed_config() {
+  local path="$1" ek ev el es esec esafe removed=0
+  [ -e "$path" ] || return 1
+  lines_load "$path"
+  lines_remove_key "minimum_release_age" "=" "settings" && removed=1
+  while IFS='|' read -r ek ev el es esec esafe; do
+    [ -z "$ek" ] && continue
+    lines_remove_key "$ek" "$es" "$esec" && removed=1
+  done < <(tool_extras mise)
+  [ "$removed" = "1" ] || return 1
+  if _mise_buf_only_structure; then rm -f -- "$path"; else lines_dump | write_atomic "$path"; fi
+}
+
+# Remove the pmsec selector from miserc.local.toml. Other env names/keys survive.
+mise_remove_selector() {
+  local localp="$1" r
+  [ -e "$localp" ] || return 1
+  lines_load "$localp"
+  miserc_parse_env; r=$?
+  [ "$r" = "0" ] || return 1
+  miserc_remove_env_value "pmsec" || return 1
+  if _miserc_buf_empty; then rm -f -- "$localp"; else lines_dump | write_atomic "$localp"; fi
+}
+
+tool_write_mise() {
+  local days="$1" legacy base pmsec localp r v
+  local -a vals=()
+  legacy=$(path_mise); base=$(path_mise_base); pmsec=$(path_mise_pmsec); localp=$(path_mise_local_miserc)
+  if mise_supports_new_mode; then
+    # Resolve the selector before writing anything: an invalid env array must
+    # not leave a half-migrated pair of generations.
+    mise_inherited_env || return 1
+    for v in "${MISE_BASE_ENV_VALUES[@]}"; do [ "$v" = "pmsec" ] || vals[${#vals[@]}]="$v"; done
+    vals[${#vals[@]}]="pmsec"
+    lines_load "$localp"
+    miserc_parse_env; r=$?
+    [ "$r" = "2" ] && { printf 'pmsec: invalid mise miserc env\n' >&2; return 1; }
+
+    _tool_write_one "$pmsec" "minimum_release_age" "minimum_release_age = \"${days}d\"" "=" "settings" "mise" 0 || return 1
+
+    lines_load "$localp"
+    miserc_parse_env; r=$?
+    [ "$r" = "2" ] && { printf 'pmsec: invalid mise miserc env\n' >&2; return 1; }
+    miserc_set_env_values "${vals[@]}"
+    lines_dump | write_atomic "$localp" || return 1
+
+    # A distinct baseConfig is left untouched; only the legacy write target
+    # loses pmsec-managed keys.
+    mise_remove_managed_from "$legacy" || true
+    return 0
+  fi
+
+  _tool_write_one "$legacy" "minimum_release_age" "minimum_release_age = \"${days}d\"" "=" "settings" "mise" 0 || return 1
+  if mise_has_new_artifacts; then
+    # Reverse migration writes the destination before cleaning the new
+    # generation so an interrupted cleanup cannot create a no-config gap.
+    mise_remove_managed_config "$pmsec" || true
+    mise_remove_selector "$localp" || true
+  fi
+}
+
+tool_unset_mise() {
+  local legacy pmsec localp removed=0
+  legacy=$(path_mise); pmsec=$(path_mise_pmsec); localp=$(path_mise_local_miserc)
+  mise_remove_managed_from "$legacy" && removed=1
+  mise_remove_managed_config "$pmsec" && removed=1
+  mise_remove_selector "$localp" && removed=1
+  printf '%d' "$removed"
+}
+
+mise_doctor_paths() {
+  if mise_supports_new_mode; then
+    MISE_DOCTOR_PATH=$(path_mise_pmsec)
+    MISE_DOCTOR_EXTRA=("$(path_mise)" "$(path_mise_local_miserc)")
+  else
+    MISE_DOCTOR_PATH=$(path_mise)
+    MISE_DOCTOR_EXTRA=()
+  fi
+}
+
+
 # cargo [registry].global-min-publish-age (cargo >= 1.100) uses a quoted
 # human duration such as "7 days" rather than the old "7d" syntax.
 parse_days_cargo_publish_age() {
@@ -1176,6 +1577,7 @@ tool_unset_composer() {
 tool_read() {
   local tool="$1" key sep section path val days bval
   if [ "$tool" = "composer" ]; then tool_read_composer; return; fi
+  if [ "$tool" = "mise" ]; then tool_read_mise; return; fi
   key=$(tool_key "$tool"); sep=$(tool_sep "$tool"); section=$(tool_section "$tool")
   path=$(tool_path "$tool")
   if [ "$tool" = "pnpm" ] && pnpm_uses_yaml; then
@@ -1263,6 +1665,7 @@ _tool_write_one() {
 tool_write() {
   local tool="$1" days="$2" path key sep section line
   if [ "$tool" = "composer" ]; then tool_write_composer "$days"; return; fi
+  if [ "$tool" = "mise" ]; then tool_write_mise "$days"; return; fi
   path=$(tool_path "$tool"); key=$(tool_key "$tool")
   sep=$(tool_sep "$tool"); section=$(tool_section "$tool")
   line=$(tool_write_value_line "$tool" "$days")
@@ -1300,6 +1703,7 @@ _tool_unset_one() {
 tool_unset() {
   local tool="$1" path removed=0 r
   if [ "$tool" = "composer" ]; then tool_unset_composer; return; fi
+  if [ "$tool" = "mise" ]; then tool_unset_mise; return; fi
   path=$(tool_path "$tool")
   r=$(_tool_unset_one "$path" "$tool" 0) || return 1
   [ "$r" = "1" ] && removed=1
@@ -1329,6 +1733,27 @@ _composer_extra() {
   printf '%s|%s|%s|%s|0\n' "$key" "$cur" "$expected" "$ok"
 }
 
+tool_read_extras_mise() {
+  local ek ev el es esec esafe p cur chosen ok
+  while IFS='|' read -r ek ev el es esec esafe; do
+    [ -z "$ek" ] && continue
+    chosen=""; ok=0
+    for p in "${MISE_READ_FILES[@]}"; do
+      lines_load "$p"
+      if cur=$(lines_read_key "$ek" "$es" "$esec"); then
+        if [ -z "$chosen" ]; then chosen="$cur"; fi
+        if [ -n "$esafe" ]; then
+          case ",$esafe," in *",$cur,"*) ok=1; chosen="$cur" ;; esac
+        elif [ "$cur" = "$ev" ]; then
+          ok=1; chosen="$cur"
+        fi
+        [ "$ok" = "1" ] && break
+      fi
+    done
+    printf '%s|%s|%s|%s|0\n' "$ek" "$chosen" "$ev" "$ok"
+  done < <(tool_extras mise)
+}
+
 tool_read_extras() {
   local tool="$1" path ek ev el es esec esafe cur ok def
   local pnpm_major="" extras_fn=tool_extras
@@ -1339,6 +1764,10 @@ tool_read_extras() {
     _composer_extra secure-http true config
     _composer_extra disable-tls false config
     _composer_extra abandoned '"fail"' config audit
+    return 0
+  fi
+  if [ "$tool" = "mise" ]; then
+    tool_read_extras_mise
     return 0
   fi
   if [ "$tool" = "pnpm" ]; then
@@ -1578,14 +2007,33 @@ pad4() {
 }
 
 cmd_check() {
-  local rows_json="" first=1 failing=0 failing_extras=0 tool path val days warn
+  local rows_json="" first=1 failing=0 failing_extras=0 row_failures=0 unwired=0 tool path val days warn r
   for tool in "${SELECTED[@]}"; do
     path=$(tool_path "$tool")
-    val=""; days=""
-    if r=$(tool_read "$tool"); then
-      val="${r%|*}"; days="${r##*|}"
+    val=""; days=""; warn=""; local selector_json="" row_fail=0 mise_warn="" row_unwired=0
+    if [ "$tool" = "mise" ]; then
+      if tool_read_mise >/dev/null; then
+        val="$MISE_READ_CONFIGURED"; days="$MISE_READ_DAYS"; path="$MISE_READ_PATH"
+        mise_warn="$MISE_READ_WARN"; row_fail="$MISE_READ_ROWFAIL"
+      fi
+      warn=$(tool_preflight "$tool")
+      [ -n "$mise_warn" ] && warn="${warn:+$warn }$mise_warn"
+      if [ -n "$MISE_SELECTOR_PATH" ]; then
+        local sv="" first_v=1 iv
+        for ((iv=0; iv<${#MISE_SELECTOR_VALUES[@]}; iv++)); do
+          [ "$first_v" = "1" ] || sv+=", "
+          first_v=0; sv+=$(json_str "${MISE_SELECTOR_VALUES[iv]}")
+        done
+        selector_json="\"selector\": {\"path\": $(json_str "$MISE_SELECTOR_PATH"), \"env\": [$sv], \"wired\": $(json_bool "$MISE_SELECTOR_WIRED")}, "
+        if [ "$MISE_SELECTOR_WIRED" != "1" ]; then row_fail=1; row_unwired=1; unwired=$((unwired+1)); fi
+      fi
+      [ "$row_fail" = "1" ] && row_failures=$((row_failures+1))
+    else
+      if r=$(tool_read "$tool"); then
+        val="${r%|*}"; days="${r##*|}"
+      fi
+      warn=$(tool_preflight "$tool")
     fi
-    warn=$(tool_preflight "$tool")
     if [ -z "$days" ] || [ "$days" -lt "$OPT_DAYS" ]; then failing=$((failing+1)); fi
 
     # Collect extras for this tool into parallel arrays.
@@ -1615,6 +2063,7 @@ cmd_check() {
       rows_json+="\"path\": $(json_str "$path"), "
       rows_json+="\"configured\": $cfg_json, "
       rows_json+="\"days\": $days_json, "
+      rows_json+="$selector_json"
       rows_json+="\"warn\": $warn_json, "
       rows_json+='"extras": ['
       local ei
@@ -1633,6 +2082,7 @@ cmd_check() {
       status=$(status_for "$days" "$OPT_DAYS")
       printf '%s %s %s = %s  [%s]\n' "$status" "$(pad4 "$tool")" "$row_key" "$display" "$path"
       if [ -n "$warn" ]; then printf '       \xe2\x9a\xa0 %s\n' "$warn"; fi
+      if [ "$row_unwired" = "1" ] && [ -z "$warn" ]; then printf '       \xe2\x9a\xa0 pmsec env not selected  [%s]\n' "$MISE_SELECTOR_PATH"; fi
       local ei ex_status ex_display
       for ((ei=0; ei<${#extras_keys[@]}; ei++)); do
         if [ "${extras_def[ei]}" = "1" ]; then
@@ -1650,12 +2100,13 @@ cmd_check() {
   done
   if [ "$OPT_JSON" = "1" ]; then
     local ok="true"
-    { [ "$failing" -gt 0 ] || [ "$failing_extras" -gt 0 ]; } && ok="false"
+    { [ "$failing" -gt 0 ] || [ "$failing_extras" -gt 0 ] || [ "$row_failures" -gt 0 ]; } && ok="false"
     printf '{\n  "bundleDays": %d,\n  "rows": [\n%s\n  ],\n  "ok": %s\n}\n' "$OPT_DAYS" "$rows_json" "$ok"
   fi
   [ "$failing" -gt 0 ] && printf 'pmsec: %d tool(s) below %d days — run `pmsec`\n' "$failing" "$OPT_DAYS" >&2
   [ "$failing_extras" -gt 0 ] && printf 'pmsec: %d hardening setting(s) not at safe value — run `pmsec`\n' "$failing_extras" >&2
-  { [ "$failing" -gt 0 ] || [ "$failing_extras" -gt 0 ]; } && return 1
+  [ "$unwired" -gt 0 ] && printf 'pmsec: pmsec environment not selected by mise miserc — run `pmsec`\n' >&2
+  { [ "$failing" -gt 0 ] || [ "$failing_extras" -gt 0 ] || [ "$row_failures" -gt 0 ]; } && return 1
   return 0
 }
 
@@ -1713,6 +2164,11 @@ cmd_enable() {
     if ! out=$(tool_write "$tool" "$effective" 2>&1); then
       err=$(explain_fs_error "$tool" "$out" "$path")
       failures=$((failures+1))
+    fi
+    if [ "$tool" = "mise" ]; then
+      if mise_supports_new_mode; then path=$(path_mise_pmsec); else path=$(path_mise); fi
+      local mise_write_warn; mise_write_warn=$(mise_env_warning)
+      [ -n "$mise_write_warn" ] && warn="${warn:+$warn }$mise_write_warn"
     fi
     if [ -n "$warn" ]; then warn_count=$((warn_count+1)); fi
     if [ "$OPT_JSON" = "1" ]; then
@@ -1778,6 +2234,9 @@ cmd_disable() {
       removed="$out"
     else
       err=$(explain_fs_error "$tool" "$out" "$path"); failures=$((failures+1))
+    fi
+    if [ "$tool" = "mise" ]; then
+      if mise_supports_new_mode; then path=$(path_mise_pmsec); else path=$(path_mise); fi
     fi
     if [ "$OPT_JSON" = "1" ]; then
       local ok_json rm_json
@@ -1856,7 +2315,21 @@ cmd_doctor() {
   local rows_json="" first=1 ok_flag=1 t path probe
   local exists writable parent_exists parent_writable owner
   for t in "${SELECTED[@]}"; do
-    path=$(tool_path "$t")
+    local extra_members="" ep first_ep=1
+    if [ "$t" = "mise" ]; then
+      mise_doctor_paths; path="$MISE_DOCTOR_PATH"
+      if [ "${#MISE_DOCTOR_EXTRA[@]}" -gt 0 ]; then
+        extra_members=', "extraPaths": ['
+        for ep in "${MISE_DOCTOR_EXTRA[@]}"; do
+          [ "$first_ep" = "1" ] || extra_members+=", "
+          first_ep=0; extra_members+=$(json_str "$ep")
+        done
+        extra_members+=']'
+      fi
+    else
+      path=$(tool_path "$t")
+      MISE_DOCTOR_EXTRA=()
+    fi
     probe=$(_pmsec_probe_path "$path")
     set -- $probe
     exists="$1"; writable="$2"; parent_exists="$3"; parent_writable="$4"; owner="${5:-}"
@@ -1875,12 +2348,13 @@ cmd_doctor() {
       rows_json+="\"writable\": $(json_bool "$writable"), "
       rows_json+="\"parentExists\": $(json_bool "$parent_exists"), "
       rows_json+="\"parentWritable\": $(json_bool "$parent_writable"), "
-      rows_json+="\"owner\": $owner_json}"
+      rows_json+="\"owner\": $owner_json$extra_members}"
     else
       local flag owner_suffix=""
       if [ "$parent_writable" = "1" ]; then flag="ok    "; else flag="BLOCK "; fi
       [ "$exists" = "1" ] && [ -n "$owner" ] && owner_suffix=" (uid=$owner)"
       printf '%s %s %s%s\n' "$flag" "$(pad4 "$t")" "$path" "$owner_suffix"
+      for ep in "${MISE_DOCTOR_EXTRA[@]}"; do printf '         also: %s\n' "$ep"; done
       [ "$parent_writable" = "0" ] && \
         printf '         no writable ancestor for %s\n' "$(dirname -- "$path")"
     fi
