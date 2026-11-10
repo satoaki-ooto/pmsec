@@ -1070,12 +1070,21 @@ function MisercParseArray {
   if ($null -eq $ch) { $script:MisercErr = 'miserc env array is unterminated'; return $null }
   if ("$ch" -ne '[') { $script:MisercErr = 'miserc env must be an array'; return $null }
   $script:MsK++
+  # A comma is required between values; none may lead or repeat (a trailing
+  # comma stays valid TOML).
+  $needSep = $false
   while ($true) {
     $ch = MisercSkip
     if ($null -eq $ch) { $script:MisercErr = 'miserc env array is unterminated'; return $null }
     if ("$ch" -eq ']') { $script:MsK++; break }
-    if ("$ch" -eq ',') { $script:MsK++; continue }
+    if ("$ch" -eq ',') {
+      if (-not $needSep) { $script:MisercErr = 'miserc env has an unexpected comma'; return $null }
+      $needSep = $false
+      $script:MsK++
+      continue
+    }
     if ("$ch" -ne '"' -and "$ch" -ne "'") { $script:MisercErr = 'miserc env may only contain string names'; return $null }
+    if ($needSep) { $script:MisercErr = 'miserc env is missing a comma between names'; return $null }
     $quote = "$ch"
     $script:MsK++
     $val = [System.Text.StringBuilder]::new()
@@ -1119,6 +1128,7 @@ function MisercParseArray {
     }
     if (-not $closed) { $script:MisercErr = 'miserc env has an unterminated string'; return $null }
     [void]$values.Add($val.ToString())
+    $needSep = $true
   }
   return @{ Values = $values.ToArray() }
 }

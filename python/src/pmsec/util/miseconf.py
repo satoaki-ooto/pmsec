@@ -58,16 +58,24 @@ def _parse_array(lines: list[str], start_line: int, start_col: int) -> tuple[lis
         raise ValueError("miserc env must be an array")
     k += 1
     values: list[str] = []
+    # Separators are validated: a comma is required between values, and one
+    # may not lead or repeat (a trailing comma stays valid TOML).
+    need_sep = False
     while True:
         ch = skip_ignored()
         if ch == "]":
             k += 1
             break
         if ch == ",":
+            if not need_sep:
+                raise ValueError("miserc env has an unexpected comma")
+            need_sep = False
             k += 1
             continue
         if ch not in ('"', "'"):
             raise ValueError("miserc env may only contain string names")
+        if need_sep:
+            raise ValueError("miserc env is missing a comma between names")
         quote = ch
         k += 1
         value = ""
@@ -100,6 +108,7 @@ def _parse_array(lines: list[str], start_line: int, start_col: int) -> tuple[lis
         if not closed:
             raise ValueError("miserc env has an unterminated string")
         values.append(value)
+        need_sep = True
     return values, j
 
 

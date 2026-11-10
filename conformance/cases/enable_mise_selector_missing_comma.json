@@ -1,0 +1,38 @@
+{
+  "setup": {
+    ".config/mise/miserc.local.toml": "env = [\"pmsec\" \"work\"]\n"
+  },
+  "env": {
+    "PMSEC_MISE_VERSION": "2026.11.0"
+  },
+  "args": [
+    "--tool",
+    "mise",
+    "--days",
+    "1",
+    "--json"
+  ],
+  "expected_exit": 1,
+  "expected_json": {
+    "enabled": true,
+    "bundleDays": 1,
+    "results": [
+      {
+        "tool": "mise",
+        "path": null,
+        "days": 1,
+        "requested": 1,
+        "kept": false,
+        "forced": false,
+        "ok": false,
+        "error": "mise: miserc env is missing a comma between names",
+        "warn": null
+      }
+    ],
+    "warnings": [],
+    "ok": false
+  },
+  "expected_files": {
+    ".config/mise/miserc.local.toml": "env = [\"pmsec\" \"work\"]\n"
+  }
+}

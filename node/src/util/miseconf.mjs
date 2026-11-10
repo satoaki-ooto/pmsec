@@ -31,7 +31,8 @@ function decodeBasicString(s) {
 // Parse the value starting at `[` on lines[startLine] from startCol.
 // Comments (inside or between values) are ignored; bare identifiers, numbers,
 // and nested arrays are rejected so an unparseable selector never gets
-// silently rewritten.
+// silently rewritten. Separators are validated: a comma is required between
+// values, and one may not lead or repeat (a trailing comma stays valid TOML).
 function parseArray(lines, startLine, startCol) {
   let j = startLine, k = startCol;
 
@@ -51,11 +52,18 @@ function parseArray(lines, startLine, startCol) {
   if (ch !== "[") throw new Error("miserc env must be an array");
   k++;
   const values = [];
+  let needSep = false;
   for (;;) {
     ch = skipIgnored();
     if (ch === "]") { k++; break; }
-    if (ch === ",") { k++; continue; }
+    if (ch === ",") {
+      if (!needSep) throw new Error("miserc env has an unexpected comma");
+      needSep = false;
+      k++;
+      continue;
+    }
     if (ch !== '"' && ch !== "'") throw new Error("miserc env may only contain string names");
+    if (needSep) throw new Error("miserc env is missing a comma between names");
     const quote = ch;
     k++;
     let value = "";
@@ -84,6 +92,7 @@ function parseArray(lines, startLine, startCol) {
     }
     if (!closed) throw new Error("miserc env has an unterminated string");
     values.push(value);
+    needSep = true;
   }
   return { values, endLine: j, endCol: k };
 }
