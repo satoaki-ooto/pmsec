@@ -2152,7 +2152,10 @@ function CmdDisable($Targets, [bool]$Json, [array]$Scopes) {
     for ($i = 0; $i -lt $results.Count; $i++) {
       $r = $results[$i]
       $scopePrefix = if ($multiScope) { """scope"": $(JsonString $r.Scope), " } else { '' }
-      $entry = "    {$scopePrefix""tool"": $(JsonString $r.Tool), ""path"": $(JsonString $r.Path), ""removed"": $(JsonBool $r.Removed), ""ok"": $(JsonBool $r.Ok)"
+      # Same null handling as CmdEnable: a row that failed before a path was
+      # known reports "path": null, not an empty string.
+      $pathJson = if ([string]::IsNullOrEmpty($r.Path)) { 'null' } else { JsonString $r.Path }
+      $entry = "    {$scopePrefix""tool"": $(JsonString $r.Tool), ""path"": $pathJson, ""removed"": $(JsonBool $r.Removed), ""ok"": $(JsonBool $r.Ok)"
       if ($r.Error) { $entry += ", ""error"": $(JsonString $r.Error)" }
       $entry += '}'
       if ($i -lt $results.Count - 1) { $entry += ',' }
