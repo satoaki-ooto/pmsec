@@ -117,6 +117,7 @@ fix PR on purpose.
 | F4 | Low | node, python | `--doctor` reported `pmsecHomeSource: "PMSEC_HOME"` when the variable was set, though these ports ignore it and write to `HOME`. An operator would believe the redirection worked. | Patched locally: doctor always reports `HOME`, and a stderr warning is printed when `PMSEC_HOME` is set. Parity tracked in #183. |
 | F5 | Infra | CI | `pull_request` on a self-hosted runner in a public repo. | Open: #182. |
 | F6 | Low | powershell | `.bak` path was not checked for a reparse point; `Test-Path` on a dangling link is version-dependent and `Copy-Item` would write through a live one. | Patched locally (same guarantee as F2 for Windows). |
+| F13 | High | bash | Under root with `PMSEC_HOME`, a symlinked mise directory (`~/.config/mise -> /home/other/...`) redirected the cleanup `rm -f` at another user's config: the write path was guarded (F2) but the delete was not. | Fixed in this PR: the mise cleanup deletes pass the same physical-path guard, and a refusal fails the tool result instead of reporting a removal. |
 
 ## Domain review: does what pmsec writes actually take effect? (2026-11-07)
 

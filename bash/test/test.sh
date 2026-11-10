@@ -806,5 +806,28 @@ else
   T "disable reports a failed mise cleanup" t_disable_reports_failed_mise_cleanup
 fi
 
+# The F13 guard arms only for uid 0: root must refuse to clean a mise dir
+# that resolves outside the target home through a planted symlink.
+t_root_refuses_mise_cleanup_through_symlink() {
+  local home; home=$(setup_home)
+  local outside; outside=$(mktemp -d -t pmsec-outside.XXXXXX)
+  printf '[settings]\nminimum_release_age = "7d"\n' > "$outside/config.pmsec.toml"
+  mkdir -p "$home/.config"
+  ln -s "$outside" "$home/.config/mise"
+  local out rc content
+  out=$(run_pmsec "$home" -- --disable --tool mise 2>&1); rc=$?
+  content=$(cat "$outside/config.pmsec.toml" 2>/dev/null)
+  rm -rf -- "$home" "$outside"
+  assert_eq "disable fails on linked mise dir" "1" "$rc" || return 1
+  assert_match "refusal message" 'refusing to write under' "$out" || return 1
+  assert_match "outside config untouched" '^minimum_release_age = "7d"$' "$content"
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+  T "root refuses mise cleanup through a symlinked dir outside the home" t_root_refuses_mise_cleanup_through_symlink
+else
+  printf 'SKIP  root mise symlink-dir refusal (guard arms only for uid 0)\n'
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
