@@ -85,8 +85,10 @@ async function hasNewArtifacts(ctx, p) {
   if (envListFrom(ctx.env.MISE_ENV).includes("pmsec")) return true;
   for (const file of [p.local, p.shared, p.system]) {
     if (!existsSync(file)) continue;
+    // A read error propagates: an unreadable selector may still activate pmsec.
+    const text = await readSafe(file);
     let parsed;
-    try { parsed = parseEnv(await readSafe(file)); } catch { continue; /* surfaced by the selector paths */ }
+    try { parsed = parseEnv(text); } catch { continue; /* surfaced by the selector paths */ }
     if (!parsed.defined) continue;
     if (parsed.values.includes("pmsec")) return true;
     break;

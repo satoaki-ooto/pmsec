@@ -463,6 +463,24 @@ T 'mise legacy enable converges when config.toml is hard-linked to config.pmsec.
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
 }
 
+if (-not $onWindows -and (& id -u) -ne '0') {
+  T 'mise legacy --force enable leaves config.toml alone when the miserc is unreadable' {
+    $h = NewHome
+    $rc = PathJoin $h '.config' 'mise' 'miserc.local.toml'
+    try {
+      [void](New-Item -ItemType Directory -Path (PathJoin $h '.config' 'mise') -Force)
+      [System.IO.File]::WriteAllText($rc, "env = [`"pmsec`"]`n")
+      & chmod 000 $rc
+      $r = InvokePmsec $h @{ PMSEC_MISE_VERSION = '2026.10.25' } @('--tool','mise','--force')
+      if ($r.Code -eq 0) { $script:LastFail = 'enable succeeded with an unreadable miserc'; return $false }
+      if (Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'config.toml')) { $script:LastFail = 'config.toml written before the miserc read failed'; return $false }
+      return $true
+    } finally { & chmod 600 $rc; Remove-Item -Recurse -Force -LiteralPath $h }
+  }
+} else {
+  Write-Host 'SKIP  mise unreadable miserc (POSIX non-root only)'
+}
+
 # Needs a case-insensitive filesystem: the default temp dir on Windows, or
 # PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere.
 $casefoldRoot = if ($env:PMSEC_TEST_CASEFOLD_DIR) { $env:PMSEC_TEST_CASEFOLD_DIR } else { [System.IO.Path]::GetTempPath() }

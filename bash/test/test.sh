@@ -843,6 +843,25 @@ t_mise_legacy_enable_hard_linked_configs() {
 
 T "mise legacy enable converges when config.toml is hard-linked to config.pmsec.toml" t_mise_legacy_enable_hard_linked_configs
 
+t_mise_legacy_force_unreadable_miserc() {
+  local home; home=$(mktemp -d)
+  local d="$home/.config/mise" rc
+  mkdir -p "$d"
+  printf 'env = ["pmsec"]\n' > "$d/miserc.local.toml"
+  chmod 000 "$d/miserc.local.toml"
+  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 -- --tool mise --force >/dev/null 2>&1; rc=$?
+  chmod 600 "$d/miserc.local.toml"
+  [ "$rc" != "0" ] || { LAST_FAIL="enable succeeded with an unreadable miserc"; rm -rf -- "$home"; return 1; }
+  [ ! -e "$d/config.toml" ] || { LAST_FAIL="config.toml written before the miserc read failed"; rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+
+if [ "$(id -u)" != "0" ]; then
+  T "mise legacy --force enable leaves config.toml alone when the miserc is unreadable" t_mise_legacy_force_unreadable_miserc
+else
+  printf 'SKIP  mise unreadable miserc (permission bits are bypassed for root)\n'
+fi
+
 if CASEFOLD_ROOT=$(casefold_root); then
   T "mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias" t_mise_reverse_migration_case_variant_alias "$CASEFOLD_ROOT"
 else

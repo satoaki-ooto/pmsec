@@ -1109,6 +1109,11 @@ mise_has_new_artifacts() {
   fi
   for p in "$(path_mise_local_miserc)" "$(path_mise_shared_miserc)" "$(path_mise_system_miserc)"; do
     [ -e "$p" ] || continue
+    # Status 2: an unreadable selector may still activate pmsec.
+    if [ ! -r "$p" ]; then
+      printf 'cannot read %s\n' "$p" >&2
+      return 2
+    fi
     lines_load "$p"
     miserc_parse_env || continue
     [ "$MISE_ENVDEF" = "1" ] || continue
@@ -1449,13 +1454,15 @@ tool_read_mise() {
     MISE_READ_WARN=$(mise_env_warning)
     [ "$MISE_SELECTOR_WIRED" = "1" ] || MISE_READ_ROWFAIL=1
   else
-    if mise_has_new_artifacts && [ "$action" = "enable" ]; then
+    mise_has_new_artifacts; r=$?
+    [ "$r" = "2" ] && return 1
+    if [ "$r" = "0" ] && [ "$action" = "enable" ]; then
       mise_read_merged "$legacy" "$base" "$pmsec"
     else
       mise_read_merged "$legacy"
     fi
     MISE_READ_PATH="$legacy"
-    if mise_has_new_artifacts; then
+    if [ "$r" = "0" ]; then
       MISE_READ_WARN="$MISE_MIGRATION_WARN"; MISE_READ_ROWFAIL=1
     fi
   fi
@@ -1569,7 +1576,9 @@ tool_write_mise() {
   # the config, and again after: replacing a hard-linked legacy file leaves
   # the pmsec link as a distinct file that still holds managed keys.
   local artifacts=0
-  mise_has_new_artifacts && artifacts=1
+  mise_has_new_artifacts; r=$?
+  [ "$r" = "2" ] && return 1
+  [ "$r" = "0" ] && artifacts=1
   _tool_write_one "$legacy" "minimum_release_age" "minimum_release_age = \"${days}d\"" "=" "settings" "mise" 0 || return 1
   if [ "$artifacts" = "1" ] || mise_has_new_artifacts; then
     # Reverse migration writes the destination before cleaning the new

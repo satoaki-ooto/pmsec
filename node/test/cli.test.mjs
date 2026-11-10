@@ -482,6 +482,21 @@ const permissionTestSkip = process.platform === "win32"
     ? "permission bits are bypassed when running as root"
     : false;
 
+test("mise legacy --force enable leaves config.toml alone when the miserc is unreadable", { skip: permissionTestSkip }, async () => {
+  const { chmod } = await import("node:fs/promises");
+  const home = await setupHome();
+  const dir = join(home, ".config", "mise");
+  await mkdir(dir, { recursive: true });
+  const rc = join(dir, "miserc.local.toml");
+  await writeFile(rc, 'env = ["pmsec"]\n');
+  await chmod(rc, 0);
+  try {
+    const { code } = await runCli(["--tool", "mise", "--force"], home, "linux", { PMSEC_MISE_VERSION: "2026.10.25" });
+    assert.notEqual(code, 0);
+    assert.equal(existsSync(join(dir, "config.toml")), false);
+  } finally { await chmod(rc, 0o600); }
+});
+
 test("--doctor blocks when the parent directory is not writable", { skip: permissionTestSkip }, async () => {
   const { chmod, mkdir: mk } = await import("node:fs/promises");
   const home = await setupHome();
