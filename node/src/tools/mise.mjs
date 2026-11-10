@@ -313,9 +313,10 @@ export async function unset(ctx) {
   };
 }
 
+// An unreadable file counts as managed: cleanup would have to touch it.
 function hasManagedKeys(file) {
   let text;
-  try { text = readFileSync(file, "utf8"); } catch { return false; }
+  try { text = readFileSync(file, "utf8").replace(/^\uFEFF/, ""); } catch (e) { return e?.code !== "ENOENT"; }
   return removeKey(text, key, { section }).removed || removeExtras(text, extras).removed;
 }
 

@@ -1617,6 +1617,8 @@ mise_paths_aliased() {
 mise_has_managed_keys() {
   local path="$1" ek ev el es esec esafe
   [ -f "$path" ] || return 1
+  # An unreadable file counts as managed: cleanup would have to touch it.
+  [ -r "$path" ] || return 0
   lines_load "$path"
   lines_remove_key "minimum_release_age" "=" "settings" && return 0
   while IFS='|' read -r ek ev el es esec esafe; do

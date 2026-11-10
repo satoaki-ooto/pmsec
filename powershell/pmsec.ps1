@@ -1472,7 +1472,8 @@ function MiseBufOnlyStructure {
 # True when the file holds a pmsec-managed key (in-memory check, no write).
 function MiseHasManagedKeys([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-  LinesLoad $Path
+  # An unreadable file counts as managed: cleanup would have to touch it.
+  try { LinesLoad $Path } catch { return $true }
   if (LinesRemoveKey 'minimum_release_age' '=' 'settings') { return $true }
   foreach ($e in (ToolExtras 'mise')) {
     if (LinesRemoveKey $e.Key $e.Sep $e.Section) { return $true }

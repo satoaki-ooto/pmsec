@@ -365,7 +365,11 @@ def unset(ctx: Context) -> dict:
 
 
 def _has_managed_keys(p: Path) -> bool:
-    text = _read(p)
+    """An unreadable file counts as managed: cleanup would have to touch it."""
+    try:
+        text = _read(p)
+    except (OSError, UnicodeDecodeError):
+        return True
     if text == "":
         return False
     return remove_key(text, KEY, section=SECTION)[1] or remove_extras(text, EXTRAS)[1]
