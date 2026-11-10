@@ -80,6 +80,43 @@ def mise_config_path(env: dict[str, str], home: Path, platform: str) -> Path:
     return base / "mise" / "config.toml"
 
 
+def mise_config_dir(env: dict[str, str], home: Path) -> Path:
+    """mise's global config directory (https://mise.jdx.dev/directories.html).
+
+    Unlike the legacy single-file path above this is the same on every OS:
+    win32 uses %USERPROFILE%\\.config\\mise, not %LOCALAPPDATA%\\mise.
+    """
+    if "MISE_CONFIG_DIR" in env:
+        return Path(env["MISE_CONFIG_DIR"])
+    if "XDG_CONFIG_HOME" in env:
+        return Path(env["XDG_CONFIG_HOME"]) / "mise"
+    return home / ".config" / "mise"
+
+
+def mise_base_config_path(env: dict[str, str], home: Path) -> Path:
+    return mise_config_dir(env, home) / "config.toml"
+
+
+def mise_pmsec_config_path(env: dict[str, str], home: Path) -> Path:
+    return mise_config_dir(env, home) / "config.pmsec.toml"
+
+
+def mise_local_miserc_path(env: dict[str, str], home: Path) -> Path:
+    return mise_config_dir(env, home) / "miserc.local.toml"
+
+
+def mise_shared_miserc_path(env: dict[str, str], home: Path) -> Path:
+    return mise_config_dir(env, home) / "miserc.toml"
+
+
+def mise_system_miserc_path(env: dict[str, str], home: Path, platform: str) -> Path:
+    if "MISE_SYSTEM_CONFIG_DIR" in env:
+        return Path(env["MISE_SYSTEM_CONFIG_DIR"]) / "miserc.toml"
+    if platform == "win32":
+        return Path(home.anchor or "C:\\") / "etc" / "mise" / "miserc.toml"
+    return Path("/etc/mise/miserc.toml")
+
+
 def uv_config_path(env: dict[str, str], home: Path, platform: str) -> Path:
     if "UV_CONFIG_FILE" in env:
         return Path(env["UV_CONFIG_FILE"])

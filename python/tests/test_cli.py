@@ -24,6 +24,8 @@ def env_for(home: Path, **overrides: str) -> dict[str, str]:
         "PMSEC_PNPM_VERSION": "none",
         "PMSEC_BUNDLER_VERSION": "none",
         "PMSEC_COMPOSER_VERSION": "none",
+        "PMSEC_MISE_VERSION": "none",
+        "MISE_SYSTEM_CONFIG_DIR": str(home / "etc-mise"),
     }
     base.update(overrides)
     return base

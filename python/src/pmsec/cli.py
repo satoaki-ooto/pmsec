@@ -83,10 +83,22 @@ def _preflight_warn(t, ctx: Context) -> str | None:
 
 def _gather(targets, ctx: Context):
     rows = []
+    failing_rows = []
     for t in targets:
         r = t.read(ctx)
-        rows.append({"tool": t.NAME, "key": t.KEY, "warn": _preflight_warn(t, ctx), **r})
-    return rows
+        warns = [w for w in (_preflight_warn(t, ctx), r.get("warn")) if w]
+        row = {
+            "tool": t.NAME, "key": r.get("key", t.KEY), "path": r["path"],
+            "configured": r["configured"], "days": r["days"],
+            "extras": r.get("extras", []),
+            "warn": " ".join(warns) if warns else None,
+        }
+        if r.get("selector") is not None:
+            row["selector"] = r["selector"]
+        rows.append(row)
+        if r.get("rowFail"):
+            failing_rows.append(row)
+    return rows, failing_rows
 
 
 def _render_human(rows, min_days):
@@ -101,6 +113,8 @@ def _render_human(rows, min_days):
         out.append(f"{status} {r['tool']:<4} {r['key']} = {r['configured'] or '(unset)'}  [{r['path']}]")
         if r.get("warn"):
             out.append(f"       ⚠ {r['warn']}")
+        elif r.get("selector") and r["selector"].get("wired") is False:
+            out.append(f"       ⚠ pmsec env not selected  [{r['selector']['path']}]")
         for e in r.get("extras", []):
             if e["ok"]:
                 ex_status = "OK     "
@@ -117,10 +131,11 @@ def _render_human(rows, min_days):
 
 
 def _check(args, targets, ctx: Context, out, err):
-    rows = _gather(targets, ctx)
+    rows, failing_rows = _gather(targets, ctx)
     failing_primary = [r for r in rows if r["days"] is None or r["days"] < args.days]
     failing_extras = [e for r in rows for e in r.get("extras", []) if not e["ok"]]
-    ok = not failing_primary and not failing_extras
+    unwired = [r for r in rows if r.get("selector") and r["selector"].get("wired") is False]
+    ok = not failing_primary and not failing_extras and not failing_rows
     if args.json:
         out.write(json.dumps({"bundleDays": args.days, "rows": rows, "ok": ok}, indent=2) + "\n")
     else:
@@ -129,6 +144,8 @@ def _check(args, targets, ctx: Context, out, err):
         err.write(f"pmsec: {len(failing_primary)} tool(s) below {args.days} days — run `pmsec`\n")
     if failing_extras:
         err.write(f"pmsec: {len(failing_extras)} hardening setting(s) not at safe value — run `pmsec`\n")
+    if unwired:
+        err.write("pmsec: pmsec environment not selected by mise miserc — run `pmsec`\n")
     return 0 if ok else 1
 
 
@@ -184,9 +201,13 @@ def _doctor(args, targets, ctx: Context, out) -> int:
         username = None
     tools = []
     for t in targets:
-        p = Path(t.path(ctx))
+        paths = t.doctor_paths(ctx) if hasattr(t, "doctor_paths") else {"path": t.path(ctx), "extraPaths": []}
+        p = Path(paths["path"])
         probe = _probe_path(p, uid)
-        tools.append({"tool": t.NAME, "key": t.KEY, **probe})
+        row = {"tool": t.NAME, "key": t.KEY, **probe}
+        if paths.get("extraPaths"):
+            row["extraPaths"] = paths["extraPaths"]
+        tools.append(row)
     # doctor.ok is intentionally narrow: parent must be writable as the
     # running uid. Everything else is informational.
     ok_flag = all(t["parentWritable"] for t in tools)
@@ -220,6 +241,8 @@ def _doctor(args, targets, ctx: Context, out) -> int:
         flag = "ok    " if t["parentWritable"] else "BLOCK "
         owner_suffix = f" (uid={t['owner']})" if t["exists"] and t["owner"] is not None else ""
         out.write(f"{flag} {t['tool']:<4} {t['path']}{owner_suffix}\n")
+        for extra in t.get("extraPaths", []):
+            out.write(f"         also: {extra}\n")
         if not t["parentWritable"]:
             out.write(f"         no writable ancestor for {t['parent']}\n")
     if not ok_flag:
@@ -250,9 +273,7 @@ def _enable(args, targets, ctx: Context, out, err):
     requested = args.days
     force = args.force
     for t in targets:
-        warn = _preflight_warn(t, ctx)
-        if warn:
-            warnings.append({"tool": t.NAME, "warn": warn})
+        preflight = _preflight_warn(t, ctx)
         try:
             if force:
                 effective, kept = requested, False
@@ -262,11 +283,15 @@ def _enable(args, targets, ctx: Context, out, err):
                 effective = max(current_days, requested)
                 kept = current_days >= requested and current_days > 0
             r = t.write(effective, dataclasses.replace(ctx, force=force))
+            warns = [w for w in (preflight, r.get("warn")) if w]
+            warn = " ".join(warns) if warns else None
+            if warn:
+                warnings.append({"tool": t.NAME, "warn": warn})
             results.append({"tool": t.NAME, "path": r["path"], "days": effective, "requested": requested, "kept": kept, "forced": force, "ok": True, "warn": warn})
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             msg = _explain_fs_error(exc, t.NAME)
             failures.append(msg)
-            results.append({"tool": t.NAME, "path": getattr(exc, "filename", None), "days": requested, "requested": requested, "kept": False, "forced": force, "ok": False, "error": msg, "warn": warn})
+            results.append({"tool": t.NAME, "path": getattr(exc, "filename", None), "days": requested, "requested": requested, "kept": False, "forced": force, "ok": False, "error": msg, "warn": preflight})
     if args.json:
         out.write(json.dumps({"enabled": True, "bundleDays": requested, "results": results, "warnings": warnings, "ok": not failures}, indent=2) + "\n")
     else:
@@ -330,7 +355,8 @@ def main(
 
     args = _parser().parse_args(argv)
     targets = _select(args.tool)
-    ctx = Context(env=env, home=home, platform=platform)
+    action = "check" if args.check else "disable" if args.disable else "doctor" if args.doctor else "enable"
+    ctx = Context(env=env, home=home, platform=platform, action=action)
     if env.get("PMSEC_HOME"):
         err.write(
             f"pmsec: PMSEC_HOME is ignored by the python port; paths resolve from HOME ({home}). "

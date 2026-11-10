@@ -10,3 +10,4 @@ class Context:
     home: Path
     platform: str
     force: bool = False
+    action: str = "enable"
