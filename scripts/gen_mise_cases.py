@@ -5,6 +5,11 @@ Run once while adding cases: `python3 scripts/gen_mise_cases.py`. The generated
 JSON files under conformance/cases/ are the committed contract; this script is
 a convenience so the expected bytes come from a running implementation instead
 of being hand-copied.
+
+Scope note: recording node's output as the expectation proves byte-parity
+across the four ports, not that mise itself loads the selected layer — that
+contract rests on mise's documented config.pmsec.toml/miserc behavior and
+would need a real-mise integration check outside this harness.
 """
 
 from __future__ import annotations
