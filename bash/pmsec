@@ -1401,7 +1401,23 @@ tool_read_mise() {
   MISE_READ_WARN=""; MISE_READ_ROWFAIL=0
   if mise_supports_new_mode; then
     if [ "$action" = "enable" ]; then
-      mise_read_merged "$legacy" "$base" "$pmsec"
+      # Later environments override earlier keys, so a stricter cooldown in
+      # any layer that stays active after enable must be preserved too.
+      local e vals=()
+      if [ -n "${MISE_ENV:-}" ]; then
+        while IFS= read -r e; do
+          [ -n "$e" ] || continue
+          case "$e" in pmsec|*[!A-Za-z0-9_-]*) continue ;; esac
+          vals[${#vals[@]}]="$(path_mise_dir)/config.$e.toml"
+        done < <(mise_env_list "$MISE_ENV")
+      else
+        mise_inherited_env || return 1
+        for e in "${MISE_BASE_ENV_VALUES[@]}"; do
+          case "$e" in pmsec|*[!A-Za-z0-9_-]*) continue ;; esac
+          vals[${#vals[@]}]="$(path_mise_dir)/config.$e.toml"
+        done
+      fi
+      mise_read_merged "$legacy" "$base" "$pmsec" "${vals[@]}"
     else
       mise_read_merged "$pmsec"
     fi

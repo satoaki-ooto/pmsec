@@ -3,7 +3,7 @@ import { unlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
   miseConfigPath, miseConfigDir, miseBaseConfigPath, misePmsecConfigPath,
-  miseLocalMisercPath, miseSharedMisercPath, miseSystemMisercPath,
+  miseEnvConfigPath, miseLocalMisercPath, miseSharedMisercPath, miseSystemMisercPath,
 } from "../util/paths.mjs";
 import { readSafe, writeAtomic } from "../util/io.mjs";
 import { readKey, setKey, removeKey } from "../util/lines.mjs";
@@ -222,10 +222,18 @@ export async function read(ctx) {
   const p = paths(ctx);
   const action = ctx.action ?? "check";
   if (supportsNewMode(ctx)) {
-    const files = action === "enable"
-      ? distinctFiles([p.legacy, p.base, p.pmsec])
-      : [p.pmsec];
-    const merged = mergeReads(await readFiles(files));
+    let files = action === "enable" ? [p.legacy, p.base, p.pmsec] : [p.pmsec];
+    if (action === "enable") {
+      // Later environments override earlier keys, so a stricter cooldown in
+      // any layer that stays active after enable must be preserved too.
+      const fromVar = envListFrom(ctx.env.MISE_ENV);
+      const envs = fromVar.length ? fromVar : (await firstEnv(p)).values;
+      for (const name of envs) {
+        if (name === "pmsec") continue;
+        files.push(miseEnvConfigPath(name, ctx.env, ctx.home));
+      }
+    }
+    const merged = mergeReads(await readFiles(distinctFiles(files)));
     const selector = await selectorState(ctx, p);
     return {
       path: p.pmsec,

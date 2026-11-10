@@ -13,6 +13,7 @@ from pmsec.util.paths import (
     mise_base_config_path,
     mise_config_dir,
     mise_config_path,
+    mise_env_config_path,
     mise_local_miserc_path,
     mise_pmsec_config_path,
     mise_shared_miserc_path,
@@ -275,7 +276,16 @@ def read(ctx: Context) -> dict:
     p = paths(ctx)
     action = getattr(ctx, "action", "check")
     if _supports_new_mode(ctx):
-        files = _distinct([p["legacy"], p["base"], p["pmsec"]]) if action == "enable" else [p["pmsec"]]
+        files = [p["legacy"], p["base"], p["pmsec"]] if action == "enable" else [p["pmsec"]]
+        if action == "enable":
+            # Later environments override earlier keys, so a stricter cooldown
+            # in any layer that stays active after enable must be preserved.
+            from_var = env_list_from(ctx.env.get("MISE_ENV"))
+            envs = from_var if from_var else _first_env(p)["values"]
+            for name in envs:
+                if name == "pmsec":
+                    continue
+                files.append(mise_env_config_path(name, ctx.env, ctx.home))
         merged = _merge_reads(_read_files(files))
         selector = _selector_state(ctx, p)
         return {

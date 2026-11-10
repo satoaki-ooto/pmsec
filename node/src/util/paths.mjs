@@ -95,6 +95,15 @@ export function misePmsecConfigPath(env = process.env, home = homedir()) {
   return join(miseConfigDir(env, home), "config.pmsec.toml");
 }
 
+// mise loads config.<environment>.toml for every selected environment next to
+// the global config; enable must consider those layers when preserving
+// stricter cooldowns. The name comes from the selector, so only safe
+// spellings resolve inside the dir.
+export function miseEnvConfigPath(name, env = process.env, home = homedir()) {
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error(`unsafe mise environment name: ${name}`);
+  return join(miseConfigDir(env, home), `config.${name}.toml`);
+}
+
 export function miseLocalMisercPath(env = process.env, home = homedir()) {
   return join(miseConfigDir(env, home), "miserc.local.toml");
 }

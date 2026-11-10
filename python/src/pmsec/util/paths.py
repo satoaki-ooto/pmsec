@@ -107,6 +107,16 @@ def mise_pmsec_config_path(env: dict[str, str], home: Path) -> Path:
     return mise_config_dir(env, home) / "config.pmsec.toml"
 
 
+def mise_env_config_path(name: str, env: dict[str, str], home: Path) -> Path:
+    """mise loads config.<environment>.toml for every selected environment next
+    to the global config; enable must consider those layers when preserving
+    stricter cooldowns. The name comes from the selector, so only safe
+    spellings resolve inside the dir."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise ValueError(f"unsafe mise environment name: {name}")
+    return mise_config_dir(env, home) / f"config.{name}.toml"
+
+
 def mise_local_miserc_path(env: dict[str, str], home: Path) -> Path:
     return mise_config_dir(env, home) / "miserc.local.toml"
 

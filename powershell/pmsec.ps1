@@ -1472,6 +1472,19 @@ function ToolReadMise {
   $selector = $null
   if (MiseSupportsNewMode) {
     $files = if ($action -eq 'enable') { @($legacy, $base, $pmsec) } else { @($pmsec) }
+    if ($action -eq 'enable') {
+      # Later environments override earlier keys, so a stricter cooldown in
+      # any layer that stays active after enable must be preserved too.
+      $envs = @()
+      if ($env:MISE_ENV) { $envs = @(MiseEnvList $env:MISE_ENV) }
+      else {
+        try { MiseInheritedEnv; $envs = @($script:MiseBaseEnv) } catch { $envs = @() }
+      }
+      foreach ($name in $envs) {
+        if ($name -ceq 'pmsec' -or $name -notmatch '^[A-Za-z0-9_-]+$') { continue }
+        $files += (PathJoin (Get-MiseDir) "config.$name.toml")
+      }
+    }
     $r = MiseReadFiles $files
     try {
       $selector = MiseSelectorState

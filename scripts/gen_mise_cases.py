@@ -254,6 +254,16 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "enable_mise_new_mode_env_layer_preservation",
+        {
+            ".config/mise/miserc.local.toml": 'env = ["work"]\n',
+            ".config/mise/config.work.toml": '[settings]\nminimum_release_age = "30d"\n',
+        },
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
         "enable_mise_new_mode_moves_pmsec_last",
         {".config/mise/miserc.local.toml": 'env = ["pmsec", "work"]\nother = 1\n'},
         None,
