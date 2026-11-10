@@ -101,7 +101,12 @@ export function miseSharedMisercPath(env = process.env, home = homedir()) {
 
 export function miseSystemMisercPath(env = process.env, home = homedir(), platform = process.platform) {
   if (env.MISE_SYSTEM_CONFIG_DIR) return join(env.MISE_SYSTEM_CONFIG_DIR, "miserc.toml");
-  if (platform === "win32") return join(parse(home).root || "C:\\", "etc", "mise", "miserc.toml");
+  if (platform === "win32") {
+    // `home` may be a simulated Windows path on a POSIX test runner, so read
+    // the drive letter from the string instead of node:path's parse().
+    const drive = home.match(/^[A-Za-z]:[\\/]/)?.[0] ?? parse(home).root ?? "C:\\";
+    return join(drive, "etc", "mise", "miserc.toml");
+  }
   return "/etc/mise/miserc.toml";
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -113,7 +114,11 @@ def mise_system_miserc_path(env: dict[str, str], home: Path, platform: str) -> P
     if "MISE_SYSTEM_CONFIG_DIR" in env:
         return Path(env["MISE_SYSTEM_CONFIG_DIR"]) / "miserc.toml"
     if platform == "win32":
-        return Path(home.anchor or "C:\\") / "etc" / "mise" / "miserc.toml"
+        # `home` may be a simulated Windows path on a POSIX test runner, so
+        # read the drive letter from the string instead of Path.anchor.
+        m = re.match(r"^[A-Za-z]:[\\/]", str(home))
+        root = m.group(0) if m else (home.anchor or "C:\\")
+        return Path(root) / "etc" / "mise" / "miserc.toml"
     return Path("/etc/mise/miserc.toml")
 
 

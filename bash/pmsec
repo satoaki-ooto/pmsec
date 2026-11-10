@@ -1106,11 +1106,11 @@ mise_has_new_artifacts() {
 # Parse the top-level `env = [...]` assignment currently in LINES_BUF.
 # Sets MISE_ENVDEF=1, MISE_ENV_START/END (line indexes), and MISE_ENV_VALUES.
 # Returns 0 when defined, 1 when absent/not top-level, 2 when invalid.
-MISERC_J=0; MISERC_K=0; MISERC_CH=""
+MISERC_J=0; MISERC_K=0; MISERC_CH=""; MISERC_ERR='miserc env must be an array'
 _miserc_skip() {
   local line ch
   while :; do
-    if [ "$MISERC_J" -ge "${#LINES_BUF[@]}" ]; then MISERC_CH=""; return 1; fi
+    if [ "$MISERC_J" -ge "${#LINES_BUF[@]}" ]; then MISERC_ERR='miserc env array is unterminated'; MISERC_CH=""; return 1; fi
     line="${LINES_BUF[MISERC_J]}"
     if [ "$MISERC_K" -ge "${#line}" ]; then MISERC_J=$((MISERC_J+1)); MISERC_K=0; continue; fi
     ch="${line:MISERC_K:1}"
@@ -1123,7 +1123,7 @@ _miserc_skip() {
 _miserc_parse_array() {
   local line ch quote val closed
   _miserc_skip || return 1
-  [ "$MISERC_CH" = "[" ] || return 1
+  [ "$MISERC_CH" = "[" ] || { MISERC_ERR='miserc env must be an array'; return 1; }
   MISERC_K=$((MISERC_K+1))
   while :; do
     _miserc_skip || return 1
@@ -1131,7 +1131,7 @@ _miserc_parse_array() {
       "]") MISERC_K=$((MISERC_K+1)); break ;;
       ",") MISERC_K=$((MISERC_K+1)); continue ;;
       '"'|"'") quote="$MISERC_CH"; MISERC_K=$((MISERC_K+1)) ;;
-      *) return 1 ;;
+      *) MISERC_ERR='miserc env may only contain string names'; return 1 ;;
     esac
     val=""; closed=0
     while [ "$MISERC_J" -lt "${#LINES_BUF[@]}" ]; do
@@ -1144,7 +1144,7 @@ _miserc_parse_array() {
       if [ "$ch" = "$quote" ]; then MISERC_K=$((MISERC_K+1)); closed=1; break; fi
       val+="$ch"; MISERC_K=$((MISERC_K+1))
     done
-    [ "$closed" = "1" ] || return 1
+    [ "$closed" = "1" ] || { MISERC_ERR='miserc env has an unterminated string'; return 1; }
     MISE_ENV_VALUES[${#MISE_ENV_VALUES[@]}]="$val"
   done
   MISE_ENV_END="$MISERC_J"
@@ -1237,7 +1237,7 @@ mise_inherited_env() {
     lines_load "$p"
     miserc_parse_env; r=$?
     if [ "$r" = "2" ]; then
-      printf 'pmsec: invalid mise miserc env in %s\n' "$p" >&2
+      printf '%s\n' "$MISERC_ERR" >&2
       return 1
     fi
     [ "$r" = "0" ] || continue
@@ -1327,7 +1327,7 @@ tool_read_mise() {
     MISE_READ_PATH="$pmsec"
     mise_selector_state; r=$?
     if [ "$r" = "2" ]; then
-      printf 'pmsec: invalid mise miserc env\n' >&2
+      printf 'pmsec: %s\n' "$MISERC_ERR" >&2
       return 1
     fi
     MISE_READ_WARN=$(mise_env_warning)
@@ -1410,13 +1410,13 @@ tool_write_mise() {
     vals[${#vals[@]}]="pmsec"
     lines_load "$localp"
     miserc_parse_env; r=$?
-    [ "$r" = "2" ] && { printf 'pmsec: invalid mise miserc env\n' >&2; return 1; }
+    [ "$r" = "2" ] && { printf '%s\n' "$MISERC_ERR" >&2; return 1; }
 
     _tool_write_one "$pmsec" "minimum_release_age" "minimum_release_age = \"${days}d\"" "=" "settings" "mise" 0 || return 1
 
     lines_load "$localp"
     miserc_parse_env; r=$?
-    [ "$r" = "2" ] && { printf 'pmsec: invalid mise miserc env\n' >&2; return 1; }
+    [ "$r" = "2" ] && { printf '%s\n' "$MISERC_ERR" >&2; return 1; }
     miserc_set_env_values "${vals[@]}"
     lines_dump | write_atomic "$localp" || return 1
 
@@ -2012,10 +2012,9 @@ cmd_check() {
     path=$(tool_path "$tool")
     val=""; days=""; warn=""; local selector_json="" row_fail=0 mise_warn="" row_unwired=0
     if [ "$tool" = "mise" ]; then
-      if tool_read_mise >/dev/null; then
-        val="$MISE_READ_CONFIGURED"; days="$MISE_READ_DAYS"; path="$MISE_READ_PATH"
-        mise_warn="$MISE_READ_WARN"; row_fail="$MISE_READ_ROWFAIL"
-      fi
+      if ! tool_read_mise >/dev/null; then return 1; fi
+      val="$MISE_READ_CONFIGURED"; days="$MISE_READ_DAYS"; path="$MISE_READ_PATH"
+      mise_warn="$MISE_READ_WARN"; row_fail="$MISE_READ_ROWFAIL"
       warn=$(tool_preflight "$tool")
       [ -n "$mise_warn" ] && warn="${warn:+$warn }$mise_warn"
       if [ -n "$MISE_SELECTOR_PATH" ]; then
@@ -2163,9 +2162,12 @@ cmd_enable() {
     fi
     if ! out=$(tool_write "$tool" "$effective" 2>&1); then
       err=$(explain_fs_error "$tool" "$out" "$path")
+      # A malformed miserc has no file to blame: keep the row's path null so
+      # every port reports the same shape for this failure.
+      case "$out" in *"miserc env"*) path="" ;; esac
       failures=$((failures+1))
     fi
-    if [ "$tool" = "mise" ]; then
+    if [ "$tool" = "mise" ] && [ -z "$err" ]; then
       if mise_supports_new_mode; then path=$(path_mise_pmsec); else path=$(path_mise); fi
       local mise_write_warn; mise_write_warn=$(mise_env_warning)
       [ -n "$mise_write_warn" ] && warn="${warn:+$warn }$mise_write_warn"
@@ -2181,7 +2183,7 @@ cmd_enable() {
       first_r=0
       results_json+=$'    {'
       results_json+="\"tool\": $(json_str "$tool"), "
-      results_json+="\"path\": $(json_str "$path"), "
+      if [ -z "$path" ]; then results_json+="\"path\": null, "; else results_json+="\"path\": $(json_str "$path"), "; fi
       results_json+="\"days\": $effective, "
       results_json+="\"requested\": $OPT_DAYS, "
       results_json+="\"kept\": $kept_json, "

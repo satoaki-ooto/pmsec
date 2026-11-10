@@ -357,6 +357,14 @@ def main(
     targets = _select(args.tool)
     action = "check" if args.check else "disable" if args.disable else "doctor" if args.doctor else "enable"
     ctx = Context(env=env, home=home, platform=platform, action=action)
+    if args.check:
+        try:
+            return _check(args, targets, ctx, out, err)
+        except ValueError as exc:
+            # A malformed miserc cannot be judged; report it instead of
+            # emitting a check result that could read as OK.
+            err.write(f"pmsec: {exc}\n")
+            return 1
     if env.get("PMSEC_HOME"):
         err.write(
             f"pmsec: PMSEC_HOME is ignored by the python port; paths resolve from HOME ({home}). "
