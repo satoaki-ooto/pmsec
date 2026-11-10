@@ -74,6 +74,11 @@ def bundle_config_path(env: dict[str, str], home: Path) -> Path:
 def mise_config_path(env: dict[str, str], home: Path, platform: str) -> Path:
     if "MISE_GLOBAL_CONFIG_FILE" in env:
         return Path(env["MISE_GLOBAL_CONFIG_FILE"])
+    # mise reads its global config from MISE_CONFIG_DIR when set, so the legacy
+    # destination must follow it; a default-path write would leave the active
+    # config without the bundle after a downgrade migration.
+    if "MISE_CONFIG_DIR" in env:
+        return Path(env["MISE_CONFIG_DIR"]) / "config.toml"
     if platform == "win32":
         base = Path(env["LOCALAPPDATA"]) if "LOCALAPPDATA" in env else home / "AppData" / "Local"
         return base / "mise" / "config.toml"

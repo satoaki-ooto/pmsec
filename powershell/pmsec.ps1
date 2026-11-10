@@ -126,6 +126,10 @@ function Get-CargoPath {
 }
 function Get-MisePath {
   if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
+  # mise reads its global config from MISE_CONFIG_DIR when set, so the legacy
+  # destination must follow it; a default-path write would leave the active
+  # config without the bundle after a downgrade migration.
+  if ($env:MISE_CONFIG_DIR) { return (PathJoin $env:MISE_CONFIG_DIR 'config.toml') }
   if ((Get-PmsecPlatform) -eq 'win32') {
     $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-PmsecHome) 'AppData' 'Local' }
     return (PathJoin $base 'mise' 'config.toml')

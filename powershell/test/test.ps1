@@ -415,6 +415,24 @@ T 'Windows mise new mode reverse-migrates when the version drops' {
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
 }
 
+T 'Windows mise legacy migration follows MISE_CONFIG_DIR' {
+  $h = NewHome
+  try {
+    $custom = PathJoin $h 'mise-custom'
+    $scope = "windows|$h|win32"
+    [void](InvokePmsec $h @{ MISE_CONFIG_DIR = $custom; PMSEC_FAKE_SCOPES = $scope; PMSEC_MISE_VERSION = '2026.11.0' } @('--tool','mise'))
+    if (-not (Test-Path -LiteralPath (PathJoin $custom 'config.pmsec.toml'))) { $script:LastFail = 'pmsec layer not under MISE_CONFIG_DIR'; return $false }
+    # A downgrade must migrate into the config dir mise actually reads.
+    [void](InvokePmsec $h @{ MISE_CONFIG_DIR = $custom; PMSEC_FAKE_SCOPES = $scope; PMSEC_MISE_VERSION = '2026.10.25' } @('--tool','mise'))
+    if (-not (Test-Path -LiteralPath (PathJoin $custom 'config.toml'))) { $script:LastFail = 'legacy write missed MISE_CONFIG_DIR'; return $false }
+    $ok = AssertMatch 'legacy cooldown in custom dir' '(?m)^minimum_release_age = "1d"$' ([System.IO.File]::ReadAllText((PathJoin $custom 'config.toml')))
+    $ok = $ok -and -not (Test-Path -LiteralPath (PathJoin $custom 'config.pmsec.toml'))
+    $ok = $ok -and -not (Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'config.toml'))
+    if (-not $ok) { $script:LastFail = 'downgrade migration wrote the wrong legacy path' }
+    return $ok
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
 T 'Windows scope ignores XDG_CONFIG_HOME for uv' {
   $h = NewHome
   try {

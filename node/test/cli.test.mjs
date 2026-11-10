@@ -639,6 +639,24 @@ test("mise new mode honors XDG_CONFIG_HOME and MISE_CONFIG_DIR", async () => {
   assert.equal(JSON.parse(out).tools[0].path, join(custom, "config.pmsec.toml"));
 });
 
+test("mise legacy migration follows MISE_CONFIG_DIR", async () => {
+  const home = await setupHome();
+  const custom = join(home, "mise-custom");
+  await runCli(["--tool", "mise", "--days", "1"], home, "linux", {
+    PMSEC_MISE_VERSION: "2026.11.0",
+    MISE_CONFIG_DIR: custom,
+  });
+  assert.match(await readFile(join(custom, "config.pmsec.toml"), "utf8"), /^minimum_release_age = "1d"$/m);
+  // A downgrade must migrate into the config dir mise actually reads.
+  await runCli(["--tool", "mise", "--days", "1"], home, "linux", {
+    PMSEC_MISE_VERSION: "2026.10.25",
+    MISE_CONFIG_DIR: custom,
+  });
+  assert.match(await readFile(join(custom, "config.toml"), "utf8"), /^minimum_release_age = "1d"$/m);
+  await assert.rejects(readFile(join(custom, "config.pmsec.toml"), "utf8"));
+  await assert.rejects(readFile(join(home, ".config", "mise", "config.toml"), "utf8"));
+});
+
 test("win32 system miserc default sits under the current drive root", async () => {
   const { miseSystemMisercPath } = await import("../src/util/paths.mjs");
   assert.equal(

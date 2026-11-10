@@ -34,9 +34,9 @@
     "ok": true
   },
   "expected_files": {
-    ".config/mise/config.toml": "[settings]\n",
+    ".config/mise/config.toml": "[settings]\nminimum_release_age = \"7d\"\n",
     "mise-custom/config.pmsec.toml": "[settings]\nnot_found_system_fallback = false\nswift.gpg_verify = true\nnode.gpg_verify = true\ngithub.slsa = true\ngithub.github_attestations = true\naqua.slsa = true\naqua.minisign = true\naqua.cosign = true\naqua.github_attestations = true\nprovenance_api_failures_fatal = true\npython.github_attestations = true\nruby.github_attestations = true\nlocked_verify_provenance = true\nslsa = true\ngithub_attestations = true\ngpg_verify = true\nparanoid = true\nminimum_release_age = \"9d\"\n",
-    "mise-custom/config.toml": "[settings]\nminimum_release_age = \"9d\"\n",
+    "mise-custom/config.toml": "[settings]\n",
     "mise-custom/miserc.local.toml": "env = [\"pmsec\"]\n"
   }
 }

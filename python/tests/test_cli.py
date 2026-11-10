@@ -609,6 +609,19 @@ def test_mise_new_mode_honors_xdg_and_config_dir(tmp_path):
     assert json.loads(out)["tools"][0]["path"] == str(custom / "config.pmsec.toml")
 
 
+def test_mise_legacy_migration_follows_config_dir(tmp_path):
+    custom = tmp_path / "mise-custom"
+    run(["--tool", "mise", "--days", "1"], tmp_path, PMSEC_MISE_VERSION="2026.11.0",
+        MISE_CONFIG_DIR=str(custom))
+    assert 'minimum_release_age = "1d"' in (custom / "config.pmsec.toml").read_text()
+    # A downgrade must migrate into the config dir mise actually reads.
+    run(["--tool", "mise", "--days", "1"], tmp_path, PMSEC_MISE_VERSION="2026.10.25",
+        MISE_CONFIG_DIR=str(custom))
+    assert 'minimum_release_age = "1d"' in (custom / "config.toml").read_text()
+    assert not (custom / "config.pmsec.toml").exists()
+    assert not (tmp_path / ".config" / "mise" / "config.toml").exists()
+
+
 def test_win32_system_miserc_sits_under_drive_root():
     from pmsec.util.paths import mise_system_miserc_path
     assert mise_system_miserc_path({"MISE_SYSTEM_CONFIG_DIR": "D:/mise-etc"}, Path("C:/Users/me"), "win32") == Path("D:/mise-etc/miserc.toml")

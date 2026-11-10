@@ -767,5 +767,20 @@ t_composer_preserves_unrelated_keys() {
 
 T "composer preserves unrelated JSON keys" t_composer_preserves_unrelated_keys
 
+t_mise_legacy_migration_follows_config_dir() {
+  local home; home=$(setup_home)
+  local custom="$home/mise-custom"
+  run_pmsec "$home" MISE_CONFIG_DIR="$custom" PMSEC_MISE_VERSION=2026.11.0 -- --tool mise --days 1 >/dev/null
+  assert_match "pmsec layer written" '^minimum_release_age = "1d"$' "$(cat "$custom/config.pmsec.toml")" || { rm -rf -- "$home"; return 1; }
+  # A downgrade must migrate into the config dir mise actually reads.
+  run_pmsec "$home" MISE_CONFIG_DIR="$custom" PMSEC_MISE_VERSION=2026.10.25 -- --tool mise --days 1 >/dev/null
+  assert_match "legacy write lands in custom dir" '^minimum_release_age = "1d"$' "$(cat "$custom/config.toml")" || { rm -rf -- "$home"; return 1; }
+  [ ! -e "$custom/config.pmsec.toml" ] || { LAST_FAIL="pmsec layer survived downgrade"; rm -rf -- "$home"; return 1; }
+  [ ! -e "$home/.config/mise/config.toml" ] || { LAST_FAIL="default legacy file written"; rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+
+T "mise legacy migration follows MISE_CONFIG_DIR" t_mise_legacy_migration_follows_config_dir
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

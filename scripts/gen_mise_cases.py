@@ -137,6 +137,16 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "enable_mise_reverse_migration_config_dir",
+        {
+            "mise-custom/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',
+            "mise-custom/miserc.local.toml": 'env = ["pmsec"]\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_CONFIG_DIR": "<HOME>/mise-custom"},
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
         "enable_mise_reverse_migration_global_file",
         {
             ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',

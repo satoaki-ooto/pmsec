@@ -98,6 +98,10 @@ path_bundler() {
 path_mise() {
   local home; home=$(_pmsec_home)
   if [ -n "${MISE_GLOBAL_CONFIG_FILE:-}" ]; then printf '%s' "$MISE_GLOBAL_CONFIG_FILE"; return; fi
+  # mise reads its global config from MISE_CONFIG_DIR when set, so the legacy
+  # destination must follow it; a default-path write would leave the active
+  # config without the bundle after a downgrade migration.
+  if [ -n "${MISE_CONFIG_DIR:-}" ]; then printf '%s/config.toml' "$MISE_CONFIG_DIR"; return; fi
   if [ "${PMSEC_PLATFORM:-}" = "win32" ]; then
     printf '%s/mise/config.toml' "${LOCALAPPDATA:-$home/AppData/Local}"; return
   fi

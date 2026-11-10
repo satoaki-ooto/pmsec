@@ -66,6 +66,10 @@ export function bundleConfigPath(env = process.env, home = homedir()) {
 
 export function miseConfigPath(env = process.env, home = homedir(), platform = process.platform) {
   if (env.MISE_GLOBAL_CONFIG_FILE) return env.MISE_GLOBAL_CONFIG_FILE;
+  // mise reads its global config from MISE_CONFIG_DIR when set, so the legacy
+  // destination must follow it; a default-path write would leave the active
+  // config without the bundle after a downgrade migration.
+  if (env.MISE_CONFIG_DIR) return join(env.MISE_CONFIG_DIR, "config.toml");
   if (platform === "win32") {
     const base = env.LOCALAPPDATA || join(home, "AppData", "Local");
     return join(base, "mise", "config.toml");
