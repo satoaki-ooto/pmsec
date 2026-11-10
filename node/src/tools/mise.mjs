@@ -74,14 +74,24 @@ function supportsNewMode(ctx) {
   return gte(v, newModeMin) === true && !ctx.env.MISE_GLOBAL_CONFIG_FILE;
 }
 
-async function hasNewArtifacts(p) {
-  if (existsSync(p.pmsec)) return true;
-  if (!existsSync(p.local)) return false;
-  try {
-    return parseEnv(await readSafe(p.local)).values.includes("pmsec");
-  } catch {
-    return false;
+async function hasNewArtifacts(ctx, p) {
+  // A leftover config.pmsec.toml that defines no managed keys and is not
+  // selected anywhere is inert — mise loads the layer only when the pmsec
+  // environment is active — so legacy mode must converge instead of failing
+  // forever on a file the cleanup intentionally keeps. An artifact is an
+  // active selector (MISE_ENV or any miserc) or managed keys in the file.
+  if (envListFrom(ctx.env.MISE_ENV).includes("pmsec")) return true;
+  for (const file of [p.local, p.shared, p.system]) {
+    if (!existsSync(file)) continue;
+    try {
+      if (parseEnv(await readSafe(file)).values.includes("pmsec")) return true;
+    } catch { /* a malformed selector is surfaced by the selector paths */ }
   }
+  try {
+    const r = readOne(await readSafe(p.pmsec));
+    if (r.configured !== null || r.extras.some(e => e.configured !== null)) return true;
+  } catch { /* surfaced by the read path */ }
+  return false;
 }
 
 // MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
@@ -225,7 +235,7 @@ export async function read(ctx) {
       rowFail: selector.wired === false,
     };
   }
-  const artifacts = await hasNewArtifacts(p);
+  const artifacts = await hasNewArtifacts(ctx, p);
   const files = action === "enable" && artifacts
     ? distinctFiles([p.legacy, p.base, p.pmsec])
     : [p.legacy];
@@ -257,7 +267,7 @@ export async function write(days, ctx) {
     return { path: p.pmsec, warn: envWarning(ctx) };
   }
 
-  const artifacts = await hasNewArtifacts(p);
+  const artifacts = await hasNewArtifacts(ctx, p);
   const settings = await applySettings(await readSafe(p.legacy), days, ctx);
   await writeAtomic(p.legacy, settings);
   if (artifacts) {

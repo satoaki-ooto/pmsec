@@ -119,6 +119,24 @@ CASES = [
         ["--tool", "mise", "--disable", "--json"],
     ),
     (
+        "check_mise_legacy_residual_pmsec_file",
+        {".config/mise/config.pmsec.toml": '[settings]\nexperimental = true\n'},
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+        {"pre": [["--tool", "mise", "--days", "1", "--json"]]},
+    ),
+    (
+        "enable_mise_legacy_residual_pmsec_file",
+        {
+            ".config/mise/config.toml": '[settings]\nminimum_release_age = "7d"\n',
+            ".config/mise/config.pmsec.toml": '[settings]\nexperimental = true\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
         "check_mise_legacy_conflict",
         {
             ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "1d"\n',

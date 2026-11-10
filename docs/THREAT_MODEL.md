@@ -95,10 +95,15 @@ list. Two properties matter:
   survives a project `miserc`, so the selector cannot be neutralised by a
   cloned repository.
 
-A legacy-mode run that finds new-mode artifacts (a leftover
-`config.pmsec.toml` or a `pmsec` selector) fails closed with a migration
-warning instead of reporting OK from either file, because the active
-configuration is ambiguous. `enable` writes the destination generation
+A legacy-mode run that finds new-mode artifacts — an active `pmsec`
+selector (the `MISE_ENV` variable or a `miserc` environment list) or
+managed keys inside a leftover `config.pmsec.toml` — fails closed with a
+migration warning instead of reporting OK from either file, because the
+active configuration is ambiguous. A residual pmsec file with neither
+managed keys nor a selector is inert (mise loads the layer only when it
+is selected), so legacy mode converges on it instead of failing forever.
+
+`enable` writes the destination generation
 before removing the other one; an interrupted cleanup can leave extra files
 but converges on the next run and never silently weakens a value outside
 `--force`.

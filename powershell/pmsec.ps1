@@ -1228,13 +1228,28 @@ function MiseEnvWarning {
 }
 
 function MiseHasNewArtifacts {
-  if (Test-Path -LiteralPath (Get-MisePmsecPath) -PathType Leaf) { return $true }
-  $localp = Get-MiseLocalMiserc
-  if (-not (Test-Path -LiteralPath $localp -PathType Leaf)) { return $false }
-  LinesLoad $localp
-  $parsed = $null
-  try { $parsed = MisercParseEnv } catch { return $false }
-  return ($parsed.Defined -and $parsed.Values -ccontains 'pmsec')
+  # A leftover config.pmsec.toml that defines no managed keys and is not
+  # selected anywhere is inert — mise loads the layer only when the pmsec
+  # environment is active — so legacy mode must converge instead of failing
+  # forever on a file the cleanup intentionally keeps. An artifact is an
+  # active selector (MISE_ENV or any miserc) or managed keys in the file.
+  foreach ($e in (MiseEnvList $env:MISE_ENV)) {
+    if ($e -ceq 'pmsec') { return $true }
+  }
+  foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+    LinesLoad $p
+    try { $parsed = MisercParseEnv } catch { continue }
+    if ($parsed.Defined -and (@($parsed.Values) -ccontains 'pmsec')) { return $true }
+  }
+  $pmsec = Get-MisePmsecPath
+  if (-not (Test-Path -LiteralPath $pmsec -PathType Leaf)) { return $false }
+  LinesLoad $pmsec
+  if ($null -ne (LinesReadKey 'minimum_release_age' '=' 'settings')) { return $true }
+  foreach ($e in (ToolExtras 'mise')) {
+    if ($null -ne (LinesReadKey $e.Key $e.Sep $e.Section)) { return $true }
+  }
+  return $false
 }
 
 function MiseSelectorState {

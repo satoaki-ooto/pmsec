@@ -106,15 +106,29 @@ def _supports_new_mode(ctx: Context) -> bool:
     return gte(v, NEW_MODE_MIN) is True and "MISE_GLOBAL_CONFIG_FILE" not in ctx.env
 
 
-def _has_new_artifacts(p: dict[str, Path]) -> bool:
-    if p["pmsec"].exists():
+def _has_new_artifacts(ctx: Context, p: dict[str, Path]) -> bool:
+    """A leftover config.pmsec.toml that defines no managed keys and is not
+    selected anywhere is inert — mise loads the layer only when the pmsec
+    environment is active — so legacy mode must converge instead of failing
+    forever on a file the cleanup intentionally keeps. An artifact is an
+    active selector (MISE_ENV or any miserc) or managed keys in the file."""
+    if "pmsec" in env_list_from(ctx.env.get("MISE_ENV")):
         return True
-    if not p["local"].exists():
-        return False
+    for f in (p["local"], p["shared"], p["system"]):
+        if not f.exists():
+            continue
+        try:
+            if "pmsec" in parse_env(_read(f))["values"]:
+                return True
+        except ValueError:
+            continue
     try:
-        return "pmsec" in parse_env(_read(p["local"]))["values"]
-    except ValueError:
-        return False
+        r = _read_one(_read(p["pmsec"]))
+        if r["configured"] is not None or any(e["configured"] is not None for e in r["extras"]):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _read_one(raw: str) -> dict:
@@ -271,7 +285,7 @@ def read(ctx: Context) -> dict:
             "warn": _env_warning(ctx),
             "rowFail": selector["wired"] is False,
         }
-    artifacts = _has_new_artifacts(p)
+    artifacts = _has_new_artifacts(ctx, p)
     files = _distinct([p["legacy"], p["base"], p["pmsec"]]) if action == "enable" and artifacts else [p["legacy"]]
     merged = _merge_reads(_read_files(files))
     return {
@@ -300,7 +314,7 @@ def write(days: int, ctx: Context) -> dict:
         _remove_managed_from(p["legacy"])
         return {"path": str(p["pmsec"]), "warn": _env_warning(ctx)}
 
-    artifacts = _has_new_artifacts(p)
+    artifacts = _has_new_artifacts(ctx, p)
     settings = _apply_settings(_read(p["legacy"]), days, ctx)
     write_atomic(p["legacy"], settings)
     if artifacts:

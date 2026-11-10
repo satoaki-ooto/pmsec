@@ -1094,16 +1094,35 @@ mise_supports_new_mode() {
 }
 
 mise_has_new_artifacts() {
-  if [ -e "$(path_mise_pmsec)" ]; then return 0; fi
-  local localp; localp=$(path_mise_local_miserc)
-  [ -e "$localp" ] || return 1
-  lines_load "$localp"
-  miserc_parse_env || return 1
-  [ "$MISE_ENVDEF" = "1" ] || return 1
-  local v
-  for v in "${MISE_ENV_VALUES[@]}"; do
-    [ "$v" = "pmsec" ] && return 0
+  # A leftover config.pmsec.toml that defines no managed keys and is not
+  # selected anywhere is inert — mise loads the layer only when the pmsec
+  # environment is active — so legacy mode must converge instead of failing
+  # forever on a file the cleanup intentionally keeps. An artifact is an
+  # active selector (MISE_ENV or any miserc) or managed keys in the file.
+  local p v
+  if [ -n "${MISE_ENV:-}" ]; then
+    while IFS= read -r v; do
+      [ "$v" = "pmsec" ] && return 0
+    done < <(mise_env_list "$MISE_ENV")
+  fi
+  for p in "$(path_mise_local_miserc)" "$(path_mise_shared_miserc)" "$(path_mise_system_miserc)"; do
+    [ -e "$p" ] || continue
+    lines_load "$p"
+    miserc_parse_env || continue
+    [ "$MISE_ENVDEF" = "1" ] || continue
+    for v in "${MISE_ENV_VALUES[@]}"; do
+      [ "$v" = "pmsec" ] && return 0
+    done
   done
+  local pmsecp; pmsecp=$(path_mise_pmsec)
+  [ -e "$pmsecp" ] || return 1
+  lines_load "$pmsecp"
+  lines_read_key "minimum_release_age" "=" "settings" >/dev/null && return 0
+  local ek ev el es esec esafe
+  while IFS='|' read -r ek ev el es esec esafe; do
+    [ -z "$ek" ] && continue
+    lines_read_key "$ek" "$es" "$esec" >/dev/null && return 0
+  done < <(tool_extras mise)
   return 1
 }
 
