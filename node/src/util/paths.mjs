@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { dirname, join, isAbsolute } from "node:path";
+import { dirname, join, isAbsolute, parse } from "node:path";
 import { existsSync } from "node:fs";
 
 export function npmrcPath(env = process.env, home = homedir()) {
@@ -72,6 +72,37 @@ export function miseConfigPath(env = process.env, home = homedir(), platform = p
   }
   const base = env.XDG_CONFIG_HOME || join(home, ".config");
   return join(base, "mise", "config.toml");
+}
+
+// mise's global config directory (https://mise.jdx.dev/directories.html).
+// Unlike the legacy single-file path above this is the same on every OS:
+// win32 uses %USERPROFILE%\.config\mise, not %LOCALAPPDATA%\mise.
+export function miseConfigDir(env = process.env, home = homedir()) {
+  if (env.MISE_CONFIG_DIR) return env.MISE_CONFIG_DIR;
+  if (env.XDG_CONFIG_HOME) return join(env.XDG_CONFIG_HOME, "mise");
+  return join(home, ".config", "mise");
+}
+
+export function miseBaseConfigPath(env = process.env, home = homedir()) {
+  return join(miseConfigDir(env, home), "config.toml");
+}
+
+export function misePmsecConfigPath(env = process.env, home = homedir()) {
+  return join(miseConfigDir(env, home), "config.pmsec.toml");
+}
+
+export function miseLocalMisercPath(env = process.env, home = homedir()) {
+  return join(miseConfigDir(env, home), "miserc.local.toml");
+}
+
+export function miseSharedMisercPath(env = process.env, home = homedir()) {
+  return join(miseConfigDir(env, home), "miserc.toml");
+}
+
+export function miseSystemMisercPath(env = process.env, home = homedir(), platform = process.platform) {
+  if (env.MISE_SYSTEM_CONFIG_DIR) return join(env.MISE_SYSTEM_CONFIG_DIR, "miserc.toml");
+  if (platform === "win32") return join(parse(home).root || "C:\\", "etc", "mise", "miserc.toml");
+  return "/etc/mise/miserc.toml";
 }
 
 export function aubeConfigPath(env = process.env, home = homedir(), platform = process.platform) {

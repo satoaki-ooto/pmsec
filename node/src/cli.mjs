@@ -99,12 +99,15 @@ function preflightWarn(t, ctx) {
 async function gatherStatus(targets, ctx) {
   return Promise.all(targets.map(async t => {
     const r = await t.read(ctx);
-    return {
+    const warns = [preflightWarn(t, ctx), r.warn].filter(Boolean);
+    const row = {
       tool: t.name, key: r.key ?? t.key, path: r.path,
       configured: r.configured, days: r.days,
       extras: r.extras ?? [],
-      warn: preflightWarn(t, ctx)
+      warn: warns.length ? warns.join(" ") : null
     };
+    if (r.selector) row.selector = r.selector;
+    return { row, fail: r.rowFail === true, selector: r.selector };
   }));
 }
 
@@ -115,6 +118,9 @@ function renderHuman(rows, min) {
     const value = r.configured ?? "(unset)";
     const tail = r.warn ? `\n       ⚠ ${r.warn}` : "";
     lines.push(`${status} ${r.tool.padEnd(4)} ${r.key} = ${value}  [${r.path}]${tail}`);
+    if (r.selector && r.selector.wired === false && !r.warn) {
+      lines.push(`       ⚠ pmsec env not selected  [${r.selector.path}]`);
+    }
     for (const e of r.extras) {
       const exStatus = e.ok ? "OK     " : e.configured === null ? "MISSING" : "STALE  ";
       const exValue = e.defaultEnforced ? `(default — runtime enforces ${e.expected})` : (e.configured ?? "(unset)");
@@ -125,14 +131,17 @@ function renderHuman(rows, min) {
 }
 
 async function runCheck(targets, { json, days }, ctx, out, err) {
-  const rows = await gatherStatus(targets, ctx);
+  const statuses = await gatherStatus(targets, ctx);
+  const rows = statuses.map(s => s.row);
   const failingPrimary = rows.filter(r => r.days === null || r.days < days);
   const failingExtras = rows.flatMap(r => r.extras.filter(e => !e.ok));
-  const ok = failingPrimary.length === 0 && failingExtras.length === 0;
+  const unwired = statuses.filter(s => s.selector && s.selector.wired === false);
+  const ok = failingPrimary.length === 0 && failingExtras.length === 0 && !statuses.some(s => s.fail);
   if (json) out.write(JSON.stringify({ bundleDays: days, rows, ok }, null, 2) + "\n");
   else out.write(renderHuman(rows, days));
   if (failingPrimary.length) err.write(`pmsec: ${failingPrimary.length} tool(s) below ${days} days — run \`pmsec\`\n`);
   if (failingExtras.length) err.write(`pmsec: ${failingExtras.length} hardening setting(s) not at safe value — run \`pmsec\`\n`);
+  if (unwired.length) err.write(`pmsec: pmsec environment not selected by mise miserc — run \`pmsec\`\n`);
   return ok ? 0 : 1;
 }
 
@@ -175,9 +184,11 @@ function runDoctor(targets, json, ctx, out) {
   let username = null;
   try { username = userInfo().username; } catch {}
   const tools = targets.map(t => {
-    const p = t.path(ctx);
-    const probe = probePath(p, uid);
-    return { tool: t.name, key: t.key, ...probe };
+    const paths = typeof t.doctorPaths === "function" ? t.doctorPaths(ctx) : { path: t.path(ctx), extraPaths: [] };
+    const probe = probePath(paths.path, uid);
+    const row = { tool: t.name, key: t.key, ...probe };
+    if (paths.extraPaths?.length) row.extraPaths = paths.extraPaths;
+    return row;
   });
   // doctor.ok is intentionally narrow: the parent directory must be writable
   // by the running uid. Everything else is informational.
@@ -208,6 +219,9 @@ function runDoctor(targets, json, ctx, out) {
     const flag = t.parentWritable ? "ok    " : "BLOCK ";
     const ownerSuffix = t.exists && t.owner !== null ? ` (uid=${t.owner})` : "";
     out.write(`${flag} ${t.tool.padEnd(4)} ${t.path}${ownerSuffix}\n`);
+    if (t.extraPaths) {
+      for (const extra of t.extraPaths) out.write(`         also: ${extra}\n`);
+    }
     if (!t.parentWritable) {
       // Only surface noise when there's a real problem. "parent missing but
       // mkdir -p can fix it" is the common case and isn't worth a line.
@@ -232,7 +246,7 @@ async function runEnable(targets, json, days, force, ctx, out, err) {
   // Each tool writes a different config file; safe to run in parallel.
   // Promise.all preserves input order in the results array.
   const results = await Promise.all(targets.map(async t => {
-    const warn = preflightWarn(t, ctx);
+    const preflight = preflightWarn(t, ctx);
     try {
       let effective = days;
       let kept = false;
@@ -243,9 +257,10 @@ async function runEnable(targets, json, days, force, ctx, out, err) {
         kept = currentDays >= days && currentDays > 0;
       }
       const r = await t.write(effective, { ...ctx, force });
+      const warn = [preflight, r.warn].filter(Boolean).join(" ") || null;
       return { tool: t.name, path: r.path, days: effective, requested: days, kept, forced: force, ok: true, warn };
     } catch (e) {
-      return { tool: t.name, path: e?.path ?? null, days, requested: days, kept: false, forced: force, ok: false, error: explainFsError(e, t.name), warn };
+      return { tool: t.name, path: e?.path ?? null, days, requested: days, kept: false, forced: force, ok: false, error: explainFsError(e, t.name), warn: preflight };
     }
   }));
   const failures = results.filter(r => !r.ok).map(r => ({ tool: r.tool, error: r.error }));
@@ -300,7 +315,7 @@ export async function run(argv, {
   let targets;
   try { targets = selectTools(opts.only); }
   catch (e) { err.write(`pmsec: ${e.message}\n`); return 2; }
-  const ctx = { env, home, platform };
+  const ctx = { env, home, platform, action: opts.mode };
   if (env.PMSEC_HOME) {
     err.write(`pmsec: PMSEC_HOME is ignored by the node port; paths resolve from HOME (${home}). Use the bash port for root-context redirection.\n`);
   }

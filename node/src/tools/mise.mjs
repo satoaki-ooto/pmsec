@@ -1,13 +1,21 @@
-import { miseConfigPath } from "../util/paths.mjs";
+import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
+import {
+  miseConfigPath, miseConfigDir, miseBaseConfigPath, misePmsecConfigPath,
+  miseLocalMisercPath, miseSharedMisercPath, miseSystemMisercPath,
+} from "../util/paths.mjs";
 import { readSafe, writeAtomic } from "../util/io.mjs";
 import { readKey, setKey, removeKey } from "../util/lines.mjs";
 import { readExtras, applyExtras, removeExtras } from "../util/extras.mjs";
-import { buildPreflight } from "../util/version.mjs";
+import { buildPreflight, detectVersion, gte } from "../util/version.mjs";
+import { parseEnv, setEnvValues, removeEnvValue, envListFrom } from "../util/miseconf.mjs";
+
 export const name = "mise";
 export const key = "minimum_release_age";
 export const section = "settings";
 export const docs = "https://mise.jdx.dev/configuration/settings.html#minimum_release_age";
 export const minBin = [2026, 4, 22];
+export const newModeMin = [2026, 11, 0];
 export const extras = [
   { key: "paranoid", expected: "true", line: "paranoid = true", section },
   { key: "gpg_verify", expected: "true", line: "gpg_verify = true", section },
@@ -28,10 +36,25 @@ export const extras = [
   { key: "not_found_system_fallback", expected: "false", line: "not_found_system_fallback = false", section },
 ];
 
-export function path(ctx) { return miseConfigPath(ctx.env, ctx.home, ctx.platform); }
-
 export const preflight = buildPreflight(name, minBin,
   "setting was named install_before before 2026.4.22 and minimum_release_age is silently ignored on older mise. Upgrade mise (`mise self-update`) to enforce the cooldown.");
+
+const MIGRATION_WARN = "a previous new-style mise configuration exists (config.pmsec.toml or the pmsec miserc selector); run `pmsec` to consolidate it";
+const MISE_ENV_WARN = "MISE_ENV overrides miserc and the pmsec environment is not active in this shell";
+
+export function path(ctx) { return miseConfigPath(ctx.env, ctx.home, ctx.platform); }
+
+export function paths(ctx) {
+  return {
+    legacy: miseConfigPath(ctx.env, ctx.home, ctx.platform),
+    dir: miseConfigDir(ctx.env, ctx.home),
+    base: miseBaseConfigPath(ctx.env, ctx.home),
+    pmsec: misePmsecConfigPath(ctx.env, ctx.home),
+    local: miseLocalMisercPath(ctx.env, ctx.home),
+    shared: miseSharedMisercPath(ctx.env, ctx.home),
+    system: miseSystemMisercPath(ctx.env, ctx.home, ctx.platform),
+  };
+}
 
 function parseDays(value) {
   if (value === null) return null;
@@ -45,30 +68,210 @@ function parseDays(value) {
   return n;
 }
 
-export async function read(ctx) {
-  const p = path(ctx);
-  const raw = await readSafe(p);
+function supportsNewMode(ctx) {
+  const v = detectVersion("mise", ["--version"], { env: ctx.env, overrideKey: "PMSEC_MISE_VERSION" });
+  return gte(v, newModeMin) === true && !ctx.env.MISE_GLOBAL_CONFIG_FILE;
+}
+
+async function hasNewArtifacts(p) {
+  if (existsSync(p.pmsec)) return true;
+  if (!existsSync(p.local)) return false;
+  try {
+    return parseEnv(await readSafe(p.local)).values.includes("pmsec");
+  } catch {
+    return false;
+  }
+}
+
+function readOne(raw) {
   const value = readKey(raw, key, { section });
+  return { configured: value, days: parseDays(value), extras: readExtras(raw, extras) };
+}
+
+function mergeReads(reads) {
+  let best = null;
+  let fallback = null;
+  for (const r of reads) {
+    if (r.configured !== null && fallback === null) fallback = r;
+    if (r.days !== null && (best === null || r.days > best.days)) best = r;
+  }
+  const chosen = best ?? fallback;
+  const extrasMerged = extras.map((e, i) => {
+    const values = reads.map(r => r.extras[i]).filter(Boolean);
+    const okOne = values.find(v => v.ok);
+    const defined = values.find(v => v.configured !== null);
+    return okOne ?? defined ?? { key: e.key, configured: null, expected: e.expected, ok: false };
+  });
   return {
-    path: p, configured: value, days: parseDays(value),
-    extras: readExtras(raw, extras)
+    configured: chosen ? chosen.configured : null,
+    days: best ? best.days : (chosen ? chosen.days : null),
+    extras: extrasMerged,
+  };
+}
+
+async function readFiles(files) {
+  return Promise.all(files.map(async p => readOne(await readSafe(p))));
+}
+
+function distinctFiles(paths) {
+  return [...new Set(paths)];
+}
+
+async function firstEnv(p) {
+  for (const file of [p.local, p.shared, p.system]) {
+    if (!existsSync(file)) continue;
+    const parsed = parseEnv(await readSafe(file));
+    if (parsed.defined) return { values: parsed.values, path: file };
+  }
+  return { values: [], path: null };
+}
+
+async function selectorState(ctx, p) {
+  const fromVar = envListFrom(ctx.env.MISE_ENV);
+  if (fromVar.length) {
+    return { path: "MISE_ENV", env: fromVar, wired: fromVar.includes("pmsec") };
+  }
+  const inherited = await firstEnv(p);
+  return {
+    path: inherited.path ?? p.local,
+    env: inherited.values,
+    wired: inherited.values.includes("pmsec"),
+  };
+}
+
+function envWarning(ctx) {
+  const values = envListFrom(ctx.env.MISE_ENV);
+  if (values.length && !values.includes("pmsec")) return MISE_ENV_WARN;
+  return null;
+}
+
+function isEmptyStructure(text) {
+  return text.split(/\r?\n/).every(line => {
+    const t = line.trim();
+    return t === "" || t.startsWith("#") || /^\[\[?[^\]]*\]\]?\s*(#.*)?$/.test(t);
+  });
+}
+
+async function deleteQuietly(p) {
+  try { await unlink(p); } catch (e) { if (e.code !== "ENOENT") throw e; }
+}
+
+async function removeManagedConfig(p) {
+  const before = await readSafe(p);
+  if (before === "") return false;
+  const cooldown = removeKey(before, key, { section });
+  const ex = removeExtras(cooldown.text, extras);
+  if (!cooldown.removed && !ex.removed) return false;
+  if (isEmptyStructure(ex.text)) await deleteQuietly(p);
+  else await writeAtomic(p, ex.text);
+  return true;
+}
+
+async function removeManagedFrom(path_) {
+  const before = await readSafe(path_);
+  if (before === "") return false;
+  const cooldown = removeKey(before, key, { section });
+  const ex = removeExtras(cooldown.text, extras);
+  const removed = cooldown.removed || ex.removed;
+  if (removed) await writeAtomic(path_, ex.text);
+  return removed;
+}
+
+async function applySettings(text, days, ctx) {
+  let out = setKey(text, key, `${key} = "${days}d"`, { section });
+  out = applyExtras(out, extras, ctx);
+  return out;
+}
+
+async function removeSelector(p) {
+  const before = await readSafe(p.local);
+  if (before === "") return false;
+  const r = removeEnvValue(before, "pmsec");
+  if (!r.removed) return false;
+  if (r.empty) await deleteQuietly(p.local);
+  else await writeAtomic(p.local, r.text);
+  return true;
+}
+
+function buildSelectorText(text, values) {
+  return setEnvValues(text, values);
+}
+
+export async function read(ctx) {
+  const p = paths(ctx);
+  const action = ctx.action ?? "check";
+  if (supportsNewMode(ctx)) {
+    const files = action === "enable"
+      ? distinctFiles([p.legacy, p.base, p.pmsec])
+      : [p.pmsec];
+    const merged = mergeReads(await readFiles(files));
+    const selector = await selectorState(ctx, p);
+    return {
+      path: p.pmsec,
+      ...merged,
+      selector,
+      warn: envWarning(ctx),
+      rowFail: selector.wired === false,
+    };
+  }
+  const artifacts = await hasNewArtifacts(p);
+  const files = action === "enable" && artifacts
+    ? distinctFiles([p.legacy, p.base, p.pmsec])
+    : [p.legacy];
+  const merged = mergeReads(await readFiles(files));
+  return {
+    path: p.legacy,
+    ...merged,
+    warn: artifacts ? MIGRATION_WARN : null,
+    rowFail: artifacts,
   };
 }
 
 export async function write(days, ctx) {
-  const p = path(ctx);
-  let text = setKey(await readSafe(p), key, `${key} = "${days}d"`, { section });
-  text = applyExtras(text, extras, ctx);
-  await writeAtomic(p, text);
-  return { path: p };
+  const p = paths(ctx);
+  if (supportsNewMode(ctx)) {
+    // Resolve the selector before touching any file: an invalid env array
+    // must fail without leaving a half-migrated pair of generations.
+    const inherited = await firstEnv(p);
+    const values = [...inherited.values.filter(v => v !== "pmsec"), "pmsec"];
+    const localBefore = await readSafe(p.local);
+    const localAfter = buildSelectorText(localBefore, values);
+
+    const settings = await applySettings(await readSafe(p.pmsec), days, ctx);
+    await writeAtomic(p.pmsec, settings);
+    await writeAtomic(p.local, localAfter);
+    // The legacy single-file generation is never the destination in new mode;
+    // drop only managed keys and leave user content in place.
+    await removeManagedFrom(p.legacy);
+    return { path: p.pmsec, warn: envWarning(ctx) };
+  }
+
+  const artifacts = await hasNewArtifacts(p);
+  const settings = await applySettings(await readSafe(p.legacy), days, ctx);
+  await writeAtomic(p.legacy, settings);
+  if (artifacts) {
+    // Reverse migration writes the destination first, then removes the new
+    // generation so an interrupted cleanup cannot leave no configuration.
+    await removeManagedConfig(p.pmsec);
+    await removeSelector(p);
+  }
+  return { path: p.legacy, warn: null };
 }
 
 export async function unset(ctx) {
-  const p = path(ctx);
-  const before = await readSafe(p);
-  const cooldown = removeKey(before, key, { section });
-  const ex = removeExtras(cooldown.text, extras);
-  const removed = cooldown.removed || ex.removed;
-  if (removed) await writeAtomic(p, ex.text);
-  return { path: p, removed };
+  const p = paths(ctx);
+  const newMode = supportsNewMode(ctx);
+  const legacyRemoved = await removeManagedFrom(p.legacy);
+  const pmsecRemoved = await removeManagedConfig(p.pmsec);
+  const selectorRemoved = await removeSelector(p);
+  return {
+    path: newMode ? p.pmsec : p.legacy,
+    removed: legacyRemoved || pmsecRemoved || selectorRemoved,
+  };
+}
+
+export function doctorPaths(ctx) {
+  const p = paths(ctx);
+  if (supportsNewMode(ctx)) return { path: p.pmsec, extraPaths: [p.legacy, p.local] };
+  return { path: p.legacy, extraPaths: [] };
 }
