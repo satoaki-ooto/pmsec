@@ -1562,6 +1562,41 @@ function ToolReadMise {
   }
 }
 
+# The path spelled with its on-disk casing, so case variants of one file on a
+# case-insensitive filesystem (Windows, the default NTFS setup) compare equal.
+# A case-sensitive filesystem (WSL) reports the variant as missing, so distinct
+# files keep distinct spellings.
+function MiseOnDiskPath([string]$Path) {
+  $full = [IO.Path]::GetFullPath($Path)
+  $root = [IO.Path]::GetPathRoot($full)
+  $out = $root
+  foreach ($part in ($full.Substring($root.Length) -split '[\\/]')) {
+    if (-not $part) { continue }
+    $name = $part
+    try {
+      if (Test-Path -LiteralPath ([IO.Path]::Combine($out, $part))) {
+        $hits = @([IO.Directory]::EnumerateFileSystemEntries($out) |
+          ForEach-Object { [IO.Path]::GetFileName($_) } |
+          Where-Object { [string]::Equals($_, $part, [StringComparison]::OrdinalIgnoreCase) })
+        if (-not ($hits -ccontains $part) -and $hits.Count -eq 1) { $name = $hits[0] }
+      }
+    } catch { }
+    $out = [IO.Path]::Combine($out, $name)
+  }
+  return $out
+}
+
+# MISE_GLOBAL_CONFIG_FILE can point at config.pmsec.toml itself, in any casing
+# the filesystem accepts; cleanup must then leave the destination alone.
+function MisePathsAliased([string]$A, [string]$B) {
+  $a = MiseOnDiskPath $A
+  $b = MiseOnDiskPath $B
+  $ra = [IO.Path]::GetPathRoot($a)
+  $rb = [IO.Path]::GetPathRoot($b)
+  return $ra.Equals($rb, [StringComparison]::OrdinalIgnoreCase) -and
+    $a.Substring($ra.Length).Equals($b.Substring($rb.Length), [StringComparison]::Ordinal)
+}
+
 function ToolWriteMise([int]$Days) {
   $legacy = Get-MisePath
   $base = Get-MiseBasePath
@@ -1594,7 +1629,7 @@ function ToolWriteMise([int]$Days) {
     # interrupted cleanup cannot create a no-config gap. MISE_GLOBAL_CONFIG_FILE
     # can point at config.pmsec.toml itself; the destination then IS the new
     # generation and cleanup would delete it.
-    if (-not [IO.Path]::GetFullPath($legacy).Equals([IO.Path]::GetFullPath($pmsec), [StringComparison]::Ordinal)) {
+    if (-not (MisePathsAliased $legacy $pmsec)) {
       [void](MiseRemoveManagedConfig $pmsec)
     }
     [void](MiseRemoveSelector $localp)
@@ -1613,7 +1648,7 @@ function ToolUnsetMise {
   # An aliased destination (MISE_GLOBAL_CONFIG_FILE at config.pmsec.toml) is
   # handled by the MiseRemoveManagedFrom pass above; a second pass could delete
   # the global config itself.
-  if (-not [IO.Path]::GetFullPath($legacy).Equals([IO.Path]::GetFullPath($pmsec), [StringComparison]::Ordinal)) {
+  if (-not (MisePathsAliased $legacy $pmsec)) {
     if (MiseRemoveManagedConfig $pmsec) { $removed = $true }
   }
   if (MiseRemoveSelector $localp) { $removed = $true }

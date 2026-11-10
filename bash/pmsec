@@ -1609,8 +1609,11 @@ mise_canonical_path() {
   printf '%s/%s' "${dir%/}" "$base"
 }
 
+# File identity (-ef) catches spellings a path comparison cannot: case
+# variants on case-insensitive filesystems (macOS) and hard links.
 mise_paths_aliased() {
-  [ "$(mise_canonical_path "$1")" = "$(mise_canonical_path "$2")" ]
+  [ "$(mise_canonical_path "$1")" = "$(mise_canonical_path "$2")" ] && return 0
+  [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ]
 }
 
 # True when the file holds a pmsec-managed key (in-memory check, no write).

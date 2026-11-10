@@ -620,6 +620,42 @@ def test_disable_reports_malformed_selector(tmp_path):
     assert "miserc env may only contain string names" in data["results"][0]["error"]
 
 
+def _casefold_root() -> Path | None:
+    """A case-insensitive directory: the default tmpdir on Windows/macOS, or
+    PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere."""
+    import tempfile
+    root = Path(os.environ.get("PMSEC_TEST_CASEFOLD_DIR") or tempfile.gettempdir())
+    try:
+        d = Path(tempfile.mkdtemp(prefix="pmsec-case-", dir=root))
+        (d / "probe").write_text("")
+        yes = (d / "PROBE").exists()
+        (d / "probe").unlink()
+        d.rmdir()
+        return root if yes else None
+    except OSError:
+        return None
+
+
+@pytest.mark.skipif(_casefold_root() is None, reason="needs a case-insensitive filesystem")
+def test_mise_reverse_migration_keeps_case_variant_global_alias():
+    import shutil
+    import tempfile
+    home = Path(tempfile.mkdtemp(prefix="pmsec-", dir=_casefold_root()))
+    try:
+        d = home / ".config" / "mise"
+        d.mkdir(parents=True)
+        (d / "config.pmsec.toml").write_text('[settings]\nminimum_release_age = "3d"\n')
+        (d / "miserc.local.toml").write_text('env = ["pmsec"]\n')
+        code, _, _ = run(["--tool", "mise", "--days", "1"], home,
+                         PMSEC_MISE_VERSION="2026.10.25",
+                         MISE_GLOBAL_CONFIG_FILE=str(d / "Config.Pmsec.toml"))
+        assert code == 0
+        assert re.search(r'^minimum_release_age = "3d"$', (d / "config.pmsec.toml").read_text(), re.M)
+        assert not (d / "miserc.local.toml").exists()
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_mise_legacy_migration_follows_config_dir(tmp_path):
     custom = tmp_path / "mise-custom"
     run(["--tool", "mise", "--days", "1"], tmp_path, PMSEC_MISE_VERSION="2026.11.0",

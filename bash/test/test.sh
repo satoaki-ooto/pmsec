@@ -782,6 +782,35 @@ t_mise_legacy_migration_follows_config_dir() {
 
 T "mise legacy migration follows MISE_CONFIG_DIR" t_mise_legacy_migration_follows_config_dir
 
+# Needs a case-insensitive filesystem: the default tmpdir on macOS, or
+# PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere.
+casefold_root() {
+  local root="${PMSEC_TEST_CASEFOLD_DIR:-${TMPDIR:-/tmp}}" d
+  d=$(mktemp -d "$root/pmsec-case.XXXXXX" 2>/dev/null) || return 1
+  : > "$d/probe"
+  if [ -e "$d/PROBE" ]; then rm -rf -- "$d"; printf '%s' "$root"; return 0; fi
+  rm -rf -- "$d"; return 1
+}
+
+t_mise_reverse_migration_case_variant_alias() {
+  local home; home=$(mktemp -d "$1/pmsec-bash.XXXXXX")
+  local d="$home/.config/mise" rc
+  mkdir -p "$d"
+  printf '[settings]\nminimum_release_age = "3d"\n' > "$d/config.pmsec.toml"
+  printf 'env = ["pmsec"]\n' > "$d/miserc.local.toml"
+  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 MISE_GLOBAL_CONFIG_FILE="$d/Config.Pmsec.toml" -- --tool mise --days 1 >/dev/null 2>&1; rc=$?
+  assert_eq "enable exit" "0" "$rc" || { rm -rf -- "$home"; return 1; }
+  assert_match "aliased destination kept" '^minimum_release_age = "3d"$' "$(cat "$d/config.pmsec.toml" 2>/dev/null)" || { rm -rf -- "$home"; return 1; }
+  [ ! -e "$d/miserc.local.toml" ] || { LAST_FAIL="selector survived reverse migration"; rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+
+if CASEFOLD_ROOT=$(casefold_root); then
+  T "mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias" t_mise_reverse_migration_case_variant_alias "$CASEFOLD_ROOT"
+else
+  printf 'SKIP  mise case-variant alias (needs a case-insensitive filesystem)\n'
+fi
+
 # A failed mise cleanup must surface as a failed disable, not a skip: the
 # legacy file keeps its managed key and pmsec exits nonzero.
 t_disable_reports_failed_mise_cleanup() {

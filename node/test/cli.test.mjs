@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { Writable } from "node:stream";
 import { run } from "../src/cli.mjs";
 
@@ -655,6 +656,36 @@ test("mise legacy migration follows MISE_CONFIG_DIR", async () => {
   assert.match(await readFile(join(custom, "config.toml"), "utf8"), /^minimum_release_age = "1d"$/m);
   await assert.rejects(readFile(join(custom, "config.pmsec.toml"), "utf8"));
   await assert.rejects(readFile(join(home, ".config", "mise", "config.toml"), "utf8"));
+});
+
+// Needs a case-insensitive filesystem: the default tmpdir on Windows/macOS, or
+// PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere.
+const casefoldRoot = process.env.PMSEC_TEST_CASEFOLD_DIR || tmpdir();
+const casefold = (() => {
+  try {
+    const d = mkdtempSync(join(casefoldRoot, "pmsec-case-"));
+    writeFileSync(join(d, "probe"), "");
+    const yes = existsSync(join(d, "PROBE"));
+    rmSync(d, { recursive: true, force: true });
+    return yes;
+  } catch { return false; }
+})();
+
+test("mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias", { skip: !casefold && "needs a case-insensitive filesystem" }, async () => {
+  const home = mkdtempSync(join(casefoldRoot, "pmsec-"));
+  try {
+    const dir = join(home, ".config", "mise");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "config.pmsec.toml"), '[settings]\nminimum_release_age = "3d"\n');
+    await writeFile(join(dir, "miserc.local.toml"), 'env = ["pmsec"]\n');
+    const { code } = await runCli(["--tool", "mise", "--days", "1"], home, "linux", {
+      PMSEC_MISE_VERSION: "2026.10.25",
+      MISE_GLOBAL_CONFIG_FILE: join(dir, "Config.Pmsec.toml"),
+    });
+    assert.equal(code, 0);
+    assert.match(await readFile(join(dir, "config.pmsec.toml"), "utf8"), /^minimum_release_age = "3d"$/m);
+    assert.equal(existsSync(join(dir, "miserc.local.toml")), false);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
 test("win32 system miserc default sits under the current drive root", async () => {

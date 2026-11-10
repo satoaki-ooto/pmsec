@@ -274,7 +274,14 @@ def _paths_aliased(p: dict[str, Path]) -> bool:
     """MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
     then the legacy destination IS the new generation and the reverse-migration
     cleanup must not remove what it just wrote (or delete the global config)."""
-    return _canonical_path(p["legacy"]) == _canonical_path(p["pmsec"])
+    if _canonical_path(p["legacy"]) == _canonical_path(p["pmsec"]):
+        return True
+    # File identity catches spellings a path comparison cannot: case variants
+    # on case-insensitive filesystems (Windows, macOS) and hard links.
+    try:
+        return os.path.samefile(p["legacy"], p["pmsec"])
+    except OSError:
+        return False
 
 
 def _canonical_path(file: Path) -> str:

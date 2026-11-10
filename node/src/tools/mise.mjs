@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -108,8 +108,18 @@ function canonicalPath(file) {
   try { return join(realpathSync(dirname(abs)), basename(abs)); } catch { return abs; }
 }
 
+// File identity catches spellings a path comparison cannot: case variants on
+// case-insensitive filesystems (Windows, macOS) and hard links.
+function sameFile(a, b) {
+  try {
+    const sa = statSync(a, { bigint: true });
+    const sb = statSync(b, { bigint: true });
+    return sa.ino !== 0n && sa.dev === sb.dev && sa.ino === sb.ino;
+  } catch { return false; }
+}
+
 function pathsAliased(p) {
-  return canonicalPath(p.legacy) === canonicalPath(p.pmsec);
+  return canonicalPath(p.legacy) === canonicalPath(p.pmsec) || sameFile(p.legacy, p.pmsec);
 }
 
 function readOne(raw) {

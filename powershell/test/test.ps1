@@ -415,6 +415,39 @@ T 'Windows mise new mode reverse-migrates when the version drops' {
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
 }
 
+# Needs a case-insensitive filesystem: the default temp dir on Windows, or
+# PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere.
+$casefoldRoot = if ($env:PMSEC_TEST_CASEFOLD_DIR) { $env:PMSEC_TEST_CASEFOLD_DIR } else { [System.IO.Path]::GetTempPath() }
+$casefold = $false
+try {
+  $probeDir = PathJoin $casefoldRoot ('pmsec-case-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+  [void](New-Item -ItemType Directory -Path $probeDir -Force)
+  [System.IO.File]::WriteAllText((PathJoin $probeDir 'probe'), '')
+  $casefold = Test-Path -LiteralPath (PathJoin $probeDir 'PROBE')
+  Remove-Item -Recurse -Force -LiteralPath $probeDir
+} catch { $casefold = $false }
+
+if ($casefold) {
+  T 'mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias' {
+    $h = PathJoin $casefoldRoot ('pmsec-ps-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    [void](New-Item -ItemType Directory -Path $h -Force)
+    try {
+      $d = PathJoin $h '.config' 'mise'
+      [void](New-Item -ItemType Directory -Path $d -Force)
+      [System.IO.File]::WriteAllText((PathJoin $d 'config.pmsec.toml'), "[settings]`nminimum_release_age = `"3d`"`n")
+      [System.IO.File]::WriteAllText((PathJoin $d 'miserc.local.toml'), "env = [`"pmsec`"]`n")
+      [void](InvokePmsec $h @{ PMSEC_MISE_VERSION = '2026.10.25'; MISE_GLOBAL_CONFIG_FILE = (PathJoin $d 'Config.Pmsec.toml') } @('--tool','mise','--days','1'))
+      $p = PathJoin $d 'config.pmsec.toml'
+      if (-not (Test-Path -LiteralPath $p)) { $script:LastFail = 'aliased destination deleted'; return $false }
+      $ok = AssertMatch 'aliased destination kept' '(?m)^minimum_release_age = "3d"$' ([System.IO.File]::ReadAllText($p))
+      if ($ok -and (Test-Path -LiteralPath (PathJoin $d 'miserc.local.toml'))) { $script:LastFail = 'selector survived reverse migration'; $ok = $false }
+      return $ok
+    } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+  }
+} else {
+  Write-Host 'SKIP  mise case-variant alias (needs a case-insensitive filesystem)'
+}
+
 T 'Windows mise legacy migration follows MISE_CONFIG_DIR' {
   $h = NewHome
   try {
