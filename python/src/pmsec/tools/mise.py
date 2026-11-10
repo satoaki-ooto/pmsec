@@ -129,6 +129,9 @@ def _has_new_artifacts(ctx: Context, p: dict[str, Path]) -> bool:
         if "pmsec" in parsed["values"]:
             return True
         break
+    # An aliased pmsec file is the legacy destination itself, not a leftover.
+    if _paths_aliased(p):
+        return False
     try:
         r = _read_one(_read(p["pmsec"]))
         if r["configured"] is not None or any(e["configured"] is not None for e in r["extras"]):
@@ -277,11 +280,24 @@ def _paths_aliased(p: dict[str, Path]) -> bool:
     if _canonical_path(p["legacy"]) == _canonical_path(p["pmsec"]):
         return True
     # File identity catches spellings a path comparison cannot: case variants
-    # on case-insensitive filesystems (Windows, macOS) and hard links.
-    try:
-        return os.path.samefile(p["legacy"], p["pmsec"])
-    except OSError:
+    # on case-insensitive filesystems, junctions, 8.3 short names, hard links.
+    # An identity that cannot be determined counts as aliased: skipping
+    # cleanup never loses settings.
+    a, b = _file_id(p["legacy"]), _file_id(p["pmsec"])
+    if a == "missing" or b == "missing":
         return False
+    return a is None or b is None or a == b
+
+
+def _file_id(file: Path):
+    """"missing", None when the identity cannot be determined, else (dev, ino)."""
+    try:
+        st = os.stat(file)
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except OSError:
+        return None
+    return None if st.st_ino == 0 else (st.st_dev, st.st_ino)
 
 
 def _canonical_path(file: Path) -> str:

@@ -415,6 +415,36 @@ T 'Windows mise new mode reverse-migrates when the version drops' {
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
 }
 
+$onWindows = $PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows
+
+# A junction on Windows, a symlink elsewhere: both reach config.pmsec.toml by
+# a spelling that differs from MISE_GLOBAL_CONFIG_FILE.
+T 'mise reverse migration keeps a MISE_GLOBAL_CONFIG_FILE alias reached through a linked MISE_CONFIG_DIR' {
+  $h = NewHome
+  try {
+    $real = PathJoin $h 'real'
+    $link = PathJoin $h 'link'
+    [void](New-Item -ItemType Directory -Path $real -Force)
+    [void](New-Item -ItemType $(if ($onWindows) { 'Junction' } else { 'SymbolicLink' }) -Path $link -Value $real)
+    [System.IO.File]::WriteAllText((PathJoin $real 'config.pmsec.toml'), "[settings]`nminimum_release_age = `"3d`"`n")
+    [System.IO.File]::WriteAllText((PathJoin $real 'miserc.local.toml'), "env = [`"pmsec`"]`n")
+    $vars = @{ PMSEC_MISE_VERSION = '2026.10.25'; MISE_CONFIG_DIR = $link; MISE_GLOBAL_CONFIG_FILE = (PathJoin $real 'config.pmsec.toml') }
+    if ($onWindows) { $vars.PMSEC_FAKE_SCOPES = "windows|$h|win32"; $vars.LOCALAPPDATA = (PathJoin $h 'AppData' 'Local') }
+    $r = InvokePmsec $h $vars @('--tool','mise','--days','1')
+    if ($r.Code -ne 0) { $script:LastFail = "enable exit $($r.Code)"; return $false }
+    $p = PathJoin $real 'config.pmsec.toml'
+    if (-not (Test-Path -LiteralPath $p)) { $script:LastFail = 'aliased destination deleted'; return $false }
+    if (-not (AssertMatch 'aliased destination kept' '(?m)^minimum_release_age = "3d"$' ([System.IO.File]::ReadAllText($p)))) { return $false }
+    if (Test-Path -LiteralPath (PathJoin $real 'miserc.local.toml')) { $script:LastFail = 'selector survived reverse migration'; return $false }
+    $r = InvokePmsec $h $vars @('--tool','mise','--check')
+    if ($r.Code -ne 0) { $script:LastFail = "check after migration exit $($r.Code)"; return $false }
+    return $true
+  } finally {
+    if (Test-Path -LiteralPath (PathJoin $h 'link')) { (Get-Item -LiteralPath (PathJoin $h 'link') -Force).Delete() }
+    Remove-Item -Recurse -Force -LiteralPath $h
+  }
+}
+
 # Needs a case-insensitive filesystem: the default temp dir on Windows, or
 # PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere.
 $casefoldRoot = if ($env:PMSEC_TEST_CASEFOLD_DIR) { $env:PMSEC_TEST_CASEFOLD_DIR } else { [System.IO.Path]::GetTempPath() }
@@ -436,11 +466,17 @@ if ($casefold) {
       [void](New-Item -ItemType Directory -Path $d -Force)
       [System.IO.File]::WriteAllText((PathJoin $d 'config.pmsec.toml'), "[settings]`nminimum_release_age = `"3d`"`n")
       [System.IO.File]::WriteAllText((PathJoin $d 'miserc.local.toml'), "env = [`"pmsec`"]`n")
-      [void](InvokePmsec $h @{ PMSEC_MISE_VERSION = '2026.10.25'; MISE_GLOBAL_CONFIG_FILE = (PathJoin $d 'Config.Pmsec.toml') } @('--tool','mise','--days','1'))
+      $vars = @{ PMSEC_MISE_VERSION = '2026.10.25'; MISE_GLOBAL_CONFIG_FILE = (PathJoin $d 'Config.Pmsec.toml') }
+      if ($onWindows) { $vars.PMSEC_FAKE_SCOPES = "windows|$h|win32"; $vars.LOCALAPPDATA = (PathJoin $h 'AppData' 'Local') }
+      [void](InvokePmsec $h $vars @('--tool','mise','--days','1'))
       $p = PathJoin $d 'config.pmsec.toml'
       if (-not (Test-Path -LiteralPath $p)) { $script:LastFail = 'aliased destination deleted'; return $false }
       $ok = AssertMatch 'aliased destination kept' '(?m)^minimum_release_age = "3d"$' ([System.IO.File]::ReadAllText($p))
       if ($ok -and (Test-Path -LiteralPath (PathJoin $d 'miserc.local.toml'))) { $script:LastFail = 'selector survived reverse migration'; $ok = $false }
+      if ($ok) {
+        $r = InvokePmsec $h $vars @('--tool','mise','--check')
+        if ($r.Code -ne 0) { $script:LastFail = "check after migration exit $($r.Code)"; $ok = $false }
+      }
       return $ok
     } finally { Remove-Item -Recurse -Force -LiteralPath $h }
   }

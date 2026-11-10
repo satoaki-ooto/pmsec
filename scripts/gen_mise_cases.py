@@ -197,6 +197,22 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "check_mise_legacy_aliased_global_after_migration",
+        {
+            "mise-custom/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',
+            "mise-custom/miserc.local.toml": 'env = ["pmsec"]\n',
+        },
+        None,
+        {
+            "PMSEC_MISE_VERSION": "2026.10.25",
+            "MISE_CONFIG_DIR": "<HOME>/mise-custom",
+            "MISE_GLOBAL_CONFIG_FILE": "<HOME>/mise-custom/config.pmsec.toml",
+        },
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+        {"pre": [["--tool", "mise", "--days", "1", "--json"]],
+         "missing": ["mise-custom/miserc.local.toml"]},
+    ),
+    (
         "enable_mise_reverse_migration_global_file",
         {
             ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',

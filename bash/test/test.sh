@@ -802,8 +802,29 @@ t_mise_reverse_migration_case_variant_alias() {
   assert_eq "enable exit" "0" "$rc" || { rm -rf -- "$home"; return 1; }
   assert_match "aliased destination kept" '^minimum_release_age = "3d"$' "$(cat "$d/config.pmsec.toml" 2>/dev/null)" || { rm -rf -- "$home"; return 1; }
   [ ! -e "$d/miserc.local.toml" ] || { LAST_FAIL="selector survived reverse migration"; rm -rf -- "$home"; return 1; }
+  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 MISE_GLOBAL_CONFIG_FILE="$d/Config.Pmsec.toml" -- --tool mise --check >/dev/null 2>&1; rc=$?
+  assert_eq "check after migration" "0" "$rc" || { rm -rf -- "$home"; return 1; }
   rm -rf -- "$home"
 }
+
+t_mise_reverse_migration_linked_config_dir_alias() {
+  local home; home=$(mktemp -d)
+  local real="$home/real" rc
+  mkdir -p "$real"
+  ln -s "$real" "$home/link"
+  printf '[settings]\nminimum_release_age = "3d"\n' > "$real/config.pmsec.toml"
+  printf 'env = ["pmsec"]\n' > "$real/miserc.local.toml"
+  local env=(PMSEC_MISE_VERSION=2026.10.25 MISE_CONFIG_DIR="$home/link" MISE_GLOBAL_CONFIG_FILE="$real/config.pmsec.toml")
+  run_pmsec "$home" "${env[@]}" -- --tool mise --days 1 >/dev/null 2>&1; rc=$?
+  assert_eq "enable exit" "0" "$rc" || { rm -rf -- "$home"; return 1; }
+  assert_match "aliased destination kept" '^minimum_release_age = "3d"$' "$(cat "$real/config.pmsec.toml" 2>/dev/null)" || { rm -rf -- "$home"; return 1; }
+  [ ! -e "$real/miserc.local.toml" ] || { LAST_FAIL="selector survived reverse migration"; rm -rf -- "$home"; return 1; }
+  run_pmsec "$home" "${env[@]}" -- --tool mise --check >/dev/null 2>&1; rc=$?
+  assert_eq "check after migration" "0" "$rc" || { rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+
+T "mise reverse migration keeps a MISE_GLOBAL_CONFIG_FILE alias reached through a linked MISE_CONFIG_DIR" t_mise_reverse_migration_linked_config_dir_alias
 
 if CASEFOLD_ROOT=$(casefold_root); then
   T "mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias" t_mise_reverse_migration_case_variant_alias "$CASEFOLD_ROOT"

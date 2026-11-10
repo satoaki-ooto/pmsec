@@ -1119,6 +1119,8 @@ mise_has_new_artifacts() {
   done
   local pmsecp; pmsecp=$(path_mise_pmsec)
   [ -e "$pmsecp" ] || return 1
+  # An aliased pmsec file is the legacy destination itself, not a leftover.
+  mise_paths_aliased "$(path_mise)" "$pmsecp" && return 1
   lines_load "$pmsecp"
   lines_read_key "minimum_release_age" "=" "settings" >/dev/null && return 0
   local ek ev el es esec esafe
@@ -1609,11 +1611,25 @@ mise_canonical_path() {
   printf '%s/%s' "${dir%/}" "$base"
 }
 
+# True only when the path provably does not exist: the nearest existing
+# ancestor is searchable, so a failed -e is ENOENT, not EACCES.
+mise_path_absent() {
+  { [ -e "$1" ] || [ -L "$1" ]; } && return 1
+  local d; d=$(dirname -- "$1")
+  while [ ! -e "$d" ]; do d=$(dirname -- "$d"); done
+  [ -x "$d" ]
+}
+
 # File identity (-ef) catches spellings a path comparison cannot: case
-# variants on case-insensitive filesystems (macOS) and hard links.
+# variants on case-insensitive filesystems and hard links. An identity that
+# cannot be determined counts as aliased: skipping cleanup never loses
+# settings.
 mise_paths_aliased() {
   [ "$(mise_canonical_path "$1")" = "$(mise_canonical_path "$2")" ] && return 0
-  [ -e "$1" ] && [ -e "$2" ] && [ "$1" -ef "$2" ]
+  mise_path_absent "$1" && return 1
+  mise_path_absent "$2" && return 1
+  { [ -e "$1" ] && [ -e "$2" ]; } || return 0
+  [ "$1" -ef "$2" ]
 }
 
 # True when the file holds a pmsec-managed key (in-memory check, no write).

@@ -91,6 +91,8 @@ async function hasNewArtifacts(ctx, p) {
     if (parsed.values.includes("pmsec")) return true;
     break;
   }
+  // An aliased pmsec file is the legacy destination itself, not a leftover.
+  if (pathsAliased(p)) return false;
   try {
     const r = readOne(await readSafe(p.pmsec));
     if (r.configured !== null || r.extras.some(e => e.configured !== null)) return true;
@@ -108,18 +110,25 @@ function canonicalPath(file) {
   try { return join(realpathSync(dirname(abs)), basename(abs)); } catch { return abs; }
 }
 
-// File identity catches spellings a path comparison cannot: case variants on
-// case-insensitive filesystems (Windows, macOS) and hard links.
-function sameFile(a, b) {
+// "missing", null when the identity cannot be determined, else dev:ino.
+function fileId(file) {
   try {
-    const sa = statSync(a, { bigint: true });
-    const sb = statSync(b, { bigint: true });
-    return sa.ino !== 0n && sa.dev === sb.dev && sa.ino === sb.ino;
-  } catch { return false; }
+    const s = statSync(file, { bigint: true });
+    return s.ino === 0n ? null : `${s.dev}:${s.ino}`;
+  } catch (e) {
+    return e?.code === "ENOENT" || e?.code === "ENOTDIR" ? "missing" : null;
+  }
 }
 
+// File identity catches spellings a path comparison cannot: case variants on
+// case-insensitive filesystems, junctions, 8.3 short names, hard links. An
+// identity that cannot be determined counts as aliased: skipping cleanup
+// never loses settings.
 function pathsAliased(p) {
-  return canonicalPath(p.legacy) === canonicalPath(p.pmsec) || sameFile(p.legacy, p.pmsec);
+  if (canonicalPath(p.legacy) === canonicalPath(p.pmsec)) return true;
+  const a = fileId(p.legacy), b = fileId(p.pmsec);
+  if (a === "missing" || b === "missing") return false;
+  return a === null || b === null || a === b;
 }
 
 function readOne(raw) {

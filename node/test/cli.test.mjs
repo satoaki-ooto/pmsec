@@ -678,14 +678,32 @@ test("mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias"
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "config.pmsec.toml"), '[settings]\nminimum_release_age = "3d"\n');
     await writeFile(join(dir, "miserc.local.toml"), 'env = ["pmsec"]\n');
-    const { code } = await runCli(["--tool", "mise", "--days", "1"], home, "linux", {
-      PMSEC_MISE_VERSION: "2026.10.25",
-      MISE_GLOBAL_CONFIG_FILE: join(dir, "Config.Pmsec.toml"),
-    });
+    const env = { PMSEC_MISE_VERSION: "2026.10.25", MISE_GLOBAL_CONFIG_FILE: join(dir, "Config.Pmsec.toml") };
+    const { code } = await runCli(["--tool", "mise", "--days", "1"], home, "linux", env);
     assert.equal(code, 0);
     assert.match(await readFile(join(dir, "config.pmsec.toml"), "utf8"), /^minimum_release_age = "3d"$/m);
     assert.equal(existsSync(join(dir, "miserc.local.toml")), false);
+    assert.equal((await runCli(["--tool", "mise", "--check"], home, "linux", env)).code, 0);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("mise reverse migration keeps a MISE_GLOBAL_CONFIG_FILE alias reached through a linked MISE_CONFIG_DIR", async () => {
+  const { symlink } = await import("node:fs/promises");
+  const home = await setupHome();
+  const real = join(home, "real");
+  await mkdir(real, { recursive: true });
+  await symlink(real, join(home, "link"), "junction");
+  await writeFile(join(real, "config.pmsec.toml"), '[settings]\nminimum_release_age = "3d"\n');
+  await writeFile(join(real, "miserc.local.toml"), 'env = ["pmsec"]\n');
+  const env = {
+    PMSEC_MISE_VERSION: "2026.10.25",
+    MISE_CONFIG_DIR: join(home, "link"),
+    MISE_GLOBAL_CONFIG_FILE: join(real, "config.pmsec.toml"),
+  };
+  assert.equal((await runCli(["--tool", "mise", "--days", "1"], home, "linux", env)).code, 0);
+  assert.match(await readFile(join(real, "config.pmsec.toml"), "utf8"), /^minimum_release_age = "3d"$/m);
+  assert.equal(existsSync(join(real, "miserc.local.toml")), false);
+  assert.equal((await runCli(["--tool", "mise", "--check"], home, "linux", env)).code, 0);
 });
 
 test("win32 system miserc default sits under the current drive root", async () => {

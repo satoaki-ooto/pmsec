@@ -646,14 +646,34 @@ def test_mise_reverse_migration_keeps_case_variant_global_alias():
         d.mkdir(parents=True)
         (d / "config.pmsec.toml").write_text('[settings]\nminimum_release_age = "3d"\n')
         (d / "miserc.local.toml").write_text('env = ["pmsec"]\n')
-        code, _, _ = run(["--tool", "mise", "--days", "1"], home,
-                         PMSEC_MISE_VERSION="2026.10.25",
-                         MISE_GLOBAL_CONFIG_FILE=str(d / "Config.Pmsec.toml"))
+        env = {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_GLOBAL_CONFIG_FILE": str(d / "Config.Pmsec.toml")}
+        code, _, _ = run(["--tool", "mise", "--days", "1"], home, **env)
         assert code == 0
         assert re.search(r'^minimum_release_age = "3d"$', (d / "config.pmsec.toml").read_text(), re.M)
         assert not (d / "miserc.local.toml").exists()
+        assert run(["--tool", "mise", "--check"], home, **env)[0] == 0
     finally:
         shutil.rmtree(home, ignore_errors=True)
+
+
+def test_mise_reverse_migration_keeps_global_alias_through_linked_config_dir(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    try:
+        os.symlink(real, tmp_path / "link", target_is_directory=True)
+    except OSError as e:
+        pytest.skip(f"cannot create a directory symlink: {e}")
+    (real / "config.pmsec.toml").write_text('[settings]\nminimum_release_age = "3d"\n')
+    (real / "miserc.local.toml").write_text('env = ["pmsec"]\n')
+    env = {
+        "PMSEC_MISE_VERSION": "2026.10.25",
+        "MISE_CONFIG_DIR": str(tmp_path / "link"),
+        "MISE_GLOBAL_CONFIG_FILE": str(real / "config.pmsec.toml"),
+    }
+    assert run(["--tool", "mise", "--days", "1"], tmp_path, **env)[0] == 0
+    assert re.search(r'^minimum_release_age = "3d"$', (real / "config.pmsec.toml").read_text(), re.M)
+    assert not (real / "miserc.local.toml").exists()
+    assert run(["--tool", "mise", "--check"], tmp_path, **env)[0] == 0
 
 
 def test_mise_legacy_migration_follows_config_dir(tmp_path):

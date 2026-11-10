@@ -1287,6 +1287,8 @@ function MiseHasNewArtifacts {
   }
   $pmsec = Get-MisePmsecPath
   if (-not (Test-Path -LiteralPath $pmsec -PathType Leaf)) { return $false }
+  # An aliased pmsec file is the legacy destination itself, not a leftover.
+  if (MisePathsAliased (Get-MisePath) $pmsec) { return $false }
   LinesLoad $pmsec
   if ($null -ne (LinesReadKey 'minimum_release_age' '=' 'settings')) { return $true }
   foreach ($e in (ToolExtras 'mise')) {
@@ -1562,39 +1564,86 @@ function ToolReadMise {
   }
 }
 
-# The path spelled with its on-disk casing, so case variants of one file on a
-# case-insensitive filesystem (Windows, the default NTFS setup) compare equal.
-# A case-sensitive filesystem (WSL) reports the variant as missing, so distinct
-# files keep distinct spellings.
-function MiseOnDiskPath([string]$Path) {
-  $full = [IO.Path]::GetFullPath($Path)
-  $root = [IO.Path]::GetPathRoot($full)
-  $out = $root
-  foreach ($part in ($full.Substring($root.Length) -split '[\\/]')) {
-    if (-not $part) { continue }
-    $name = $part
-    try {
-      if (Test-Path -LiteralPath ([IO.Path]::Combine($out, $part))) {
-        $hits = @([IO.Directory]::EnumerateFileSystemEntries($out) |
-          ForEach-Object { [IO.Path]::GetFileName($_) } |
-          Where-Object { [string]::Equals($_, $part, [StringComparison]::OrdinalIgnoreCase) })
-        if (-not ($hits -ccontains $part) -and $hits.Count -eq 1) { $name = $hits[0] }
-      }
-    } catch { }
-    $out = [IO.Path]::Combine($out, $name)
+$script:PmsecFileIdSource = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class PmsecFileId {
+  [StructLayout(LayoutKind.Sequential)]
+  struct FILE_ID_INFO {
+    public ulong VolumeSerialNumber;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)] public byte[] FileId;
   }
-  return $out
+  [StructLayout(LayoutKind.Sequential)]
+  struct FILETIME_ { public uint Low; public uint High; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct BY_HANDLE_FILE_INFORMATION {
+    public uint FileAttributes;
+    public FILETIME_ CreationTime, LastAccessTime, LastWriteTime;
+    public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks, FileIndexHigh, FileIndexLow;
+  }
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool GetFileInformationByHandleEx(SafeFileHandle h, int infoClass, out FILE_ID_INFO info, uint size);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool GetFileInformationByHandle(SafeFileHandle h, out BY_HANDLE_FILE_INFORMATION info);
+  // Volume + file ID of the file the path resolves to (junctions and symlinks
+  // followed), or null when the filesystem reports none.
+  public static string Get(string path) {
+    // FILE_READ_ATTRIBUTES, share read/write/delete, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS.
+    using (SafeFileHandle h = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+      if (h.IsInvalid) return null;
+      FILE_ID_INFO id;
+      if (GetFileInformationByHandleEx(h, 18, out id, (uint)Marshal.SizeOf(typeof(FILE_ID_INFO))) &&
+          id.FileId != null && Array.Exists(id.FileId, b => b != 0)) {
+        return "x" + id.VolumeSerialNumber.ToString("x16") + ":" + BitConverter.ToString(id.FileId);
+      }
+      BY_HANDLE_FILE_INFORMATION bh;
+      if (GetFileInformationByHandle(h, out bh) && (bh.FileIndexHigh != 0 || bh.FileIndexLow != 0)) {
+        return "b" + bh.VolumeSerialNumber.ToString("x8") + ":" + bh.FileIndexHigh.ToString("x8") + bh.FileIndexLow.ToString("x8");
+      }
+      return null;
+    }
+  }
+}
+'@
+
+# 'missing', $null when the identity cannot be determined, else a volume:id
+# string for the file the path resolves to.
+function MiseFileId([string]$Path) {
+  try { [void][IO.File]::GetAttributes($Path) }
+  catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return 'missing' }
+  catch { return $null }
+  try {
+    if ($PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows) {
+      if (-not ('PmsecFileId' -as [type])) { Add-Type -TypeDefinition $script:PmsecFileIdSource }
+      return [PmsecFileId]::Get($Path)
+    }
+    # Non-Windows hosts only run the test suite; stat the link target.
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.LinkType) {
+      $target = $item.ResolveLinkTarget($true)
+      if (-not $target) { return $null }
+      $item = Get-Item -LiteralPath $target.FullName -Force
+    }
+    $st = $item.UnixStat
+    if (-not $st -or -not $st.Inode) { return $null }
+    return "$($st.DeviceId):$($st.Inode)"
+  } catch { return $null }
 }
 
-# MISE_GLOBAL_CONFIG_FILE can point at config.pmsec.toml itself, in any casing
-# the filesystem accepts; cleanup must then leave the destination alone.
+# MISE_GLOBAL_CONFIG_FILE can point at config.pmsec.toml itself through any
+# spelling the filesystem accepts (case variant, junction, 8.3 short name);
+# cleanup must then leave the destination alone. An identity that cannot be
+# determined counts as aliased: skipping cleanup never loses settings.
 function MisePathsAliased([string]$A, [string]$B) {
-  $a = MiseOnDiskPath $A
-  $b = MiseOnDiskPath $B
-  $ra = [IO.Path]::GetPathRoot($a)
-  $rb = [IO.Path]::GetPathRoot($b)
-  return $ra.Equals($rb, [StringComparison]::OrdinalIgnoreCase) -and
-    $a.Substring($ra.Length).Equals($b.Substring($rb.Length), [StringComparison]::Ordinal)
+  if ([IO.Path]::GetFullPath($A).Equals([IO.Path]::GetFullPath($B), [StringComparison]::Ordinal)) { return $true }
+  $ia = MiseFileId $A
+  $ib = MiseFileId $B
+  if ($ia -ceq 'missing' -or $ib -ceq 'missing') { return $false }
+  if ($null -eq $ia -or $null -eq $ib) { return $true }
+  return ($ia -ceq $ib)
 }
 
 function ToolWriteMise([int]$Days) {
