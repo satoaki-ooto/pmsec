@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { unlink } from "node:fs/promises";
+import { resolve } from "node:path";
 import {
   miseConfigPath, miseConfigDir, miseBaseConfigPath, misePmsecConfigPath,
   miseLocalMisercPath, miseSharedMisercPath, miseSystemMisercPath,
@@ -81,6 +82,13 @@ async function hasNewArtifacts(p) {
   } catch {
     return false;
   }
+}
+
+// MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
+// then the legacy destination IS the new generation and the reverse-migration
+// cleanup must not remove what it just wrote (or delete the global config).
+function pathsAliased(p) {
+  return resolve(p.legacy) === resolve(p.pmsec);
 }
 
 function readOne(raw) {
@@ -252,7 +260,7 @@ export async function write(days, ctx) {
   if (artifacts) {
     // Reverse migration writes the destination first, then removes the new
     // generation so an interrupted cleanup cannot leave no configuration.
-    await removeManagedConfig(p.pmsec);
+    if (!pathsAliased(p)) await removeManagedConfig(p.pmsec);
     await removeSelector(p);
   }
   return { path: p.legacy, warn: null };
@@ -262,7 +270,7 @@ export async function unset(ctx) {
   const p = paths(ctx);
   const newMode = supportsNewMode(ctx);
   const legacyRemoved = await removeManagedFrom(p.legacy);
-  const pmsecRemoved = await removeManagedConfig(p.pmsec);
+  const pmsecRemoved = pathsAliased(p) ? false : await removeManagedConfig(p.pmsec);
   const selectorRemoved = await removeSelector(p);
   return {
     path: newMode ? p.pmsec : p.legacy,

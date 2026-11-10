@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -248,6 +249,14 @@ def _remove_selector(p: dict[str, Path]) -> bool:
     return True
 
 
+def _paths_aliased(p: dict[str, Path]) -> bool:
+    """MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
+    then the legacy destination IS the new generation and the reverse-migration
+    cleanup must not remove what it just wrote (or delete the global config)."""
+    norm = lambda v: os.path.normpath(str(v))
+    return norm(p["legacy"]) == norm(p["pmsec"])
+
+
 def read(ctx: Context) -> dict:
     p = paths(ctx)
     action = getattr(ctx, "action", "check")
@@ -297,7 +306,8 @@ def write(days: int, ctx: Context) -> dict:
     if artifacts:
         # Write the destination before cleaning the new generation so an
         # interrupted cleanup cannot create a no-config gap.
-        _remove_managed_config(p["pmsec"])
+        if not _paths_aliased(p):
+            _remove_managed_config(p["pmsec"])
         _remove_selector(p)
     return {"path": str(p["legacy"]), "warn": None}
 
@@ -306,7 +316,7 @@ def unset(ctx: Context) -> dict:
     p = paths(ctx)
     new_mode = _supports_new_mode(ctx)
     legacy_removed = _remove_managed_from(p["legacy"])
-    pmsec_removed = _remove_managed_config(p["pmsec"])
+    pmsec_removed = False if _paths_aliased(p) else _remove_managed_config(p["pmsec"])
     selector_removed = _remove_selector(p)
     return {
         "path": str(p["pmsec"] if new_mode else p["legacy"]),

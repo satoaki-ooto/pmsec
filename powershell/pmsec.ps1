@@ -1493,8 +1493,12 @@ function ToolWriteMise([int]$Days) {
   ToolWriteFile $legacy 'minimum_release_age' $line '=' 'settings' 'mise' $false
   if (MiseHasNewArtifacts) {
     # Write the destination before cleaning the new generation so an
-    # interrupted cleanup cannot create a no-config gap.
-    [void](MiseRemoveManagedConfig $pmsec)
+    # interrupted cleanup cannot create a no-config gap. MISE_GLOBAL_CONFIG_FILE
+    # can point at config.pmsec.toml itself; the destination then IS the new
+    # generation and cleanup would delete it.
+    if (-not [IO.Path]::GetFullPath($legacy).Equals([IO.Path]::GetFullPath($pmsec), [StringComparison]::Ordinal)) {
+      [void](MiseRemoveManagedConfig $pmsec)
+    }
     [void](MiseRemoveSelector $localp)
   }
   return @{ Path = $legacy; Warn = $null }
@@ -1508,7 +1512,12 @@ function ToolUnsetMise {
   if (MiseSupportsNewMode) { $path = $pmsec }
   $removed = $false
   if (MiseRemoveManagedFrom $legacy) { $removed = $true }
-  if (MiseRemoveManagedConfig $pmsec) { $removed = $true }
+  # An aliased destination (MISE_GLOBAL_CONFIG_FILE at config.pmsec.toml) is
+  # handled by the MiseRemoveManagedFrom pass above; a second pass could delete
+  # the global config itself.
+  if (-not [IO.Path]::GetFullPath($legacy).Equals([IO.Path]::GetFullPath($pmsec), [StringComparison]::Ordinal)) {
+    if (MiseRemoveManagedConfig $pmsec) { $removed = $true }
+  }
   if (MiseRemoveSelector $localp) { $removed = $true }
   return @{ Path = $path; Removed = $removed }
 }
