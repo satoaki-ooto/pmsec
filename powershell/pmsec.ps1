@@ -125,8 +125,8 @@ function Get-CargoPath {
   return (PathJoin (Get-PmsecHome) '.cargo' 'config.toml')
 }
 function Get-MisePath {
+  if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
   if ((Get-PmsecPlatform) -eq 'win32') {
-    if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
     $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-PmsecHome) 'AppData' 'Local' }
     return (PathJoin $base 'mise' 'config.toml')
   }
@@ -136,10 +136,8 @@ function Get-MisePath {
 # Unlike the legacy single-file path above this is the same on every OS:
 # win32 uses %USERPROFILE%/.config/mise, not %LOCALAPPDATA%/mise.
 function Get-MiseDir {
-  if ((Get-PmsecPlatform) -eq 'win32') {
-    if ($env:MISE_CONFIG_DIR) { return $env:MISE_CONFIG_DIR }
-    if ($env:XDG_CONFIG_HOME) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
-  }
+  if ($env:MISE_CONFIG_DIR) { return $env:MISE_CONFIG_DIR }
+  if ($env:XDG_CONFIG_HOME) { return (PathJoin $env:XDG_CONFIG_HOME 'mise') }
   return (PathJoin (Get-PmsecHome) '.config' 'mise')
 }
 function Get-MiseBasePath { return (PathJoin (Get-MiseDir) 'config.toml') }
@@ -1022,7 +1020,7 @@ $script:MiseEnvWarn = 'MISE_ENV overrides miserc and the pmsec environment is no
 # (the override only reaches the Windows host scope; a WSL distro reads its
 # own environment).
 function MiseSupportsNewMode {
-  if ((Get-PmsecPlatform) -eq 'win32' -and $env:MISE_GLOBAL_CONFIG_FILE) { return $false }
+  if ($env:MISE_GLOBAL_CONFIG_FILE) { return $false }
   # WSL scopes would have to detect inside the distro; without an explicit
   # override the version is unknown, which the plan resolves to legacy mode.
   if ((Get-PmsecPlatform) -ne 'win32' -and -not $env:PMSEC_MISE_VERSION) { return $false }
@@ -1033,6 +1031,7 @@ function MiseSupportsNewMode {
 
 $script:MsJ = 0
 $script:MsK = 0
+$script:MisercErr = 'miserc env must be an array'
 
 function MisercSkip {
   while ($true) {
@@ -1051,14 +1050,15 @@ function MisercSkip {
 function MisercParseArray {
   $values = [System.Collections.Generic.List[string]]::new()
   $ch = MisercSkip
-  if ($null -eq $ch -or "$ch" -ne '[') { return $null }
+  if ($null -eq $ch) { $script:MisercErr = 'miserc env array is unterminated'; return $null }
+  if ("$ch" -ne '[') { $script:MisercErr = 'miserc env must be an array'; return $null }
   $script:MsK++
   while ($true) {
     $ch = MisercSkip
-    if ($null -eq $ch) { return $null }
+    if ($null -eq $ch) { $script:MisercErr = 'miserc env array is unterminated'; return $null }
     if ("$ch" -eq ']') { $script:MsK++; break }
     if ("$ch" -eq ',') { $script:MsK++; continue }
-    if ("$ch" -ne '"' -and "$ch" -ne "'") { return $null }
+    if ("$ch" -ne '"' -and "$ch" -ne "'") { $script:MisercErr = 'miserc env may only contain string names'; return $null }
     $quote = "$ch"
     $script:MsK++
     $val = [System.Text.StringBuilder]::new()
@@ -1077,7 +1077,7 @@ function MisercParseArray {
       [void]$val.Append($c)
       $script:MsK++
     }
-    if (-not $closed) { return $null }
+    if (-not $closed) { $script:MisercErr = 'miserc env has an unterminated string'; return $null }
     [void]$values.Add($val.ToString())
   }
   return @{ Values = $values.ToArray() }
@@ -1094,7 +1094,7 @@ function MisercParseEnv {
     $script:MsJ = $i
     $script:MsK = $prefixLen + 1
     $parsed = MisercParseArray
-    if ($null -eq $parsed) { throw 'miserc env must be an array of string names' }
+    if ($null -eq $parsed) { throw $script:MisercErr }
     return @{ Defined = $true; Values = $parsed.Values; Start = $i; End = $script:MsJ }
   }
   return @{ Defined = $false; Values = @(); Start = -1; End = -1 }
@@ -1235,7 +1235,7 @@ function MiseReadFiles([string[]]$Files) {
     $cur.Extras = $extras.ToArray()
   }
   $chosen = if ($null -ne $best) { $best } else { $fallback }
-  $extraDefs = @(ToolExtras 'mise')
+  $extraDefs = ToolExtras 'mise'
   $mergedExtras = [System.Collections.Generic.List[hashtable]]::new()
   for ($i = 0; $i -lt $extraDefs.Count; $i++) {
     $okOne = $null; $definedOne = $null
@@ -1460,11 +1460,13 @@ function ToolUnsetMise {
   $legacy = Get-MisePath
   $pmsec = Get-MisePmsecPath
   $localp = Get-MiseLocalMiserc
+  $path = $legacy
+  if (MiseSupportsNewMode) { $path = $pmsec }
   $removed = $false
   if (MiseRemoveManagedFrom $legacy) { $removed = $true }
   if (MiseRemoveManagedConfig $pmsec) { $removed = $true }
   if (MiseRemoveSelector $localp) { $removed = $true }
-  return @{ Path = (if (MiseSupportsNewMode) { $pmsec } else { $legacy }); Removed = $removed }
+  return @{ Path = $path; Removed = $removed }
 }
 
 function ToolRead([string]$Tool) {
@@ -1942,6 +1944,7 @@ function CmdEnable($Targets, [bool]$Json, [int]$Days, [bool]$Force, [array]$Scop
         if ($w.Warn) { $warn = if ($warn) { "$warn $($w.Warn)" } else { $w.Warn } }
       } catch {
         $err = ExplainFsError $t $_
+        if ($err -match 'miserc env') { $path = $null }
         $failures.Add($err)
       }
       if ($warn) { $warnCount++ }
@@ -1964,7 +1967,8 @@ function CmdEnable($Targets, [bool]$Json, [int]$Days, [bool]$Force, [array]$Scop
     for ($i = 0; $i -lt $results.Count; $i++) {
       $r = $results[$i]
       $scopePrefix = if ($multiScope) { """scope"": $(JsonString $r.Scope), " } else { '' }
-      $entry = "    {$scopePrefix""tool"": $(JsonString $r.Tool), ""path"": $(JsonString $r.Path), ""days"": $($r.Days), ""requested"": $($r.Requested), ""kept"": $(JsonBool $r.Kept), ""forced"": $(JsonBool $r.Forced), ""ok"": $(JsonBool $r.Ok), ""warn"": $(JsonStrOrNull $r.Warn)"
+      $pathJson = if ([string]::IsNullOrEmpty($r.Path)) { 'null' } else { JsonString $r.Path }
+      $entry = "    {$scopePrefix""tool"": $(JsonString $r.Tool), ""path"": $pathJson, ""days"": $($r.Days), ""requested"": $($r.Requested), ""kept"": $(JsonBool $r.Kept), ""forced"": $(JsonBool $r.Forced), ""ok"": $(JsonBool $r.Ok), ""warn"": $(JsonStrOrNull $r.Warn)"
       if ($r.Error) { $entry += ", ""error"": $(JsonString $r.Error)" }
       $entry += '}'
       if ($i -lt $results.Count - 1) { $entry += ',' }
@@ -2028,6 +2032,7 @@ function CmdDisable($Targets, [bool]$Json, [array]$Scopes) {
         $removed = [bool]$u.Removed
       } catch {
         $err = ExplainFsError $t $_
+        if ($err -match 'miserc env') { $path = $null }
         $failures.Add($err)
       }
       $results.Add(@{
