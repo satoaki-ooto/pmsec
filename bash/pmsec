@@ -1565,8 +1565,13 @@ tool_write_mise() {
     return 0
   fi
 
+  # Judged before the write so an unreadable miserc fails without touching
+  # the config, and again after: replacing a hard-linked legacy file leaves
+  # the pmsec link as a distinct file that still holds managed keys.
+  local artifacts=0
+  mise_has_new_artifacts && artifacts=1
   _tool_write_one "$legacy" "minimum_release_age" "minimum_release_age = \"${days}d\"" "=" "settings" "mise" 0 || return 1
-  if mise_has_new_artifacts; then
+  if [ "$artifacts" = "1" ] || mise_has_new_artifacts; then
     # Reverse migration writes the destination before cleaning the new
     # generation so an interrupted cleanup cannot create a no-config gap.
     # MISE_GLOBAL_CONFIG_FILE can point at config.pmsec.toml itself; the

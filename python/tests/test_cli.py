@@ -670,6 +670,21 @@ def test_mise_legacy_enable_converges_with_hard_linked_configs(tmp_path):
     assert run(["--tool", "mise", "--check"], tmp_path, **env)[0] == 0
 
 
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs a non-root POSIX user")
+def test_mise_legacy_force_enable_leaves_config_alone_when_miserc_unreadable(tmp_path):
+    d = tmp_path / ".config" / "mise"
+    d.mkdir(parents=True)
+    rc = d / "miserc.local.toml"
+    rc.write_text('env = ["pmsec"]\n')
+    rc.chmod(0)
+    try:
+        code, _, _ = run(["--tool", "mise", "--force"], tmp_path, PMSEC_MISE_VERSION="2026.10.25")
+    finally:
+        rc.chmod(0o600)
+    assert code != 0
+    assert not (d / "config.toml").exists()
+
+
 def test_mise_reverse_migration_keeps_global_alias_through_linked_config_dir(tmp_path):
     real = tmp_path / "real"
     real.mkdir()

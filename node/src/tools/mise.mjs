@@ -308,11 +308,13 @@ export async function write(days, ctx) {
     return { path: p.pmsec, warn: envWarning(ctx) };
   }
 
+  // Judged before the write so an unreadable miserc fails without touching
+  // the config, and again after: replacing a hard-linked legacy file leaves
+  // the pmsec link as a distinct file that still holds managed keys.
+  const artifacts = await hasNewArtifacts(ctx, p);
   const settings = await applySettings(await readSafe(p.legacy), days, ctx);
   await writeAtomic(p.legacy, settings);
-  // Judged after the write: replacing a hard-linked legacy file leaves the
-  // pmsec link as a distinct file that still holds managed keys.
-  if (await hasNewArtifacts(ctx, p)) {
+  if (artifacts || await hasNewArtifacts(ctx, p)) {
     // Reverse migration writes the destination first, then removes the new
     // generation so an interrupted cleanup cannot leave no configuration.
     if (!pathsAliased(p)) await removeManagedConfig(p.pmsec);

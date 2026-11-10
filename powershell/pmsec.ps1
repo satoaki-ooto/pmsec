@@ -1672,8 +1672,12 @@ function ToolWriteMise([int]$Days) {
     return @{ Path = $pmsec; Warn = (MiseEnvWarning) }
   }
 
+  # Judged before the write so an unreadable miserc fails without touching
+  # the config, and again after: replacing a hard-linked legacy file leaves
+  # the pmsec link as a distinct file that still holds managed keys.
+  $artifacts = MiseHasNewArtifacts
   ToolWriteFile $legacy 'minimum_release_age' $line '=' 'settings' 'mise' $false
-  if (MiseHasNewArtifacts) {
+  if ($artifacts -or (MiseHasNewArtifacts)) {
     # Write the destination before cleaning the new generation so an
     # interrupted cleanup cannot create a no-config gap. MISE_GLOBAL_CONFIG_FILE
     # can point at config.pmsec.toml itself; the destination then IS the new
