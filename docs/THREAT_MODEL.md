@@ -1,7 +1,8 @@
 # pmsec threat model
 
-Last reviewed: 2026-11-07 (full source review of `node/`, `python/`, `bash/`,
-`powershell/`, `conformance/`, `.github/workflows/`, `scripts/`).
+Last reviewed: 2026-11-10 (mise `config.pmsec.toml` layering; previous full
+source review of `node/`, `python/`, `bash/`, `powershell/`, `conformance/`,
+`.github/workflows/`, `scripts/` on 2026-11-07).
 
 ## What pmsec is
 
@@ -78,6 +79,29 @@ Windows host. Accepted; `--no-wsl` / `PMSEC_NO_WSL=1` opts out.
   compromised GitHub account rewriting history, which SHA pinning alone
   does not prevent for a force-pushed branch (the pinned commit is immutable,
   but the script could be repointed).
+
+### F. mise environment layering (`MISE_ENV`, `miserc`)
+
+On mise >= 2026.11.0 pmsec keeps its settings in `config.pmsec.toml` and
+activates that layer by adding `pmsec` to the global `miserc` environment
+list. Two properties matter:
+
+- `MISE_ENV` (or `-E`) replaces the global `miserc` environment list rather
+  than adding to it, so a user or script that sets `MISE_ENV` without `pmsec`
+  silently drops the hardened layer. pmsec cannot prevent this; `--check`
+  reports `selector.wired=false` and fails so the bypass is visible.
+- Before 2026.11.0 a project-level `miserc` could override the global list.
+  The new-mode threshold requires 2026.11.0, where the global environment
+  survives a project `miserc`, so the selector cannot be neutralised by a
+  cloned repository.
+
+A legacy-mode run that finds new-mode artifacts (a leftover
+`config.pmsec.toml` or a `pmsec` selector) fails closed with a migration
+warning instead of reporting OK from either file, because the active
+configuration is ambiguous. `enable` writes the destination generation
+before removing the other one; an interrupted cleanup can leave extra files
+but converges on the next run and never silently weakens a value outside
+`--force`.
 
 ## Findings from the 2026-11-07 review
 

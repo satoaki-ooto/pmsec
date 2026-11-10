@@ -1903,7 +1903,13 @@ Environment:
   YARN_RC_FILENAME      Override the yarn config file path.
   BUN_CONFIG_FILE       Override the bun config file path.
   CARGO_HOME            Override the cargo dir; pmsec writes \$CARGO_HOME/config.toml.
-  MISE_GLOBAL_CONFIG_FILE Override the mise config file path.
+  MISE_GLOBAL_CONFIG_FILE Force legacy mise mode: write this single file
+                        instead of config.pmsec.toml + the miserc selector.
+  MISE_CONFIG_DIR       Override the global mise config dir (also used
+                        for config.pmsec.toml and miserc.local.toml).
+  MISE_SYSTEM_CONFIG_DIR Read the system miserc.toml from here.
+  MISE_ENV              Replaces the miserc env list; when set without
+                        `pmsec`, --check reports the layer as inactive.
   AUBE_CONFIG_FILE      Override the aube config file path.
   COMPOSER_HOME         Override the Composer home dir; pmsec writes \$COMPOSER_HOME/config.json.
   UV_CONFIG_FILE        Override the uv config file path.

@@ -109,24 +109,24 @@ for npm `>=11.5.1` on Node 24. The PyPI publisher also uses `ubuntu-24.04` becau
 | bun | `~/.bunfig.toml` (`$XDG_CONFIG_HOME/.bunfig.toml` when that variable is set; bun then ignores the HOME file) | `[install].minimumReleaseAge` | `86400` | 1-day publish cooldown for newly resolved versions; versions already in `bun.lock` are not re-checked | bun >= 1.3.0 |
 | bun | same file | `[install].ignoreScripts` | `true` | disable lifecycle scripts | bun >= 1.3.0 |
 | cargo | `$CARGO_HOME/config.toml` | [`[registry].global-min-publish-age`](https://doc.rust-lang.org/nightly/cargo/reference/config.html#registryglobal-min-publish-age) | `"1 days"` (tracks `--days`) | 1-day publish cooldown; resolver ignores crate versions published within it unless already in `Cargo.lock`; `cargo install` is not covered | cargo >= 1.100.0 (stable from 2026-11-12; older cargo warns and ignores it) |
-| mise | `~/.config/mise/config.toml` | `[settings].minimum_release_age` | `"1d"` | 1-day release cooldown | mise >= 2026.4.22 |
-| mise | `~/.config/mise/config.toml` | `[settings].paranoid` | `true` | always re-verify artifacts | current mise |
-| mise | `~/.config/mise/config.toml` | `[settings].gpg_verify` | `true` | require GPG when available | current mise |
-| mise | `~/.config/mise/config.toml` | `[settings].github_attestations` | `true` | verify GitHub attestations | mise >= 2025.12.12; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].slsa` | `true` | verify SLSA provenance | mise >= 2025.12; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].locked_verify_provenance` | `true` | re-verify provenance on every install even when lockfile has a checksum — prevents lockfile-poisoning bypass | mise >= 2026.4.4 |
-| mise | `~/.config/mise/config.toml` | `[settings].ruby.github_attestations` | `true` | verify GitHub attestations for Ruby binaries installed via mise | mise >= 2025.12.12 |
-| mise | `~/.config/mise/config.toml` | `[settings].python.github_attestations` | `true` | verify GitHub attestations for Python binaries installed via mise | mise >= 2026.3.18 |
-| mise | `~/.config/mise/config.toml` | `[settings].provenance_api_failures_fatal` | `true` | fail install when attestation/SLSA API is unreachable, preventing silent provenance bypass | mise >= 2026.5.11; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].aqua.github_attestations` | `true` | verify GitHub attestations for tools installed via aqua backend | mise >= 2025.9 |
-| mise | `~/.config/mise/config.toml` | `[settings].aqua.cosign` | `true` | verify cosign signatures for aqua-backend tools | mise >= 2026.5.1; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].aqua.minisign` | `true` | verify minisign signatures for aqua-backend tools | mise >= 2025.12; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].aqua.slsa` | `true` | verify SLSA provenance for aqua-backend tools | mise >= 2025.12; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].github.github_attestations` | `true` | verify GitHub attestations for tools fetched via github backend | mise >= 2026; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].github.slsa` | `true` | verify SLSA provenance for tools fetched via github backend | mise >= 2026; default true |
-| mise | `~/.config/mise/config.toml` | `[settings].node.gpg_verify` | `true` | in-process GPG verification for Node.js tarballs using pure-Rust rPGP (no external `gpg` binary required) | mise >= 2026.7.12 |
-| mise | `~/.config/mise/config.toml` | `[settings].swift.gpg_verify` | `true` | in-process GPG verification for Swift tarballs using pure-Rust rPGP (no external `gpg` binary required) | mise >= 2026.7.12 |
-| mise | `~/.config/mise/config.toml` | `[settings].not_found_system_fallback` | `false` | prevents mise shims from silently falling back to same-named system PATH binaries when the required tool version is not installed — eliminates PATH-hijacking via shim fallback | mise >= 2026.8.3 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].minimum_release_age` | `"1d"` | 1-day release cooldown | mise >= 2026.4.22 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].paranoid` | `true` | always re-verify artifacts | current mise |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].gpg_verify` | `true` | require GPG when available | current mise |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].github_attestations` | `true` | verify GitHub attestations | mise >= 2025.12.12; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].slsa` | `true` | verify SLSA provenance | mise >= 2025.12; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].locked_verify_provenance` | `true` | re-verify provenance on every install even when lockfile has a checksum — prevents lockfile-poisoning bypass | mise >= 2026.4.4 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].ruby.github_attestations` | `true` | verify GitHub attestations for Ruby binaries installed via mise | mise >= 2025.12.12 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].python.github_attestations` | `true` | verify GitHub attestations for Python binaries installed via mise | mise >= 2026.3.18 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].provenance_api_failures_fatal` | `true` | fail install when attestation/SLSA API is unreachable, preventing silent provenance bypass | mise >= 2026.5.11; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].aqua.github_attestations` | `true` | verify GitHub attestations for tools installed via aqua backend | mise >= 2025.9 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].aqua.cosign` | `true` | verify cosign signatures for aqua-backend tools | mise >= 2026.5.1; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].aqua.minisign` | `true` | verify minisign signatures for aqua-backend tools | mise >= 2025.12; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].aqua.slsa` | `true` | verify SLSA provenance for aqua-backend tools | mise >= 2025.12; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].github.github_attestations` | `true` | verify GitHub attestations for tools fetched via github backend | mise >= 2026; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].github.slsa` | `true` | verify SLSA provenance for tools fetched via github backend | mise >= 2026; default true |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].node.gpg_verify` | `true` | in-process GPG verification for Node.js tarballs using pure-Rust rPGP (no external `gpg` binary required) | mise >= 2026.7.12 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].swift.gpg_verify` | `true` | in-process GPG verification for Swift tarballs using pure-Rust rPGP (no external `gpg` binary required) | mise >= 2026.7.12 |
+| mise | `<mise dir>/config.pmsec.toml` (mise >= 2026.11.0) or `<mise dir>/config.toml` | `[settings].not_found_system_fallback` | `false` | prevents mise shims from silently falling back to same-named system PATH binaries when the required tool version is not installed — eliminates PATH-hijacking via shim fallback | mise >= 2026.8.3 |
 | uv | `~/.config/uv/uv.toml` | `exclude-newer` | `"1 days"` | 1-day publish cooldown at lock time; `uv sync` against an existing `uv.lock` does not re-resolve | uv >= 0.11.3 (older uv fails to parse the written file; preflight warns) |
 | uv | `~/.config/uv/uv.toml` | `index-strategy` | `"first-index"` | avoid cross-index confusion | uv >= 0.1.0 |
 | uv | `~/.config/uv/uv.toml` | `[audit].malware-check` | `true` | query OSV API for known-malicious packages before sync, blocking install of packages with MAL advisories | uv >= 0.11.31 |
@@ -145,6 +145,36 @@ otherwise, including when the pnpm version cannot be detected.
 
 For yarn, pmsec writes `npmMinimalAgeGate` in minutes: yarn 4.10.x mis-parsed
 the `d` suffix (yarnpkg/berry#6991), while a bare number is minutes on 4.10+.
+
+### mise: `config.pmsec.toml` and the `miserc` selector
+
+mise >= 2026.11.0 can load extra global config layers, so on those versions
+pmsec stops editing `config.toml`:
+
+- the settings above go to `<mise config dir>/config.pmsec.toml` (still the
+  normal `[settings]` table, so project `mise.toml` files can override it);
+- pmsec appends `pmsec` to the `env` list in
+  `<mise config dir>/miserc.local.toml`, which activates that layer.
+
+`<mise config dir>` is `MISE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/mise`, else
+`~/.config/mise` on every OS — on Windows that is `%USERPROFILE%\.config\mise`,
+not `%LOCALAPPDATA%\mise`. The selector inherits `env` from the first file
+that defines it (`miserc.local.toml`, then `miserc.toml`, then the system
+`miserc.toml` under `MISE_SYSTEM_CONFIG_DIR` or `/etc/mise`); inherited names
+are frozen into the local list, so later edits to the shared list do not
+propagate. Unlike lower-priority config files, a `miserc` in a project cannot
+drop the global environment on these versions.
+
+Older or undetectable mise, and any run with `MISE_GLOBAL_CONFIG_FILE` set,
+keep the legacy single-file layout. Only one generation is managed at a time:
+enabling in new-mode removes pmsec's keys from `config.toml`, and enabling on
+a legacy host that still has new-mode artifacts writes `config.toml` first,
+then removes `config.pmsec.toml` and the `pmsec` selector. `--check` fails
+closed while both exist instead of reporting OK from an ambiguous setup.
+
+`MISE_ENV` overrides `miserc` completely: if it is set without `pmsec`, both
+`enable` and `--check` warn (and `--check` fails) that the environment is not
+active in that shell.
 
 ## Overrides
 
@@ -190,7 +220,9 @@ and `pmsec --check` cannot see any of those. Concretely:
 - **Environment and flags win over every file**: `npm_config_*`,
   `PNPM_CONFIG_*`, `YARN_*`, `CARGO_*`, `MISE_*`, `UV_*`, `BUNDLE_*`,
   `COMPOSER_*`, and per-command flags such as `--min-release-age=0`,
-  `--no-time-gate`, `--no-cooldown`.
+  `--no-time-gate`, `--no-cooldown`. On the mise side `MISE_ENV` (or
+  `-E`) replaces the `miserc` environment list, so a shell that sets it
+  without `pmsec` can drop the whole hardened layer.
 - **Lockfiles bypass cooldowns**: npm, yarn, bun, cargo, uv, bundler and
   composer install whatever a committed lockfile pins without re-checking its
   age. pnpm re-verifies unless `trustLockfile: true`; mise skips `mise.lock`
