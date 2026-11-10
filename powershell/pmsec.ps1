@@ -1101,11 +1101,15 @@ function MisercParseArray {
 }
 
 # Parse the top-level `env = [...]` assignment in the loaded buffer.
+# "Top-level" also excludes TOML multi-line strings: text inside a `"""`
+# body is never taken for the selector. Scan against LinesScan, parse the
+# array from the raw LinesBuf.
 # Returns @{ Defined; Values; Start; End } or throws on an invalid array.
 function MisercParseEnv {
+  LinesScanView
   for ($i = 0; $i -lt $script:LinesBuf.Count; $i++) {
-    if (LinesIsSection $script:LinesBuf[$i]) { break }
-    if ("$($script:LinesBuf[$i])" -notmatch '^\s*env\s*=') { continue }
+    if (LinesIsSection $script:LinesScan[$i]) { break }
+    if ("$($script:LinesScan[$i])" -notmatch '^\s*env\s*=') { continue }
     $line = [string]$script:LinesBuf[$i]
     $prefixLen = $line.IndexOf('=')
     $script:MsJ = $i

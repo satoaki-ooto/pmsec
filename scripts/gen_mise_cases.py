@@ -171,6 +171,20 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--json"],
     ),
     (
+        "enable_mise_new_mode_multiline_env",
+        {".config/mise/miserc.local.toml": 'note = """\nenv = ["ghost"]\n"""\nenv = ["work"]\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_multiline_section",
+        {".config/mise/miserc.local.toml": 'note = """\n[settings]\nenv = ["ghost"]\n"""\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
         "enable_mise_new_mode_moves_pmsec_last",
         {".config/mise/miserc.local.toml": 'env = ["pmsec", "work"]\nother = 1\n'},
         None,

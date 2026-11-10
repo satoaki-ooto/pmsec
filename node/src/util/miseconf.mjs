@@ -2,6 +2,8 @@
 // pmsec-owned `config.pmsec.toml` layer. Only the pieces pmsec needs are
 // modelled: a single top-level `env = [...]` array of environment names.
 
+import { scanView } from "./lines.mjs";
+
 const ENV_KEY = /^\s*env\s*=\s*(.*)$/;
 const SECTION = /^\s*\[/;
 
@@ -84,15 +86,18 @@ function parseArray(lines, startLine, startCol) {
   return { values, endLine: j, endCol: k };
 }
 
-// Find the top-level `env` assignment. Returns null when the file has none.
+// Find the top-level `env` assignment — outside any table and outside a
+// multi-line string, so text inside a `"""` body is never taken for the
+// selector. Returns null when the file has none.
 export function parseEnv(text) {
   if (text === "") return { defined: false, values: [], start: -1, end: -1 };
   const lines = text.split(/\r?\n/);
+  const scan = scanView(lines);
   for (let i = 0; i < lines.length; i++) {
-    if (SECTION.test(lines[i])) break;
-    const m = lines[i].match(ENV_KEY);
+    if (SECTION.test(scan[i])) break;
+    const m = scan[i].match(ENV_KEY);
     if (!m) continue;
-    const startCol = lines[i].indexOf("=") + 1;
+    const startCol = scan[i].indexOf("=") + 1;
     const parsed = parseArray(lines, i, startCol);
     return { defined: true, values: parsed.values, start: i, end: parsed.endLine };
   }
@@ -116,8 +121,9 @@ function envLine(values) {
 }
 
 function topLevelInsertIndex(lines) {
+  const scan = scanView(lines);
   for (let i = 0; i < lines.length; i++) {
-    if (SECTION.test(lines[i])) {
+    if (SECTION.test(scan[i])) {
       return i > 0 && lines[i - 1] === "" ? i - 1 : i;
     }
   }

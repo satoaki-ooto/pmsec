@@ -35,7 +35,7 @@ function entryValue(line, sep) {
 
 // Copy of `lines` with the body of TOML multi-line strings blanked, so text
 // inside them is never taken for a header or key. Indices stay aligned.
-function scanView(lines) {
+export function scanView(lines) {
   let open = null;
   return lines.map(line => {
     const inside = open !== null;

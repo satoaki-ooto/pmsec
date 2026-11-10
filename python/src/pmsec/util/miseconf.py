@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from .lines import scan_view
+
 # Helpers for mise's `miserc*.toml` global environment selectors and the
 # pmsec-owned `config.pmsec.toml` layer. Only the pieces pmsec needs are
 # modelled: a single top-level `env = [...]` array of environment names.
@@ -100,11 +102,16 @@ def _parse_array(lines: list[str], start_line: int, start_col: int) -> tuple[lis
 
 
 def parse_env(text: str) -> dict:
-    """Return {"defined", "values", "start", "end"}; start/end are line indexes."""
+    """Return {"defined", "values", "start", "end"}; start/end are line indexes.
+
+    Top-level means outside any table and outside a multi-line string: text
+    inside a multi-line string body is never taken for the selector.
+    """
     if text == "":
         return {"defined": False, "values": [], "start": -1, "end": -1}
     lines = re.split(r"\r?\n", text)
-    for i, line in enumerate(lines):
+    scan = scan_view(lines)
+    for i, line in enumerate(scan):
         if _SECTION.match(line):
             break
         m = _ENV_KEY.match(line)
@@ -141,7 +148,8 @@ def _env_line(values: list[str]) -> str:
 
 
 def _top_level_insert_index(lines: list[str]) -> int:
-    for i, line in enumerate(lines):
+    scan = scan_view(lines)
+    for i, line in enumerate(scan):
         if _SECTION.match(line):
             return i - 1 if i > 0 and lines[i - 1] == "" else i
     return len(lines)

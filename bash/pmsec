@@ -1108,6 +1108,9 @@ mise_has_new_artifacts() {
 }
 
 # Parse the top-level `env = [...]` assignment currently in LINES_BUF.
+# "Top-level" also excludes TOML multi-line strings: text inside a `"""`
+# body is never taken for the selector. Scan against SCAN_BUF, parse the
+# array from the raw lines.
 # Sets MISE_ENVDEF=1, MISE_ENV_START/END (line indexes), and MISE_ENV_VALUES.
 # Returns 0 when defined, 1 when absent/not top-level, 2 when invalid.
 MISERC_J=0; MISERC_K=0; MISERC_CH=""; MISERC_ERR='miserc env must be an array'
@@ -1157,10 +1160,11 @@ _miserc_parse_array() {
 
 miserc_parse_env() {
   MISE_ENVDEF=0; MISE_ENV_START=-1; MISE_ENV_END=-1; MISE_ENV_VALUES=()
+  lines_scan
   local n=${#LINES_BUF[@]} i line prefix
   for ((i=0; i<n; i++)); do
-    lines_is_section "${LINES_BUF[i]}" && break
-    [[ "${LINES_BUF[i]}" =~ ^[[:space:]]*env[[:space:]]*= ]] || continue
+    lines_is_section "${SCAN_BUF[i]}" && break
+    [[ "${SCAN_BUF[i]}" =~ ^[[:space:]]*env[[:space:]]*= ]] || continue
     line="${LINES_BUF[i]}"; prefix="${line%%=*}"
     MISE_ENV_START="$i"
     MISERC_J="$i"; MISERC_K=$((${#prefix}+1))

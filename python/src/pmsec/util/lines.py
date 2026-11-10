@@ -42,7 +42,7 @@ def _line_value(line: str, sep: str) -> str | None:
     return re.sub(r"\s+#.*$", "", v)
 
 
-def _scan_view(lines: list[str]) -> list[str]:
+def scan_view(lines: list[str]) -> list[str]:
     """Copy of `lines` with the body of TOML multi-line strings blanked.
 
     Text inside them is then never taken for a header or key. Indices stay aligned.
@@ -136,7 +136,7 @@ def _index_first_section(lines: list[str]) -> int:
 
 
 def read_key(text: str, key: str, *, sep: str = "=", section: str | None = None) -> str | None:
-    lines = _scan_view(text.splitlines())
+    lines = scan_view(text.splitlines())
     key, section, inline, _ = _resolve(lines, key, sep, section)
     if inline >= 0:
         for p in _inline_pairs(lines[inline]):
@@ -154,7 +154,7 @@ def set_key(text: str, key: str, value_line: str, *, sep: str = "=", section: st
     trailing = text.endswith("\n") or text == ""
     lines = [] if text == "" else text.rstrip("\n").split("\n")
     orig = key
-    scan = _scan_view(lines)
+    scan = scan_view(lines)
     key, section, inline, head = _resolve(scan, key, sep, section)
     if key != orig:
         value_line = key + value_line[len(orig):]
@@ -196,7 +196,7 @@ def set_key(text: str, key: str, value_line: str, *, sep: str = "=", section: st
 def remove_key(text: str, key: str, *, sep: str = "=", section: str | None = None) -> tuple[str, bool]:
     trailing = text.endswith("\n")
     lines = [] if text == "" else text.rstrip("\n").split("\n")
-    scan = _scan_view(lines)
+    scan = scan_view(lines)
     key, section, inline, head = _resolve(scan, key, sep, section)
     if inline >= 0:
         pairs = _inline_pairs(lines[inline])
