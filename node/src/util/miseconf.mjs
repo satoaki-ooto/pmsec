@@ -68,6 +68,54 @@ function parseArray(lines, startLine, startCol) {
     }
     if (ch !== '"' && ch !== "'") throw new Error("miserc env may only contain string names");
     if (needSep) throw new Error("miserc env is missing a comma between names");
+    const mlTok = lines[j].slice(k, k + 3);
+    if (mlTok === '"""' || mlTok === "'''") {
+      // A multiline basic/literal string is one value that may span lines:
+      // `env = ["""work"""]` is valid TOML.
+      k += 3;
+      // TOML trims the first newline right after the opening delimiter.
+      if (k >= lines[j].length) { j++; k = 0; }
+      let value = "";
+      let closed = false;
+      while (j < lines.length) {
+        const line = lines[j];
+        if (k >= line.length) { j++; k = 0; value += "\n"; continue; }
+        const c = line[k];
+        if (mlTok === '"""' && c === "\\") {
+          if (/^[ \t]*$/.test(line.slice(k + 1))) {
+            // A line-ending backslash trims the newline and the following
+            // whitespace instead of being content.
+            j++; k = 0;
+            while (j < lines.length) {
+              const stripped = lines[j].replace(/^[ \t]+/, "");
+              if (stripped === "") { j++; continue; }
+              k = lines[j].length - stripped.length;
+              break;
+            }
+            continue;
+          }
+          const next = line[k + 1];
+          if (next === undefined) throw new Error("miserc env has an unterminated escape");
+          if (next === "u" || next === "U") {
+            const len = next === "u" ? 4 : 8;
+            const hex = line.slice(k + 2, k + 2 + len);
+            value += decodeBasicString(`\\${next}${hex}`);
+            k += 2 + len;
+            continue;
+          }
+          value += decodeBasicString(`\\${next}`);
+          k += 2;
+          continue;
+        }
+        if (line.startsWith(mlTok, k)) { k += 3; closed = true; break; }
+        value += c;
+        k++;
+      }
+      if (!closed) throw new Error("miserc env has an unterminated string");
+      values.push(value);
+      needSep = true;
+      continue;
+    }
     const quote = ch;
     k++;
     let value = "";

@@ -368,6 +368,13 @@ def main(
     targets = _select(args.tool)
     action = "check" if args.check else "disable" if args.disable else "doctor" if args.doctor else "enable"
     ctx = Context(env=env, home=home, platform=platform, action=action)
+    # Warn before dispatching, like the node port: a check that fails on an
+    # unreadable miserc must still explain why its paths ignore PMSEC_HOME.
+    if env.get("PMSEC_HOME"):
+        err.write(
+            f"pmsec: PMSEC_HOME is ignored by the python port; paths resolve from HOME ({home}). "
+            "Use the bash port for root-context redirection.\n"
+        )
     if args.check:
         try:
             return _check(args, targets, ctx, out, err)
@@ -377,13 +384,6 @@ def main(
             # traceback).
             err.write(f"pmsec: {exc}\n")
             return 1
-    if env.get("PMSEC_HOME"):
-        err.write(
-            f"pmsec: PMSEC_HOME is ignored by the python port; paths resolve from HOME ({home}). "
-            "Use the bash port for root-context redirection.\n"
-        )
-    if args.check:
-        return _check(args, targets, ctx, out, err)
     if args.disable:
         return _disable(args, targets, ctx, out, err)
     if args.doctor:

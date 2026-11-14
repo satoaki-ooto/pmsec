@@ -44,6 +44,9 @@ export function scanView(lines) {
     let i = 0;
     while (i < line.length) {
       if (open !== null) {
+        // Inside a multiline basic string a backslash escapes the next char,
+        // so `\"""` does not close the delimiter; literal strings have none.
+        if (open === '"""' && line[i] === "\\") { i += 2; continue; }
         if (line.startsWith(open, i)) { open = null; i += 3; }
         else i++;
         continue;

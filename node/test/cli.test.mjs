@@ -497,6 +497,17 @@ test("mise legacy --force enable leaves config.toml alone when the miserc is unr
   } finally { await chmod(rc, 0o600); }
 });
 
+test("mise enable fails when a multiline env name embeds a newline", async () => {
+  const home = await setupHome();
+  const dir = join(home, ".config", "mise");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "miserc.local.toml"), 'env = [\n  """work\n  pmsec""",\n]\n');
+  const { code, err } = await runCli(["--tool", "mise", "--days", "1"], home, "linux", { PMSEC_MISE_VERSION: "2026.11.0" });
+  assert.notEqual(code, 0);
+  assert.match(err, /unsafe mise environment name/);
+  assert.equal(existsSync(join(dir, "config.pmsec.toml")), false);
+});
+
 test("--doctor blocks when the parent directory is not writable", { skip: permissionTestSkip }, async () => {
   const { chmod, mkdir: mk } = await import("node:fs/promises");
   const home = await setupHome();

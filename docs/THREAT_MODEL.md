@@ -106,12 +106,17 @@ active configuration is ambiguous. A residual pmsec file with neither
 managed keys nor a selector is inert (mise loads the layer only when it
 is selected), so legacy mode converges on it instead of failing forever.
 The inert-file guarantee has one exception: when `MISE_GLOBAL_CONFIG_FILE`
-points at `config.pmsec.toml` itself — through any spelling the filesystem
-identifies as the same file (case variant, junction, hard link) — that
-file is the active legacy destination, not a leftover. Reverse migration
-writes the cooldown there and leaves the file in place, and when pmsec
-cannot even prove the two paths are distinct files it refuses the
-destructive cleanup instead of reporting a skipped deletion as success.
+points at `config.pmsec.toml` itself — through a spelling the filesystem
+identifies as the same file (case variant, junction, symlink) — that file
+is the active legacy destination, not a leftover. Reverse migration writes
+the cooldown there and leaves it in place, and when pmsec cannot even
+prove the two paths are distinct files it refuses the destructive cleanup
+instead of reporting a skipped deletion as success. A hard link is the one
+alias this does not extend to: pmsec replaces its destination atomically,
+which detaches the link, so after the write the legacy path and the pmsec
+file are distinct inodes again. The pre-write pass therefore judges them
+as one file and leaves it alone, while the post-write pass finds the still
+selected pmsec file holding managed keys and cleans it up.
 
 `enable` writes the destination generation
 before removing the other one; an interrupted cleanup can leave extra files

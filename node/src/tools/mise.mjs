@@ -125,10 +125,19 @@ function provablyMissing(file) {
     let st;
     try { st = lstatSync(dir, { bigint: true }); }
     catch (e) {
-      if (e?.code === "ENOENT" || e?.code === "ENOTDIR") { dir = dirname(dir); continue; }
+      if (e?.code === "ENOENT" || e?.code === "ENOTDIR") {
+        // A missing filesystem root cannot be inspected: absence is not
+        // provable, and dirname would keep returning the root forever.
+        if (dir === dirname(dir)) return false;
+        dir = dirname(dir);
+        continue;
+      }
       return false;
     }
-    return st.isDirectory();
+    // lstat does not follow a final symlink; a config dir reached through a
+    // valid one is still a real directory, so inspect the target itself.
+    try { return statSync(dir, { bigint: true }).isDirectory(); }
+    catch { return false; }
   }
 }
 
@@ -271,25 +280,30 @@ async function applySettings(text, days, ctx) {
 }
 
 async function removeSelector(p) {
-  const before = await readSafe(p.local);
-  if (before !== "") {
-    const r = removeEnvValue(before, "pmsec");
+  let changed = false;
+  let now = await readSafe(p.local);
+  if (now !== "") {
+    const r = removeEnvValue(now, "pmsec");
     if (r.removed) {
-      if (r.empty) await deleteQuietly(p.local);
-      else await writeAtomic(p.local, r.text);
-      return true;
+      if (r.empty) { await deleteQuietly(p.local); now = ""; }
+      else { await writeAtomic(p.local, r.text); now = r.text; }
+      changed = true;
     }
   }
-  // The local miserc holds no pmsec name. When the effective selector lives
-  // in shared/system, materialize the cleaned list into the local file so
-  // legacy checks converge: the foreign file (often root-owned) stays
+  // Re-resolve the effective selector AFTER the local change: removing a
+  // local assignment can expose a shared/system env list that still selects
+  // pmsec, and the next legacy check would re-enable. Materialize the
+  // cleaned list into the local file (an empty kept list writes env = [])
+  // so legacy checks converge; the foreign file (often root-owned) stays
   // untouched, mirroring how forward migration materializes inherited names.
+  // The base is the current local text: a file the removal just unlinked or
+  // stripped of its env line rebuilds from what remains.
   const inherited = await firstEnv(p);
   if (inherited.path && inherited.path !== p.local && inherited.values.includes("pmsec")) {
-    await writeAtomic(p.local, setEnvValues(before, inherited.values.filter(v => v !== "pmsec")));
+    await writeAtomic(p.local, setEnvValues(now, inherited.values.filter(v => v !== "pmsec")));
     return true;
   }
-  return false;
+  return changed;
 }
 
 function buildSelectorText(text, values) {

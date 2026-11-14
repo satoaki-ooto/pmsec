@@ -1104,6 +1104,9 @@ $script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
 @{
   Dir = Get-MiseDir; Path = Get-MisePath; System = Get-MiseSystemMiserc
   MiseEnv = Get-MiseScopeEnv 'MISE_ENV'
+  # The raw translation of MISE_CONFIG_DIR: PathJoin re-joins a stripped
+  # leading slash, so only this field catches a non-absolute POSIX result.
+  FromScope = if ($env:MISE_CONFIG_DIR) { ConvertFrom-MiseScopePath $env:MISE_CONFIG_DIR } else { $null }
 }
 '@)
   $keys = @('MISE_CONFIG_DIR','MISE_GLOBAL_CONFIG_FILE','MISE_SYSTEM_CONFIG_DIR','MISE_ENV','XDG_CONFIG_HOME','WSLENV')
@@ -1145,7 +1148,7 @@ $script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
     # so pmsec must resolve the same path the distro's mise will read.
     $env:WSLENV = 'MISE_CONFIG_DIR/p'
     $env:MISE_CONFIG_DIR = 'C:\Users\alice\mise'
-    if (-not (Probe 'p-drive' @{ Dir = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise' })) { return $false }
+    if (-not (Probe 'p-drive' @{ Dir = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise'; FromScope = '/mnt/c/Users/alice/mise' })) { return $false }
     $env:MISE_CONFIG_DIR = 'c:\Users\alice\mise'
     if (-not (Probe 'p-lowercase-drive' @{ Dir = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise' })) { return $false }
     $env:MISE_CONFIG_DIR = 'C:/Users/alice/mise'
@@ -1153,13 +1156,14 @@ $script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
     # A POSIX value under /p is already what the distro sees: pass verbatim.
     $env:MISE_CONFIG_DIR = '/home/alice/mise'
     if (-not (Probe 'p-posix-verbatim' @{ Dir = '\\wsl$\Ubuntu\home\alice\mise' })) { return $false }
-    # A value inside this distro's UNC root maps back to its POSIX path.
+    # A value inside this distro's UNC root maps back to its POSIX path —
+    # and stays absolute, or Get-MiseDir would build a relative POSIX path.
     $env:MISE_CONFIG_DIR = '\\wsl$\Ubuntu\home\alice\mise'
-    if (-not (Probe 'p-same-distro-unc' @{ Dir = '\\wsl$\Ubuntu\home\alice\mise' })) { return $false }
+    if (-not (Probe 'p-same-distro-unc' @{ Dir = '\\wsl$\Ubuntu\home\alice\mise'; FromScope = '/home/alice/mise' })) { return $false }
     # Another distro's UNC root is not this distro's view: leave it alone and
     # let the non-POSIX value stay ignored.
     $env:MISE_CONFIG_DIR = '\\wsl$\Debian\home\bob'
-    if (-not (Probe 'p-foreign-distro-unc' @{ Dir = '\\wsl$\Ubuntu\home\alice\.config\mise' })) { return $false }
+    if (-not (Probe 'p-foreign-distro-unc' @{ Dir = '\\wsl$\Ubuntu\home\alice\.config\mise'; FromScope = '\\wsl$\Debian\home\bob' })) { return $false }
     # Flag order and combinations must not change the translation, and every
     # mise override takes the same route.
     $env:MISE_CONFIG_DIR = 'C:\Users\alice\mise'

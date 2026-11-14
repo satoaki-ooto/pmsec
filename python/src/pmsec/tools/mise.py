@@ -264,24 +264,31 @@ def _apply_settings(text: str, days: int, ctx: Context) -> str:
 
 
 def _remove_selector(p: dict[str, Path]) -> bool:
-    before = _read(p["local"])
-    if before != "":
-        r = remove_env_value(before, "pmsec")
+    changed = False
+    now = _read(p["local"])
+    if now != "":
+        r = remove_env_value(now, "pmsec")
         if r["removed"]:
             if r["empty"]:
                 _unlink_quietly(p["local"])
+                now = ""
             else:
                 write_atomic(p["local"], r["text"])
-            return True
-    # The local miserc holds no pmsec name. When the effective selector lives
-    # in shared/system, materialize the cleaned list into the local file so
-    # legacy checks converge: the foreign file (often root-owned) stays
+                now = r["text"]
+            changed = True
+    # Re-resolve the effective selector AFTER the local change: removing a
+    # local assignment can expose a shared/system env list that still selects
+    # pmsec, and the next legacy check would re-enable. Materialize the
+    # cleaned list into the local file (an empty kept list writes env = [])
+    # so legacy checks converge; the foreign file (often root-owned) stays
     # untouched, mirroring how forward migration materializes inherited names.
+    # The base is the current local text: a file the removal just unlinked or
+    # stripped of its env line rebuilds from what remains.
     inherited = _first_env(p)
     if inherited["path"] and inherited["path"] != p["local"] and "pmsec" in inherited["values"]:
-        write_atomic(p["local"], set_env_values(before, [v for v in inherited["values"] if v != "pmsec"]))
+        write_atomic(p["local"], set_env_values(now, [v for v in inherited["values"] if v != "pmsec"]))
         return True
-    return False
+    return changed
 
 
 def _provably_missing(file: Path) -> bool:
@@ -294,12 +301,19 @@ def _provably_missing(file: Path) -> bool:
         except (FileNotFoundError, NotADirectoryError):
             parent = os.path.dirname(head)
             if parent == head:
-                return True
+                # The filesystem root itself is missing: absence cannot be
+                # proven, and destructive cleanup must stay refused.
+                return False
             head = parent
             continue
         except OSError:
             return False
-        return stat.S_ISDIR(st.st_mode)
+        # lstat does not follow a final symlink; a config dir reached through
+        # a valid one is still a real directory, so inspect the target itself.
+        try:
+            return stat.S_ISDIR(os.stat(head).st_mode)
+        except OSError:
+            return False
 
 
 def _file_id(file: Path):

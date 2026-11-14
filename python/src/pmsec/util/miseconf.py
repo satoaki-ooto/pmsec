@@ -80,6 +80,60 @@ def _parse_array(lines: list[str], start_line: int, start_col: int) -> tuple[lis
             raise ValueError("miserc env is missing a comma between names")
         quote = ch
         k += 1
+        if lines[j][k:k + 2] == quote * 2:
+            # A multiline basic/literal string is one value that may span
+            # lines: `env = ["""work"""]` is valid TOML.
+            k += 2
+            value = ""
+            closed = False
+            # TOML trims the first newline right after the opening delimiter.
+            if k >= len(lines[j]):
+                j += 1
+                k = 0
+            while j < len(lines):
+                line = lines[j]
+                if k >= len(line):
+                    j += 1
+                    k = 0
+                    value += "\n"
+                    continue
+                c = line[k]
+                if quote == '"' and c == "\\":
+                    if re.fullmatch(r"[ \t]*", line[k + 1:]):
+                        # A line-ending backslash trims the newline and the
+                        # following whitespace instead of being content.
+                        j += 1
+                        k = 0
+                        while j < len(lines):
+                            stripped = lines[j].lstrip(" \t")
+                            if stripped == "":
+                                j += 1
+                                continue
+                            k = len(lines[j]) - len(stripped)
+                            break
+                        continue
+                    if k + 1 >= len(line):
+                        raise ValueError("miserc env has an unterminated escape")
+                    nxt = line[k + 1]
+                    if nxt in ("u", "U"):
+                        width = 4 if nxt == "u" else 8
+                        value += _decode_basic("\\" + nxt + line[k + 2:k + 2 + width])
+                        k += 2 + width
+                        continue
+                    value += _decode_basic("\\" + nxt)
+                    k += 2
+                    continue
+                if line.startswith(quote * 3, k):
+                    k += 3
+                    closed = True
+                    break
+                value += c
+                k += 1
+            if not closed:
+                raise ValueError("miserc env has an unterminated string")
+            values.append(value)
+            need_sep = True
+            continue
         value = ""
         closed = False
         while j < len(lines):

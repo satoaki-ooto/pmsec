@@ -161,13 +161,18 @@ function Get-MiseScopeEnv([string]$Name) {
 function ConvertFrom-MiseScopePath([string]$WinPath) {
   $m = [regex]::Match($WinPath, '^([A-Za-z]):[\\/](.*)$')
   if ($m.Success) {
-    return '/mnt/' + $m.Groups[1].Value.ToLower() + '/' + ($m.Groups[2].Value -replace '\\', '/')
+    # Invariant casing: a culture-sensitive ToLower would map a leading `I`
+    # to dotless i (tr-TR) and break the automount path.
+    return '/mnt/' + $m.Groups[1].Value.ToLowerInvariant() + '/' + ($m.Groups[2].Value -replace '\\', '/')
   }
   $root = Get-MiseWslRoot
   if ($root) {
     $prefix = $root + '\'
     if ($WinPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-      return ($WinPath.Substring($prefix.Length) -replace '\\', '/')
+      # Keep the leading slash: the result must stay a POSIX absolute path
+      # (\\wsl$\<distro>\home\alice\mise -> /home/alice/mise) or the path
+      # tests and writers reject it as relative.
+      return '/' + (($WinPath.Substring($prefix.Length)) -replace '\\', '/')
     }
   }
   return $WinPath
@@ -414,6 +419,9 @@ function LinesScanView {
     $i = 0
     while ($i -lt $line.Length) {
       if ($null -ne $open) {
+        # Inside a multiline basic string a backslash escapes the next char,
+        # so `\"""` does not close the delimiter; literal strings have none.
+        if ($open -ceq '"""' -and $line[$i] -ceq '\') { $i += 2; continue }
         if ($i + 3 -le $line.Length -and $line.Substring($i, 3) -ceq $open) { $open = $null; $i += 3 }
         else { $i++ }
         continue
@@ -1184,13 +1192,42 @@ function MisercParseArray {
     if ($needSep) { $script:MisercErr = 'miserc env is missing a comma between names'; return $null }
     $quote = "$ch"
     $script:MsK++
+    # A multiline string opener (""" or ''') makes one value that may span
+    # lines: `env = ["""work"""]` is valid TOML.
+    $curLine = [string]$script:LinesBuf[$script:MsJ]
+    $ml = $false
+    if ($script:MsK + 1 -lt $curLine.Length -and $curLine.Substring($script:MsK, 2) -ceq ($quote + $quote)) {
+      $script:MsK += 2
+      $ml = $true
+    }
     $val = [System.Text.StringBuilder]::new()
     $closed = $false
+    if ($ml) {
+      # TOML trims the first newline right after the opening delimiter.
+      if ($script:MsK -ge $curLine.Length) { $script:MsJ++; $script:MsK = 0 }
+    }
     while ($script:MsJ -lt $script:LinesBuf.Count) {
       $line = [string]$script:LinesBuf[$script:MsJ]
-      if ($script:MsK -ge $line.Length) { $script:MsJ++; $script:MsK = 0; continue }
+      if ($script:MsK -ge $line.Length) {
+        $script:MsJ++; $script:MsK = 0
+        if ($ml) { [void]$val.Append("`n") }
+        continue
+      }
       $c = $line[$script:MsK]
       if ($quote -eq '"' -and "$c" -eq '\') {
+        if ($ml -and ($line.Substring($script:MsK + 1) -match '^[ \t]*$')) {
+          # A line-ending backslash trims the newline and the following
+          # whitespace instead of being content.
+          $script:MsJ++; $script:MsK = 0
+          while ($script:MsJ -lt $script:LinesBuf.Count) {
+            $nl = [string]$script:LinesBuf[$script:MsJ]
+            $trimmed = $nl.TrimStart(' ', "`t")
+            if ($trimmed -ceq '') { $script:MsJ++; continue }
+            $script:MsK = $nl.Length - $trimmed.Length
+            break
+          }
+          continue
+        }
         # Decode TOML basic-string escapes so an escaped env name survives
         # enable unchanged; invalid hex contributes nothing, matching the
         # node/python decoders.
@@ -1219,7 +1256,13 @@ function MisercParseArray {
         $script:MsK++
         continue
       }
-      if ("$c" -eq $quote) { $script:MsK++; $closed = $true; break }
+      if ($ml) {
+        if ($script:MsK + 3 -le $line.Length -and $line.Substring($script:MsK, 3) -ceq ($quote + $quote + $quote)) {
+          $script:MsK += 3; $closed = $true; break
+        }
+      } elseif ("$c" -eq $quote) {
+        $script:MsK++; $closed = $true; break
+      }
       [void]$val.Append($c)
       $script:MsK++
     }
@@ -1374,8 +1417,11 @@ function MiseEnvList([string]$Raw) {
 
 function MiseEnvWarning {
   $miseEnv = Get-MiseScopeEnv 'MISE_ENV'
-  if (-not $miseEnv) { return $null }
-  foreach ($e in (MiseEnvList $miseEnv)) {
+  # Only a parsed nonempty list replaces the miserc files; MISE_ENV="," leaves
+  # them in charge, so the shell still sees the pmsec layer.
+  $envList = @(MiseEnvList $miseEnv)
+  if ($envList.Count -eq 0) { return $null }
+  foreach ($e in $envList) {
     if ($e -ceq 'pmsec') { return $null }
   }
   return $script:MiseEnvWarn
@@ -1421,12 +1467,13 @@ function MiseSelectorState {
   $result = @{ Path = $null; Env = @(); Wired = $false }
   # pmsec is only the effective layer when it loads last: later environments
   # override earlier ones, so membership alone cannot prove the hardened
-  # values win.
-  $miseEnv = Get-MiseScopeEnv 'MISE_ENV'
-  if ($miseEnv) {
+  # values win. Only a parsed nonempty MISE_ENV replaces the miserc list;
+  # MISE_ENV="," selects nothing and leaves the files in charge.
+  $envList = @(MiseEnvList (Get-MiseScopeEnv 'MISE_ENV'))
+  if ($envList.Count -gt 0) {
     $result.Path = 'MISE_ENV'
-    $result.Env = @(MiseEnvList $miseEnv)
-    $result.Wired = ($result.Env.Count -gt 0 -and $result.Env[-1] -ceq 'pmsec')
+    $result.Env = $envList
+    $result.Wired = ($envList[-1] -ceq 'pmsec')
     return $result
   }
   foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
@@ -1630,28 +1677,35 @@ function MiseRemoveManagedConfig([string]$Path) {
 }
 
 # Remove the pmsec selector from miserc.local.toml. Other names/keys survive.
-# When the local file holds no pmsec name but the effective selector lives in
-# a shared/system miserc, materialize the cleaned list into the local file so
+# After the local change the effective selector is re-resolved: removing a
+# local assignment can expose a shared/system env list that still selects
+# pmsec, and the next legacy check would re-enable. The cleaned list is then
+# materialized into the local file (an empty kept list writes env = []) so
 # legacy checks converge: the foreign file (often root-owned) stays
 # untouched, mirroring how forward migration materializes inherited names.
 function MiseRemoveSelector([string]$Path) {
+  $changed = $false
   LinesLoad $Path
   $parsed = MisercParseEnv
   if (MisercRemoveEnvValue 'pmsec' $parsed) {
     if (MisercBufEmpty) { Remove-Item -LiteralPath $Path -Force }
     else { WriteAtomic $Path (LinesDump) }
-    return $true
+    $changed = $true
   }
   MiseInheritedEnv
   if ($null -ne $script:MiseBaseEnvPath -and $script:MiseBaseEnvPath -ne $Path -and
       @($script:MiseBaseEnv) -ccontains 'pmsec') {
+    # The env indices below must describe THIS buffer: parse the freshly
+    # loaded local file, or a shared/system parse would point the splice at
+    # unrelated local lines. A local file that was just removed loads as an
+    # empty buffer and the assignment is inserted at the top.
     LinesLoad $Path
     $parsed = MisercParseEnv
     MisercSetEnvValues @($script:MiseBaseEnv | Where-Object { $_ -cne 'pmsec' }) $parsed
     WriteAtomic $Path (LinesDump)
     return $true
   }
-  return $false
+  return $changed
 }
 
 function ToolReadMise {
@@ -1762,7 +1816,18 @@ function MiseProvablyMissing([string]$Path) {
           $_.Exception -is [Management.Automation.ItemNotFoundException]) { $dir = $parent; continue }
       return $false
     }
-    return ($item.PSIsContainer -and -not $item.LinkType)
+    # Follow links: an ancestor reached through a valid symlink/junction is
+    # still a real directory, so it can prove absence; only a dangling link
+    # (or an unreadable target) leaves the outcome unknown.
+    while ($item.LinkType) {
+      $target = @($item.Target)[0]
+      if (-not $target) { return $false }
+      if (-not [IO.Path]::IsPathRooted($target)) {
+        $target = Join-Path ([IO.Path]::GetDirectoryName($item.FullName)) $target
+      }
+      try { $item = Get-Item -LiteralPath $target -Force } catch { return $false }
+    }
+    return $item.PSIsContainer
   }
 }
 
@@ -2348,24 +2413,29 @@ function CmdEnable($Targets, [bool]$Json, [int]$Days, [bool]$Force, [array]$Scop
       $warn = ToolPreflight $t
       $err = $null
       $path = ToolPath $t
-      if ($Force) {
-        $effective = $Days; $kept = $false
-      } else {
-        $current = ToolRead $t
-        $curDays = if ($null -eq $current.Days) { 0 } else { [int]$current.Days }
-        if ($curDays -ge $Days -and $curDays -gt 0) {
-          $effective = $curDays; $kept = $true
-        } else {
-          $effective = $Days; $kept = $false
-        }
-      }
+      $effective = $Days
+      $kept = $false
       try {
+        # The read sits inside the same per-tool boundary as the write: an
+        # unsafe env name (or unreadable miserc) found while reading must
+        # fail this tool's row like any other error, not abort the whole run
+        # before any result is collected.
+        if (-not $Force) {
+          $current = ToolRead $t
+          $curDays = if ($null -eq $current.Days) { 0 } else { [int]$current.Days }
+          if ($curDays -ge $Days -and $curDays -gt 0) {
+            $effective = $curDays; $kept = $true
+          }
+        }
         $w = ToolWrite $t $effective
         $path = $w.Path
         if ($w.Warn) { $warn = if ($warn) { "$warn $($w.Warn)" } else { $w.Warn } }
       } catch {
         $err = ExplainFsError $t $_
-        if ($err -match 'miserc env') { $path = $null }
+        # A pre-write failure (invalid miserc, unsafe env name) wrote nothing:
+        # report no path, like the node port's `e?.path ?? null`, and keep the
+        # requested days so the row still says what was asked for.
+        if ($err -match 'miserc env|unsafe mise environment') { $path = $null }
         $failures.Add($err)
       }
       if ($warn) { $warnCount++ }

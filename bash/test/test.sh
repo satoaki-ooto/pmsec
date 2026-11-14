@@ -862,6 +862,73 @@ else
   printf 'SKIP  mise unreadable miserc (permission bits are bypassed for root)\n'
 fi
 
+# The USAGE heredoc is unquoted, so an unescaped backtick made `--help` run a
+# bare `pmsec` (a full enable) while printing the text.
+t_mise_help_does_not_execute_usage_backticks() {
+  local home; home=$(mktemp -d)
+  local d="$home/.config/mise" rc
+  mkdir -p "$d"
+  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 -- --help >/dev/null 2>&1; rc=$?
+  [ "$rc" = "0" ] || { LAST_FAIL="help exited $rc"; rm -rf -- "$home"; return 1; }
+  [ ! -e "$d/config.toml" ] || { LAST_FAIL="help wrote a legacy config (backtick substitution ran pmsec)"; rm -rf -- "$home"; return 1; }
+  [ ! -e "$d/config.pmsec.toml" ] || { LAST_FAIL="help wrote config.pmsec.toml"; rm -rf -- "$home"; return 1; }
+  [ ! -e "$d/miserc.local.toml" ] || { LAST_FAIL="help wrote miserc.local.toml"; rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+T "mise --help does not execute the USAGE backticks" t_mise_help_does_not_execute_usage_backticks
+
+# MISE_ENV="," parses to an empty list: it must not replace the miserc list,
+# so a pmsec selector stays an active artifact for check to report.
+t_mise_parsed_empty_mise_env_hides_nothing() {
+  local home; home=$(mktemp -d)
+  local d="$home/.config/mise" rc
+  mkdir -p "$d"
+  printf '[settings]\nminimum_release_age = "1d"\n' > "$d/config.toml"
+  printf 'env = ["pmsec"]\n' > "$d/miserc.local.toml"
+  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 MISE_ENV=, -- --tool mise --days 1 --check >/dev/null 2>&1; rc=$?
+  [ "$rc" != "0" ] || { LAST_FAIL="check reported OK while the pmsec selector is active"; rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+T "mise parsed-empty MISE_ENV does not hide the selector" t_mise_parsed_empty_mise_env_hides_nothing
+
+# A quoted key that decodes with a trailing newline ("env\n") must not be
+# taken for the env key: command substitution would strip it and let cleanup
+# splice the user's key out.
+t_mise_quoted_key_trailing_newline_is_not_env() {
+  local home; home=$(mktemp -d)
+  local d="$home/.config/mise" rc
+  mkdir -p "$d"
+  printf '"env\\n" = ["pmsec"]\nother = 1\n' > "$d/miserc.local.toml"
+  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 -- --tool mise --days 1 >/dev/null 2>&1; rc=$?
+  [ "$rc" = "0" ] || { LAST_FAIL="enable exited $rc"; rm -rf -- "$home"; return 1; }
+  grep -Fq '"env\n" = ["pmsec"]' "$d/miserc.local.toml" || { LAST_FAIL="miserc was rewritten (trailing-newline key treated as env)"; rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+T "mise quoted key with trailing newline is not the env key" t_mise_quoted_key_trailing_newline_is_not_env
+
+if [ "$(id -u)" != "0" ]; then
+# An unreadable config.<env>.toml layer may hold a stricter cooldown: the
+# enable must fail instead of reading the merge as if the layer were empty.
+t_mise_enable_fails_on_unreadable_env_layer() {
+  local home; home=$(mktemp -d)
+  local d="$home/.config/mise" rc
+  mkdir -p "$d"
+  printf 'env = ["work"]\n' > "$d/miserc.local.toml"
+  printf '[settings]\nminimum_release_age = "30d"\n' > "$d/config.work.toml"
+  chmod 000 "$d/config.work.toml"
+  run_pmsec "$home" PMSEC_MISE_VERSION=2026.11.0 -- --tool mise --days 1 >/dev/null 2>&1; rc=$?
+  chmod 600 "$d/config.work.toml"
+  [ "$rc" != "0" ] || { LAST_FAIL="enable succeeded over an unreadable env layer"; rm -rf -- "$home"; return 1; }
+  [ "$(cat "$d/config.work.toml")" = '[settings]
+minimum_release_age = "30d"' ] || { LAST_FAIL="unreadable layer was modified"; rm -rf -- "$home"; return 1; }
+  [ ! -e "$d/config.pmsec.toml" ] || { LAST_FAIL="pmsec layer written before the layer read failed"; rm -rf -- "$home"; return 1; }
+  rm -rf -- "$home"
+}
+  T "mise enable fails when a selected env layer is unreadable" t_mise_enable_fails_on_unreadable_env_layer
+else
+  printf 'SKIP  mise unreadable env layer (permission bits are bypassed for root)\n'
+fi
+
 if CASEFOLD_ROOT=$(casefold_root); then
   T "mise reverse migration keeps a case-variant MISE_GLOBAL_CONFIG_FILE alias" t_mise_reverse_migration_case_variant_alias "$CASEFOLD_ROOT"
 else

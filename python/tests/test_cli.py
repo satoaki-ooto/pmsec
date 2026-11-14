@@ -620,6 +620,19 @@ def test_disable_reports_malformed_selector(tmp_path):
     assert "miserc env may only contain string names" in data["results"][0]["error"]
 
 
+def test_mise_enable_fails_on_multiline_env_name(tmp_path):
+    # A newline inside a multiline basic string cannot name an env layer: the
+    # enable must refuse it instead of silently dropping the active selector.
+    (tmp_path / ".config" / "mise").mkdir(parents=True)
+    (tmp_path / ".config" / "mise" / "miserc.local.toml").write_text(
+        'env = [\n  """work\n  pmsec""",\n]\n'
+    )
+    code, out, err = run(["--tool", "mise", "--days", "1"], tmp_path, PMSEC_MISE_VERSION="2026.11.0")
+    assert code != 0
+    assert "unsafe mise environment name" in err
+    assert not (tmp_path / ".config" / "mise" / "config.pmsec.toml").exists()
+
+
 def _casefold_root() -> Path | None:
     """A case-insensitive directory: the default tmpdir on Windows/macOS, or
     PMSEC_TEST_CASEFOLD_DIR (e.g. a vfat mount) elsewhere."""

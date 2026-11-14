@@ -194,6 +194,9 @@ lines_scan() {
     j=0; len=${#line}
     while (( j < len )); do
       if [ -n "$open" ]; then
+        # Inside a multiline basic string a backslash escapes the next char,
+        # so `\"""` does not close the delimiter; literal strings have none.
+        if [ "$open" = '"""' ] && [ "${line:j:1}" = '\' ]; then j=$((j+2)); continue; fi
         if [ "${line:j:3}" = "$open" ]; then open=""; j=$((j+3)); else j=$((j+1)); fi
         continue
       fi
@@ -1122,11 +1125,12 @@ mise_has_new_artifacts() {
   # forever on a file the cleanup intentionally keeps. An artifact is an
   # active selector (MISE_ENV or the effective miserc) or managed keys in the
   # file. Only the first miserc that defines env counts: a pmsec name in a
-  # lower-precedence miserc is shadowed and never selects the layer. A
-  # nonempty MISE_ENV replaces the miserc list entirely, so the miserc files
-  # are not scanned when the variable names any environment.
+  # lower-precedence miserc is shadowed and never selects the layer. A parsed
+  # nonempty MISE_ENV (entries trimmed, empties dropped) replaces the miserc
+  # list entirely, so the miserc files are not scanned when it names any
+  # environment; MISE_ENV="," selects nothing and must not hide the artifact.
   local p v override=0
-  if [ -n "${MISE_ENV:-}" ]; then
+  if mise_env_override; then
     override=1
     while IFS= read -r v; do
       [ "$v" = "pmsec" ] && return 0
@@ -1190,8 +1194,10 @@ _miserc_skip() {
   done
 }
 
-# Print the UTF-8 encoding of a codepoint. printf %b expands the octal
-# escapes; bash cannot hold NUL, so codepoint 0 contributes nothing.
+# Set _MISERC_UTF8 to the UTF-8 encoding of a codepoint. printf %b expands
+# the octal escapes; bash cannot hold NUL, so codepoint 0 contributes
+# nothing. printf -v (not command substitution) so a codepoint whose encoding
+# is a newline survives.
 _miserc_utf8() {
   local cp="$1" esc
   if [ "$cp" -lt 128 ]; then
@@ -1203,27 +1209,30 @@ _miserc_utf8() {
   else
     esc=$(printf '\\%03o\\%03o\\%03o\\%03o' "$(( (cp >> 18) | 240 ))" "$(( ((cp >> 12) & 63) | 128 ))" "$(( ((cp >> 6) & 63) | 128 ))" "$(( (cp & 63) | 128 ))")
   fi
-  printf '%b' "$esc"
+  printf -v _MISERC_UTF8 '%b' "$esc"
 }
 
-# Decode one TOML basic-string escape. $1 = escape char, $2 = hex digits
-# (for \u/\U). Prints the decoded text; invalid hex contributes nothing,
-# matching the node/python decoders.
+# Decode one TOML basic-string escape into _MISERC_DECODED (a global: command
+# substitution would strip a decoded trailing newline, e.g. \n or \u000a).
+# $1 = escape char, $2 = hex digits (for \u/\U). Invalid hex contributes
+# nothing, matching the node/python decoders.
 _miserc_decode_escape() {
   local ch="$1" hex="$2" w=4
+  _MISERC_DECODED=""
   case "$ch" in
     [uU])
       [ "$ch" = "U" ] && w=8
       if [ "${#hex}" = "$w" ] && [[ "$hex" =~ ^[0-9A-Fa-f]+$ ]]; then
         _miserc_utf8 $((16#$hex))
+        _MISERC_DECODED="$_MISERC_UTF8"
       fi
       return 0 ;;
-    b) printf '\b' ;;
-    t) printf '\t' ;;
-    n) printf '\n' ;;
-    f) printf '\f' ;;
-    r) printf '\r' ;;
-    *) printf '%s' "$ch" ;;
+    b) _MISERC_DECODED=$'\b' ;;
+    t) _MISERC_DECODED=$'\t' ;;
+    n) _MISERC_DECODED=$'\n' ;;
+    f) _MISERC_DECODED=$'\f' ;;
+    r) _MISERC_DECODED=$'\r' ;;
+    *) _MISERC_DECODED="$ch" ;;
   esac
 }
 
@@ -1245,9 +1254,11 @@ _miserc_decode_basic() {
         [ "$c" = "U" ] && w=8
         hex="${s:$((i+1)):$w}"
         i=$((i+1+w))
-        out+="$(_miserc_decode_escape "$c" "$hex")"
+        _miserc_decode_escape "$c" "$hex"
+        out+="$_MISERC_DECODED"
       else
-        out+="$(_miserc_decode_escape "$c" "")"
+        _miserc_decode_escape "$c" ""
+        out+="$_MISERC_DECODED"
         i=$((i+1))
       fi
       continue
@@ -1258,7 +1269,7 @@ _miserc_decode_basic() {
 }
 
 _miserc_parse_array() {
-  local line ch quote val closed need_sep=0
+  local line ch quote val closed need_sep=0 ml=0
   _miserc_skip || return 1
   [ "$MISERC_CH" = "[" ] || { MISERC_ERR='miserc env must be an array'; return 1; }
   MISERC_K=$((MISERC_K+1))
@@ -1273,9 +1284,72 @@ _miserc_parse_array() {
         need_sep=0; MISERC_K=$((MISERC_K+1)); continue ;;
       '"'|"'")
         [ "$need_sep" = "0" ] || { MISERC_ERR='miserc env is missing a comma between names'; return 1; }
-        quote="$MISERC_CH"; MISERC_K=$((MISERC_K+1)) ;;
+        quote="$MISERC_CH"; MISERC_K=$((MISERC_K+1))
+        # A multiline string opener (""" or ''') makes one value that may span
+        # lines: `env = ["""work"""]` is valid TOML.
+        line="${LINES_BUF[MISERC_J]}"
+        if [ "${line:MISERC_K:2}" = "$quote$quote" ]; then
+          MISERC_K=$((MISERC_K+2)); ml=1
+        else
+          ml=0
+        fi ;;
       *) MISERC_ERR='miserc env may only contain string names'; return 1 ;;
     esac
+    if [ "$ml" = "1" ]; then
+      # TOML trims the first newline right after the opening delimiter.
+      line="${LINES_BUF[MISERC_J]}"
+      if [ "$MISERC_K" -ge "${#line}" ]; then MISERC_J=$((MISERC_J+1)); MISERC_K=0; fi
+      val=""; closed=0
+      while [ "$MISERC_J" -lt "${#LINES_BUF[@]}" ]; do
+        line="${LINES_BUF[MISERC_J]}"
+        if [ "$MISERC_K" -ge "${#line}" ]; then
+          MISERC_J=$((MISERC_J+1)); MISERC_K=0
+          val+=$'\n'
+          continue
+        fi
+        ch="${line:MISERC_K:1}"
+        if [ "$quote" = '"' ] && [ "$ch" = "\\" ]; then
+          # A backslash before the end of the line (spaces and tabs allowed)
+          # trims the newline and the following whitespace; other escapes
+          # decode like the single-line path.
+          if [[ "${line:$((MISERC_K+1))}" =~ ^[[:space:]]*$ ]]; then
+            MISERC_J=$((MISERC_J+1)); MISERC_K=0
+            while [ "$MISERC_J" -lt "${#LINES_BUF[@]}" ]; do
+              line="${LINES_BUF[MISERC_J]}"
+              ch="${line#"${line%%[![:space:]]*}"}"
+              if [ -z "$ch" ]; then MISERC_J=$((MISERC_J+1)); continue; fi
+              MISERC_K=$(( ${#line} - ${#ch} ))
+              break
+            done
+            continue
+          fi
+          MISERC_K=$((MISERC_K+1))
+          if [ "$MISERC_K" -ge "${#line}" ]; then MISERC_ERR='miserc env has an unterminated escape'; return 1; fi
+          ch="${line:MISERC_K:1}"
+          if [ "$ch" = "u" ] || [ "$ch" = "U" ]; then
+            local w=4 hex
+            [ "$ch" = "U" ] && w=8
+            hex="${line:$((MISERC_K+1)):$w}"
+            MISERC_K=$((MISERC_K+1+w))
+            _miserc_decode_escape "$ch" "$hex"
+            val+="$_MISERC_DECODED"
+          else
+            _miserc_decode_escape "$ch" ""
+            val+="$_MISERC_DECODED"
+            MISERC_K=$((MISERC_K+1))
+          fi
+          continue
+        fi
+        if [ "${line:MISERC_K:3}" = "$quote$quote$quote" ]; then
+          MISERC_K=$((MISERC_K+3)); closed=1; break
+        fi
+        val+="$ch"; MISERC_K=$((MISERC_K+1))
+      done
+      [ "$closed" = "1" ] || { MISERC_ERR='miserc env has an unterminated string'; return 1; }
+      MISE_ENV_VALUES[${#MISE_ENV_VALUES[@]}]="$val"
+      need_sep=1
+      continue
+    fi
     val=""; closed=0
     while [ "$MISERC_J" -lt "${#LINES_BUF[@]}" ]; do
       line="${LINES_BUF[MISERC_J]}"
@@ -1293,9 +1367,11 @@ _miserc_parse_array() {
           [ "$ch" = "U" ] && w=8
           hex="${line:$((MISERC_K+1)):$w}"
           MISERC_K=$((MISERC_K+1+w))
-          val+="$(_miserc_decode_escape "$ch" "$hex")"
+          _miserc_decode_escape "$ch" "$hex"
+          val+="$_MISERC_DECODED"
         else
-          val+="$(_miserc_decode_escape "$ch" "")"
+          _miserc_decode_escape "$ch" ""
+          val+="$_MISERC_DECODED"
           MISERC_K=$((MISERC_K+1))
         fi
         continue
@@ -1325,7 +1401,10 @@ miserc_parse_env() {
     [[ "${SCAN_BUF[i]}" =~ $env_key_re ]] || continue
     rawkey="${BASH_REMATCH[1]}"
     if [[ "$rawkey" == \"*\" ]]; then
-      key=$(_miserc_decode_basic "${rawkey:1:${#rawkey}-2}")
+      # `$( )` strips trailing newlines; a sentinel keeps a decoded key like
+      # "env\n" distinct from the bare env key.
+      key=$(_miserc_decode_basic "${rawkey:1:${#rawkey}-2}"; printf x)
+      key="${key%x}"
     elif [[ "$rawkey" == \'*\' ]]; then
       key="${rawkey:1:${#rawkey}-2}"
     else
@@ -1436,7 +1515,14 @@ mise_inherited_env() {
   MISE_BASE_ENV_VALUES=(); MISE_BASE_ENV_PATH=""
   for p in "$(path_mise_local_miserc)" "$(path_mise_shared_miserc)" "$(path_mise_system_miserc)"; do
     [ -e "$p" ] || continue
-    lines_load "$p"
+    # An unreadable miserc cannot prove which environments it selects; treat
+    # it like a parse failure instead of judging as if it were empty.
+    if [ ! -r "$p" ]; then
+      MISERC_ERR="cannot read $p"
+      printf '%s\n' "$MISERC_ERR" >&2
+      return 1
+    fi
+    lines_load "$p" || { MISERC_ERR="cannot read $p"; printf '%s\n' "$MISERC_ERR" >&2; return 1; }
     miserc_parse_env; r=$?
     if [ "$r" = "2" ]; then
       printf '%s\n' "$MISERC_ERR" >&2
@@ -1474,7 +1560,9 @@ mise_env_list() {
 
 mise_env_warning() {
   local e v
-  [ -n "${MISE_ENV:-}" ] || return 0
+  # Only a parsed nonempty MISE_ENV replaces the miserc list; MISE_ENV=","
+  # leaves the files in charge, so the shell still sees the pmsec layer.
+  mise_env_override || return 0
   while IFS= read -r e; do
     [ "$e" = "pmsec" ] && return 0
   done < <(mise_env_list "$MISE_ENV")
@@ -1487,11 +1575,11 @@ mise_selector_state() {
   MISE_SELECTOR_PATH=""; MISE_SELECTOR_WIRED=0; MISE_SELECTOR_VALUES=()
   # pmsec is only the effective layer when it loads last: later environments
   # override earlier ones, so membership alone cannot prove the hardened
-  # values win.
-  if [ -n "${MISE_ENV:-}" ]; then
+  # values win. Only a parsed nonempty MISE_ENV replaces the miserc list;
+  # MISE_ENV="," selects nothing and leaves the files in charge.
+  if mise_env_override; then
     MISE_SELECTOR_PATH="MISE_ENV"
     while IFS= read -r e; do
-      [ -n "$e" ] || continue
       MISE_SELECTOR_VALUES[${#MISE_SELECTOR_VALUES[@]}]="$e"
     done < <(mise_env_list "$MISE_ENV")
     n=${#MISE_SELECTOR_VALUES[@]}
@@ -1500,7 +1588,13 @@ mise_selector_state() {
   fi
   for p in "$(path_mise_local_miserc)" "$(path_mise_shared_miserc)" "$(path_mise_system_miserc)"; do
     [ -e "$p" ] || continue
-    lines_load "$p"
+    # An unreadable selector may still activate pmsec: report it (status 2,
+    # MISERC_ERR for the caller to print) instead of judging from thin air.
+    if [ ! -r "$p" ]; then
+      MISERC_ERR="cannot read $p"
+      return 2
+    fi
+    lines_load "$p" || { MISERC_ERR="cannot read $p"; return 2; }
     miserc_parse_env; r=$?
     [ "$r" = "2" ] && return 2
     [ "$r" = "0" ] || continue
@@ -1524,7 +1618,14 @@ mise_read_merged() {
     for q in "${MISE_READ_FILES[@]}"; do [ "$q" = "$p" ] && dup=1; done
     [ "$dup" = "1" ] && continue
     MISE_READ_FILES[${#MISE_READ_FILES[@]}]="$p"
-    lines_load "$p"
+    # A layer that cannot be read may hold a stricter cooldown: an unreadable
+    # 30-day config.work.toml must not let the enable write 1 day. Report
+    # status 2 with MISERC_ERR for the caller to surface.
+    if [ -e "$p" ] && [ ! -r "$p" ]; then
+      MISERC_ERR="cannot read $p"
+      return 2
+    fi
+    lines_load "$p" || { MISERC_ERR="cannot read $p"; return 2; }
     if val=$(lines_read_key "minimum_release_age" "=" "settings"); then
       [ -z "$fallback" ] && fallback="$val"
       if d=$(parse_days_mise "$val"); then
@@ -1577,9 +1678,19 @@ tool_read_mise() {
         esac
         vals[${#vals[@]}]="$(path_mise_dir)/config.$e.toml"
       done
-      mise_read_merged "$legacy" "$base" "$pmsec" "${vals[@]}"
+      # Status 2 from an unreadable layer must fail the read: judging from a
+      # partial merge could lower a stricter cooldown. Return 2 (the "cannot
+      # judge" code cmd_enable fails the row on) — status 1 would read as
+      # "not configured" and let the enable proceed.
+      mise_read_merged "$legacy" "$base" "$pmsec" "${vals[@]}" || {
+        printf 'pmsec: %s\n' "$MISERC_ERR" >&2
+        return 2
+      }
     else
-      mise_read_merged "$pmsec"
+      mise_read_merged "$pmsec" || {
+        printf 'pmsec: %s\n' "$MISERC_ERR" >&2
+        return 2
+      }
     fi
     MISE_READ_PATH="$pmsec"
     mise_selector_state; r=$?
@@ -1593,9 +1704,15 @@ tool_read_mise() {
     mise_has_new_artifacts; r=$?
     [ "$r" = "2" ] && return 1
     if [ "$r" = "0" ] && [ "$action" = "enable" ]; then
-      mise_read_merged "$legacy" "$base" "$pmsec"
+      mise_read_merged "$legacy" "$base" "$pmsec" || {
+        printf 'pmsec: %s\n' "$MISERC_ERR" >&2
+        return 2
+      }
     else
-      mise_read_merged "$legacy"
+      mise_read_merged "$legacy" || {
+        printf 'pmsec: %s\n' "$MISERC_ERR" >&2
+        return 2
+      }
     fi
     MISE_READ_PATH="$legacy"
     if [ "$r" = "0" ]; then
@@ -1668,7 +1785,7 @@ mise_remove_managed_config() {
 # Remove the pmsec selector from miserc.local.toml. Other env names/keys survive.
 # 0 = removed, 1 = nothing to remove, 2 = invalid env or failed write.
 mise_remove_selector() {
-  local localp="$1" dir r p v
+  local localp="$1" dir r p v changed=0
   local -a kept=()
   if [ -e "$localp" ]; then
     # A failed lines_load would silently skip the removal; an unreadable
@@ -1680,6 +1797,7 @@ mise_remove_selector() {
     # sees captured stderr: a bare status 2 would produce an empty message.
     [ "$r" = "2" ] && { printf '%s\n' "$MISERC_ERR" >&2; return 2; }
     if [ "$r" = "0" ] && miserc_remove_env_value "pmsec"; then
+      changed=1
       # Same symlinked-directory refusal as mise_remove_managed_config (F13).
       dir=$(dirname -- "$localp")
       _pmsec_root_dir_guard "$dir" || return 2
@@ -1688,25 +1806,34 @@ mise_remove_selector() {
       elif ! lines_dump | write_atomic "$localp"; then
         return 2
       fi
-      return 0
     fi
   fi
-  # The local miserc holds no pmsec name. When the effective selector lives
-  # in shared/system, materialize the cleaned list into the local file so
-  # legacy checks converge: the foreign file (often root-owned) stays
-  # untouched, mirroring how forward migration materializes inherited names.
+  # Re-resolve the effective selector AFTER the local change: removing a
+  # local assignment can expose a shared/system env list that still selects
+  # pmsec, and the next legacy check would re-enable. Materialize the cleaned
+  # list into the local file (kept empty writes env = []) so legacy checks
+  # converge; the foreign file (often root-owned) stays untouched, mirroring
+  # how forward migration materializes inherited names.
   mise_inherited_env || return 2
   if [ -n "$MISE_BASE_ENV_PATH" ] && [ "$MISE_BASE_ENV_PATH" != "$localp" ]; then
+    kept=()
     for v in "${MISE_BASE_ENV_VALUES[@]}"; do [ "$v" = "pmsec" ] || kept[${#kept[@]}]="$v"; done
-    [ "${#kept[@]}" -eq "${#MISE_BASE_ENV_VALUES[@]}" ] || {
+    if [ "${#kept[@]}" -ne "${#MISE_BASE_ENV_VALUES[@]}" ]; then
+      # The env indices below must describe THIS buffer: parse the freshly
+      # loaded local file, or a shared/system parse would point the splice at
+      # unrelated local lines. A local file that was just unlinked loads as an
+      # empty buffer and the assignment is inserted at the top.
       lines_load "$localp"
+      miserc_parse_env; r=$?
+      [ "$r" = "2" ] && { printf '%s\n' "$MISERC_ERR" >&2; return 2; }
       miserc_set_env_values "${kept[@]}"
       dir=$(dirname -- "$localp")
       _pmsec_root_dir_guard "$dir" || return 2
       lines_dump | write_atomic "$localp" || return 2
       return 0
-    }
+    fi
   fi
+  if [ "$changed" = "1" ]; then return 0; fi
   return 1
 }
 
@@ -2347,7 +2474,7 @@ Environment:
                         for config.pmsec.toml and miserc.local.toml).
   MISE_SYSTEM_CONFIG_DIR Read the system miserc.toml from here.
   MISE_ENV              Replaces the miserc env list; when set without
-                        `pmsec`, --check reports the layer as inactive.
+                        \`pmsec\`, --check reports the layer as inactive.
   AUBE_CONFIG_FILE      Override the aube config file path.
   COMPOSER_HOME         Override the Composer home dir; pmsec writes \$COMPOSER_HOME/config.json.
   UV_CONFIG_FILE        Override the uv config file path.

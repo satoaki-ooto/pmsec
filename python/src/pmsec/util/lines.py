@@ -56,6 +56,12 @@ def scan_view(lines: list[str]) -> list[str]:
         n = len(line)
         while i < n:
             if open_ is not None:
+                # Inside a multiline basic string a backslash escapes the next
+                # char, so `\"""` does not close the delimiter; literal strings
+                # have none.
+                if open_ == '"""' and line[i] == "\\":
+                    i += 2
+                    continue
                 if line.startswith(open_, i):
                     open_ = None
                     i += 3

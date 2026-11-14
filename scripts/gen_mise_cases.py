@@ -412,6 +412,10 @@ CASES = [
         None,
         {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_ENV": "work"},
         ["--tool", "mise", "--days", "1", "--json"],
+        # The foreign MISE_ENV hides the selector from this shell, so the
+        # miserc keeps its pmsec name — but the pmsec FILE's managed keys are
+        # still removed and the emptied file deleted.
+        {"missing": [".config/mise/config.pmsec.toml"]},
     ),
     # The effective selector may live in a shared/system miserc the cleanup
     # must not rewrite: the cleaned list is materialized into the local file
@@ -425,6 +429,7 @@ CASES = [
         None,
         {"PMSEC_MISE_VERSION": "2026.10.25"},
         ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml"]},
     ),
     (
         "check_mise_legacy_shared_selector_converged",
@@ -432,6 +437,22 @@ CASES = [
         "enable_mise_legacy_shared_selector_materialized",
         {"PMSEC_MISE_VERSION": "2026.10.25"},
         ["--tool", "mise", "--days", "1", "--check", "--json"],
+    ),
+    # Same materialization with a nonempty local file that defines no env:
+    # the env indices used for the rewrite must describe the freshly parsed
+    # local buffer, not the shared one, or unrelated local lines are spliced
+    # out.
+    (
+        "enable_mise_legacy_shared_selector_materialized_keeps_local",
+        {
+            ".config/mise/miserc.toml": 'env = ["work", "pmsec"]\n',
+            ".config/mise/miserc.local.toml": "other = 1\n",
+            ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml"]},
     ),
     # Delimiters inside a comment or a single-line string are not structural:
     # neither may open a multi-line string that hides the real selector or the
@@ -495,6 +516,70 @@ CASES = [
         {".config/mise/miserc.local.toml": 'env = ["work"]\n'},
         None,
         {**NEW_MODE, "MISE_ENV": "work/prod"},
+        ["--tool", "mise", "--days", "1", "--json"],
+        # The enable fails before writing anything: no half-migrated pair.
+        {"missing": [".config/mise/config.pmsec.toml"]},
+    ),
+    # Removing a local pmsec name can expose a shared/system selector that
+    # still selects pmsec; the cleanup must re-resolve and materialize the
+    # cleaned list locally (env = [] when nothing but pmsec remains), or the
+    # next legacy check would re-enable.
+    (
+        "enable_mise_legacy_local_removal_exposes_shared",
+        {
+            ".config/mise/miserc.toml": 'env = ["pmsec"]\n',
+            ".config/mise/miserc.local.toml": 'env = ["pmsec"]\n',
+            ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml"]},
+    ),
+    (
+        "check_mise_legacy_local_removal_exposes_shared_converged",
+        {},
+        "enable_mise_legacy_local_removal_exposes_shared",
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+    ),
+    # A multiline basic/literal string is one array value: `env = ["""w"""]`
+    # is valid TOML, and enable rewrites the decoded names back as plain
+    # single-line strings.
+    (
+        "enable_mise_new_mode_multiline_basic_env",
+        {".config/mise/miserc.local.toml": 'env = ["""pmsec""", """work"""]\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_multiline_literal_env",
+        {".config/mise/miserc.local.toml": "env = ['''work''']\nother = 1\n"},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    # An escaped delimiter inside a multiline basic string (`\"""`) does not
+    # close it: the env line below stays inside the string body and is not a
+    # real selector, so enable starts fresh instead of migrating "work".
+    (
+        "enable_mise_new_mode_multiline_escaped_delim_hides_env",
+        {".config/mise/miserc.local.toml": 'note = """say \\"\nenv = ["work"]\n"""\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    # A line-ending backslash inside a multiline basic string trims the
+    # newline and the following whitespace, so a selector can span lines
+    # without embedding a newline in the name. (A name that does embed a
+    # newline is refused as unsafe; its message rendering differs per port,
+    # so that refusal is pinned by unit tests instead of a shared fixture.)
+    (
+        "enable_mise_new_mode_multiline_env_line_ending_backslash",
+        {".config/mise/miserc.local.toml": 'env = [\n  """\\\n  work""",\n]\n'},
+        None,
+        NEW_MODE,
         ["--tool", "mise", "--days", "1", "--json"],
     ),
 ]
