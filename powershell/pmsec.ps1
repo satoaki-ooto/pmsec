@@ -1827,6 +1827,7 @@ public static class PmsecFileId {
 function MiseProvablyMissing([string]$Path) {
   $dir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
   $seen = [System.Collections.Generic.HashSet[string]]::new()
+  $hops = 0
   while ($true) {
     $parent = [IO.Path]::GetDirectoryName($dir)
     if ($parent -eq $dir -or -not $parent) {
@@ -1842,9 +1843,10 @@ function MiseProvablyMissing([string]$Path) {
     # Follow links: an ancestor reached through a valid symlink/junction is
     # still a real directory, so it can prove absence; only a dangling link
     # (or an unreadable target) leaves the outcome unknown. A link cycle is
-    # unknown too: never resolve the same link twice.
+    # unknown too: never resolve the same link twice, and bound the total hop
+    # count so alias-expanding relative targets cannot grow the path forever.
     while ($item.LinkType) {
-      if (-not $seen.Add($item.FullName)) { return $false }
+      if (++$hops -gt 64 -or -not $seen.Add($item.FullName)) { return $false }
       $target = @($item.Target)[0]
       if (-not $target) { return $false }
       if (-not [IO.Path]::IsPathRooted($target)) {

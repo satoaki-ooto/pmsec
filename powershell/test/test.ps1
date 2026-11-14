@@ -524,8 +524,14 @@ T 'mise cleanup fails closed on a cyclic MISE_GLOBAL_CONFIG_FILE link' {
   $h = NewHome
   try {
     $cycle = PathJoin $h 'cycle'
+    [void](New-Item -ItemType Directory -Path $cycle -Force)
+    $again = PathJoin $cycle 'again'
+    $dir = PathJoin $cycle 'dir'
+    # again aliases the cycle root; dir's relative target expands through it,
+    # so the resolved spelling grows on every hop instead of repeating.
     try {
-      [void](New-Item -ItemType SymbolicLink -Path $cycle -Target $cycle)
+      [void](New-Item -ItemType SymbolicLink -Path $again -Target $cycle)
+      [void](New-Item -ItemType SymbolicLink -Path $dir -Target (PathJoin 'again' 'dir'))
     } catch {
       Write-Host 'SKIP  mise cyclic-link cleanup (symlink creation blocked)'
       return $true
@@ -536,15 +542,27 @@ T 'mise cleanup fails closed on a cyclic MISE_GLOBAL_CONFIG_FILE link' {
     $selectorPath = PathJoin $d 'miserc.local.toml'
     [System.IO.File]::WriteAllText($pmsecPath, "[settings]`nminimum_release_age = `"3d`"`n")
     [System.IO.File]::WriteAllText($selectorPath, "env = [`"pmsec`"]`n")
-    $r = InvokePmsec $h @{
+    $vars = @{
       PMSEC_MISE_VERSION = '2026.10.25'
-      MISE_GLOBAL_CONFIG_FILE = (PathJoin $cycle 'config.toml')
-    } @('--disable','--tool','mise')
+      MISE_GLOBAL_CONFIG_FILE = (PathJoin $dir 'config.toml')
+    }
+    if ($onWindows) {
+      $vars.PMSEC_FAKE_SCOPES = "windows|$h|win32"
+      $vars.LOCALAPPDATA = (PathJoin $h 'AppData' 'Local')
+    }
+    $r = InvokePmsec $h $vars @('--disable','--tool','mise')
     if ($r.Code -eq 0) { $script:LastFail = "cleanup reported success through a cyclic link`n$($r.Out)"; return $false }
     if (-not (Test-Path -LiteralPath $pmsecPath)) { $script:LastFail = 'cyclic link allowed destructive cleanup'; return $false }
     if (-not (Test-Path -LiteralPath $selectorPath)) { $script:LastFail = 'cyclic link allowed selector cleanup'; return $false }
     return $true
-  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+  } finally {
+    # Drop the expanding links before the recursive delete so cleanup cannot
+    # walk through them.
+    foreach ($link in @($dir, $again)) {
+      if (Test-Path -LiteralPath $link) { Remove-Item -Force -LiteralPath $link -ErrorAction Ignore }
+    }
+    Remove-Item -Recurse -Force -LiteralPath $h
+  }
 }
 
 T 'Windows mise legacy migration follows MISE_CONFIG_DIR' {
