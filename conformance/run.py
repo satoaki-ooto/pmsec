@@ -46,6 +46,10 @@ def env_for(impl: str, home: Path) -> dict[str, str]:
         # Composer uses Application Support on macOS instead of XDG. Pin its
         # home so one case exercises the same path on every runner.
         "COMPOSER_HOME": str(home / ".config" / "composer"),
+        # mise also reads a system-level config; pointing it inside the case
+        # home keeps the host's /etc/mise/miserc.toml out of system-selector
+        # cases.
+        "MISE_SYSTEM_CONFIG_DIR": str(home / "etc-mise"),
     }
     # Hide every host-installed package manager so version-aware preflight
     # warnings are deterministic (otherwise CI runners that ship npm/yarn/etc
@@ -57,6 +61,14 @@ def env_for(impl: str, home: Path) -> dict[str, str]:
     if impl == "powershell":
         env["PMSEC_FAKE_SCOPES"] = f"test|{home}|linux"
     return env
+
+
+def case_env(impl: str, home: Path, overrides: dict[str, str]) -> dict[str, str]:
+    """env_for merged with the case's `env` overrides; the literal <HOME> in
+    values expands to the case temp dir (applies to `pre` and the run)."""
+    env = env_for(impl, home)
+    env.update(overrides)
+    return {k: v.replace("<HOME>", str(home)) for k, v in env.items()}
 
 
 def normalize(obj, home: Path):
@@ -86,8 +98,7 @@ def run_case(impl: str, case_path: Path) -> tuple[bool, str]:
     case = json.loads(case_path.read_text())
     home = Path(tempfile.mkdtemp(prefix="pmsec-conf-"))
     try:
-        env = env_for(impl, home)
-        env.update(case.get("env", {}))
+        env = case_env(impl, home, case.get("env", {}))
         for rel, body in case.get("setup", {}).items():
             target = home / rel
             target.parent.mkdir(parents=True, exist_ok=True)
