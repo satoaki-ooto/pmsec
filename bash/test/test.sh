@@ -795,6 +795,133 @@ call_helper() {
   fi
 }
 
+# call_snippet [VAR=val ...] -- SNIPPET [ARG ...]
+# Source the port, then run SNIPPET through bash -c. call_helper only returns
+# stdout, so a probe that has to read the globals a helper sets needs its own
+# snippet. ARGs arrive as "$@" and may carry raw text: an argv element keeps
+# newlines, quotes and trailing blanks that a $(...) capture would eat.
+call_snippet() {
+  local extra=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+    extra[${#extra[@]}]="$1"; shift
+  done
+  shift
+  local snippet="$1"; shift
+  if [ "${#extra[@]}" -eq 0 ]; then
+    env -i PATH="$PATH" bash -c '
+      . "$1"; shift
+      snippet=$1; shift
+      eval "$snippet"
+    ' _ "$PMSEC" "$snippet" "$@"
+  else
+    env -i PATH="$PATH" "${extra[@]}" bash -c '
+      . "$1"; shift
+      snippet=$1; shift
+      eval "$snippet"
+    ' _ "$PMSEC" "$snippet" "$@"
+  fi
+}
+
+# field NAME BLOCK — the value of the first `NAME=...` line in a probe block.
+field() {
+  local name="$1" rest="$2" line
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *$'\n'*) line="${rest%%$'\n'*}"; rest="${rest#*$'\n'}" ;;
+      *) line="$rest"; rest="" ;;
+    esac
+    case "$line" in
+      "$name="*) printf '%s' "${line#"$name="}"; return 0 ;;
+    esac
+  done
+  return 0
+}
+
+# Probe snippets for the miserc helpers. A quoted heredoc keeps every `$'...'`
+# escape and quote literal, and the probes spell newlines as <LF> and CRs as
+# <CR> so a trailing newline survives `$(...)`.
+MISERC_PARSE_PROBE=$(cat <<'SNIPPET'
+miserc_env_parse_text "$1" "$2"; rc=$?
+printf 'rc=%s\npath=%s\nreason=%s\nfound=%s\nstart=%s\nend=%s\n' \
+  "$rc" "${MISEC_ERROR_PATH-}" "${MISEC_ERROR_REASON-}" "${MISEC_ENV_FOUND-}" \
+  "${MISEC_ENV_START-}" "${MISEC_ENV_END-}"
+names=""; tokens=""; sep=""; i=0
+while [ "$i" -lt "${#MISEC_ENV_VALUES[@]}" ]; do
+  names="$names$sep${MISEC_ENV_VALUES[i]}"
+  tokens="$tokens$sep${MISEC_ENV_TOKENS[i]}"
+  sep='|'
+  i=$((i+1))
+done
+printf 'nvalues=%s\nnames=%s\ntokens=%s\n' "${#MISEC_ENV_VALUES[@]}" "$names" "$tokens"
+SNIPPET
+)
+
+MISERC_WRITE_PROBE=$(cat <<'SNIPPET'
+label=$1; text=$2; shift 2
+miserc_env_write_pmsec_text "$label" "$text" "$@"; rc=$?
+printf 'rc=%s\npath=%s\nreason=%s\nset=%s\n' \
+  "$rc" "${MISEC_ERROR_PATH-}" "${MISEC_ERROR_REASON-}" "${MISEC_ENV_OUTPUT+1}"
+if [ -n "${MISEC_ENV_OUTPUT+1}" ]; then
+  out="${MISEC_ENV_OUTPUT//$'\r'/<CR>}"
+  printf 'out=%s\n' "${out//$'\n'/<LF>}"
+fi
+SNIPPET
+)
+
+MISERC_SPLICE_PROBE=$(cat <<'SNIPPET'
+miserc_env_parse_text "$1" "$2" || exit 1
+t=$2
+pre="${t:0:MISEC_ENV_START}"
+mid="${t:MISEC_ENV_START:MISEC_ENV_END-MISEC_ENV_START}"
+post="${t:MISEC_ENV_END}"
+printf 'pre=%s\nmid=%s\npost=%s\n' "${pre//$'\n'/<LF>}" "${mid//$'\n'/<LF>}" "${post//$'\n'/<LF>}"
+SNIPPET
+)
+
+MISERC_TWICE_PROBE=$(cat <<'SNIPPET'
+label=$1; text=$2; shift 2
+miserc_env_write_pmsec_text "$label" "$text" "$@" || { printf 'rc=1\nreason=%s\n' "$MISEC_ERROR_REASON"; exit 0; }
+first=$MISEC_ENV_OUTPUT
+miserc_env_write_pmsec_text "$label" "$first" "$@" || { printf 'rc=2\nreason=%s\n' "$MISEC_ERROR_REASON"; exit 0; }
+second=$MISEC_ENV_OUTPUT
+if [ "$first" = "$second" ]; then printf 'same=1\n'; else printf 'same=0\n'; fi
+printf 'first=%s\nsecond=%s\n' "${first//$'\n'/<LF>}" "${second//$'\n'/<LF>}"
+SNIPPET
+)
+
+miserc_parse() { call_snippet -- "$MISERC_PARSE_PROBE" "$1" "$2"; }
+miserc_write() { call_snippet -- "$MISERC_WRITE_PROBE" "$@"; }
+miserc_splice() { call_snippet -- "$MISERC_SPLICE_PROBE" "$1" "$2"; }
+miserc_twice() { call_snippet -- "$MISERC_TWICE_PROBE" "$@"; }
+
+# accept_case LABEL TEXT FOUND NAMES [TOKENS]
+# The parse must succeed, report FOUND, and decode exactly NAMES (`|`-joined,
+# in order). When TOKENS is given the raw tokens must match too.
+accept_case() {
+  local label="$1" text="$2" found="$3" names="$4" tokens="${5-}" out
+  out=$(miserc_parse "$label" "$text")
+  assert_eq "accept[$label]: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "accept[$label]: path" "" "$(field path "$out")" || return 1
+  assert_eq "accept[$label]: found" "$found" "$(field found "$out")" || return 1
+  assert_eq "accept[$label]: names" "$names" "$(field names "$out")" || return 1
+  if [ "$#" -ge 5 ]; then
+    assert_eq "accept[$label]: tokens" "$tokens" "$(field tokens "$out")"
+  fi
+}
+
+# reject_case LABEL TEXT REASON
+# The parse must fail with exactly REASON, LABEL in MISEC_ERROR_PATH, and no
+# output at all.
+reject_case() {
+  local label="$1" text="$2" reason="$3" out quiet
+  out=$(miserc_parse "$label" "$text")
+  assert_eq "reject[$reason]: rc" "1" "$(field rc "$out")" || return 1
+  assert_eq "reject[$reason]: path" "$label" "$(field path "$out")" || return 1
+  assert_eq "reject[$reason]: reason" "$reason" "$(field reason "$out")" || return 1
+  quiet=$(call_helper -- miserc_env_parse_text "$label" "$text" 2>&1)
+  assert_eq "reject[$reason]: silent" "" "$quiet"
+}
+
 # Sourcing the port must define the helpers and do nothing else: no output, no
 # writes, no CLI run.
 t_source_guard_defines_without_running_main() {
@@ -910,12 +1037,425 @@ t_mise_supports_new_mode_matrix() {
   assert_eq "mode: re-detected on every call" "first=0 second=1" "$seq"
 }
 
+# ---------- mise config layer: narrow miserc env parser ----------
+
+# No top-level env array at all reads as "not defined" — including the shapes
+# the writer refuses to touch ([env] tables and dotted env.* keys).
+t_miserc_parse_absent() {
+  accept_case "no env: empty text" "" 0 "" || return 1
+  accept_case "no env: [env] table" '[env]
+A = "b"' 0 "" || return 1
+  accept_case "no env: dotted key" 'env.foo = 1' 0 "" || return 1
+  accept_case "no env: dotted key with spaces" 'env . foo = 1' 0 "" || return 1
+  accept_case "no env: env-prefixed keys" 'envelope = true
+environment = "x"
+env2 = 1
+envx=1' 0 ""
+}
+
+# Every accepted array shape, plus the tokens the writer reuses.
+t_miserc_parse_shapes() {
+  accept_case "empty array" 'env = []' 1 "" || return 1
+  accept_case "empty array spaced" 'env = [ ]' 1 "" || return 1
+  accept_case "empty array multiline" 'env = [
+  # nothing yet
+]' 1 "" || return 1
+  accept_case "single element" 'env = ["work"]' 1 'work' '"work"' || return 1
+  accept_case "inline pair" 'env = ["a", "b"]' 1 'a|b' || return 1
+  accept_case "tight spacing" 'env=["a","b"]' 1 'a|b' || return 1
+  accept_case "trailing comma" 'env = ["a", ]' 1 'a' || return 1
+  accept_case "trailing comma on its own line" 'env = [
+  "a",
+]' 1 'a' || return 1
+  accept_case "multiline with comments" 'env = [
+  # leading
+  "work", # trailing
+  '"'"'lit'"'"',
+]' 1 'work|lit' "\"work\"|'lit'" || return 1
+  accept_case "indented key" '  env = ["a"]' 1 'a' || return 1
+  accept_case "tab-indented key" '	env = ["a"]' 1 'a' || return 1
+  accept_case "tabs around the assignment" $'env\t=\t["a"]\t' 1 'a' || return 1
+  accept_case "comments between every token" 'env = [
+  "a" # one
+  , # the separator sits on its own line
+  "b"
+]' 1 'a|b' || return 1
+  accept_case "duplicate names" 'env = ["a", "a"]' 1 'a|a' || return 1
+  accept_case "literal keeps its backslash" "env = ['C:\\tmp']" 1 'C:\tmp' "'C:\\tmp'" || return 1
+  accept_case "meta bytes inside strings" 'env = ["a # b", "c[d]", "e,f", " g "]' 1 'a # b|c[d]|e,f| g ' || return 1
+  accept_case "name with a single quote" 'env = ["it'"'"'s"]' 1 "it's" || return 1
+  accept_case "multibyte name" 'env = ["日本"]' 1 '日本' '"日本"'
+}
+
+# START/END are byte offsets: splicing them back out has to reproduce the exact
+# assignment, with a BOM, indentation, comments and following lines untouched.
+t_miserc_parse_splice_offsets() {
+  local out text bom=$'\xEF\xBB\xBF'
+  text='before = 1
+env = [ "a",
+  "b" ]
+after = 2'
+  out=$(miserc_splice misc "$text")
+  assert_eq "splice: multiline array" 'pre=before = 1<LF>|mid=env = [ "a",<LF>  "b" ]|post=<LF>after = 2' \
+    "pre=$(field pre "$out")|mid=$(field mid "$out")|post=$(field post "$out")" || return 1
+
+  # START sits on the bare key, so the indentation in front of it (and the BOM
+  # before the first line) is outside the replaced range.
+  text="${bom}note = \"x\"
+  env = ['a']   # keep
+[tail]"
+  out=$(miserc_splice misc "$text")
+  assert_eq "splice: BOM, indentation and trailing comment" \
+    "pre=${bom}note = \"x\"<LF>  |mid=env = ['a']|post=   # keep<LF>[tail]" \
+    "pre=$(field pre "$out")|mid=$(field mid "$out")|post=$(field post "$out")" || return 1
+
+  # Nothing is printed on a successful parse.
+  out=$(call_helper -- miserc_env_parse_text misc 'env = ["a"]' 2>&1)
+  assert_eq "splice: successful parse is silent" "" "$out"
+}
+
+# Strings and comments are opaque: env-like text inside them is never an
+# assignment, and a `[table]` inside a multiline string never ends the root
+# region.
+t_miserc_parse_ignores_strings_and_comments() {
+  local text
+  text=$(cat <<'TXT'
+note = "env = [\"x\"]"
+flag = 'env = ["y"]'
+doc = """
+env = ["fake"]
+[not.a.table]
+"""
+# env = ["commented"]
+key = 1
+TXT
+)
+  accept_case "env-like text in strings and comments" "$text" 0 "" || return 1
+
+  text=$(cat <<'TXT'
+doc = """
+[env]
+"""
+env = ["top"]
+TXT
+)
+  accept_case "table header inside a multiline string" "$text" 1 'top' || return 1
+
+  text=$(cat <<'TXT'
+doc = '''
+[env]
+'''
+[tool]
+env = ["scoped"]
+TXT
+)
+  accept_case "env inside a table is not top-level" "$text" 0 ""
+}
+
+# A one-line string that reaches the end of its line ends there: the subset does
+# not validate general TOML, so the rest of the line is string content and
+# scanning resumes on the next line. `unterminated string in file` is reserved
+# for a `"""`/`'''` block that never closes.
+t_miserc_parse_line_terminated_strings() {
+  accept_case "unterminated basic string ends at the line" 'x = "abc
+env = ["work"]' 1 'work' || return 1
+  accept_case "unterminated literal string ends at the line" "x = 'abc
+env = ['work']" 1 'work' || return 1
+  # What follows the opener is string content: an env-like tail on that line is
+  # not an assignment, and a `#` in it does not start a comment.
+  accept_case "line-terminated string hides an env-like tail" 'x = "abc # env = ["fake"]
+env = ["work"]' 1 'work' || return 1
+  # An escaped quote does not close a basic string, so the line still ends it.
+  accept_case "escaped quote does not close the string" 'x = "a\"b
+env = ["work"]' 1 'work' || return 1
+  # Past the last newline the string simply ends with the file.
+  accept_case "unterminated string on the last line" 'env = ["work"]
+x = "abc' 1 'work'
+}
+
+t_miserc_parse_reject_quoted_key() {
+  reject_case miserc.local.toml '"env" = ["a"]' "quoted env key is unsupported" || return 1
+  reject_case misc "'env' = ['a']" "quoted env key is unsupported"
+}
+
+# The scanner has to keep going after the first valid assignment to find a
+# duplicate further down.
+t_miserc_parse_reject_duplicate() {
+  reject_case misc 'env = ["a"]
+env = ["b"]' "duplicate top-level env assignment" || return 1
+  reject_case misc 'env = ["a"]
+key = 1
+
+env = ["b"]' "duplicate top-level env assignment" || return 1
+  # A second assignment after the first table header belongs to that table.
+  accept_case "second env under a table is not a duplicate" 'env = ["a"]
+[t]
+env = ["b"]' 1 'a'
+}
+
+t_miserc_parse_reject_not_array() {
+  reject_case misc 'env = "a"' "env must be an array" || return 1
+  reject_case misc 'env = 1' "env must be an array" || return 1
+  reject_case misc 'env = true' "env must be an array" || return 1
+  reject_case misc 'env = { a = "b" }' "env must be an array"
+}
+
+t_miserc_parse_reject_element_forms() {
+  reject_case misc 'env = [bare]' "env array elements must be single-line quoted strings" || return 1
+  reject_case misc 'env = [["a"]]' "env array elements must be single-line quoted strings" || return 1
+  reject_case misc 'env = [{ a = 1 }]' "env array elements must be single-line quoted strings" || return 1
+  reject_case misc 'env = ["a", 1]' "env array elements must be single-line quoted strings"
+}
+
+t_miserc_parse_reject_escapes_and_multiline_elements() {
+  reject_case misc 'env = ["a\tb"]' "escape sequences are unsupported" || return 1
+  reject_case misc 'env = ["a\"b"]' "escape sequences are unsupported" || return 1
+  reject_case misc 'env = ["""
+a
+"""]' "multiline strings are unsupported" || return 1
+  reject_case misc "env = ['''
+a
+''']" "multiline strings are unsupported"
+}
+
+t_miserc_parse_reject_unterminated() {
+  reject_case misc 'env = [' "unterminated env assignment" || return 1
+  reject_case misc 'env = ["a"' "unterminated env assignment" || return 1
+  reject_case misc 'env = ["a",' "unterminated env assignment" || return 1
+  reject_case misc 'env =' "unterminated env assignment" || return 1
+  reject_case misc 'env = [
+  "a"
+' "unterminated env assignment"
+}
+
+t_miserc_parse_reject_malformed_key() {
+  reject_case misc 'env ["a"]' "malformed env assignment" || return 1
+  reject_case misc 'env' "malformed env assignment" || return 1
+  # A second top-level `env` key is reported as a duplicate even when its value
+  # form would not parse: the key itself is what collides.
+  reject_case misc 'env = ["a"]
+
+env ["b"]' "duplicate top-level env assignment"
+}
+
+t_miserc_parse_reject_separators() {
+  reject_case misc 'env = ["a" "b"]' "malformed env array separator" || return 1
+  reject_case misc 'env = ["a",, "b"]' "malformed env array separator" || return 1
+  reject_case misc 'env = [, "a"]' "malformed env array separator"
+}
+
+t_miserc_parse_reject_trailing_junk() {
+  reject_case misc 'env = ["a"] junk' "unexpected content after env array" || return 1
+  reject_case misc 'env = ["a"] x = 1' "unexpected content after env array" || return 1
+  # A comment is not junk.
+  accept_case "comment after the array" 'env = ["a"] # ok' 1 'a'
+}
+
+# Only a multiline block that never closes is an unrelated unterminated string;
+# a one-line opener ends with its line (see t_miserc_parse_line_terminated_strings).
+t_miserc_parse_reject_unterminated_file_string() {
+  reject_case misc 'doc = """
+never closed' "unterminated string in file" || return 1
+  reject_case misc "doc = '''
+never closed" "unterminated string in file"
+}
+
+# One structured diagnostic per failure, in the shared cross-port shape.
+t_miserc_error_text_shape() {
+  local out
+  out=$(call_snippet -- '
+    miserc_env_parse_text "path/miserc.local.toml" "env = 1" || miserc_error_text
+  ')
+  assert_eq "error text: shape" "invalid env in path/miserc.local.toml: env must be an array" "$out"
+}
+
+# ---------- mise config layer: narrow miserc env writer ----------
+
+t_miserc_write_fresh() {
+  local out quiet
+  out=$(miserc_write misc "")
+  assert_eq "write: empty input rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "write: empty input" 'env = ["pmsec"]<LF>' "$(field out "$out")" || return 1
+  out=$(miserc_write misc "" work)
+  assert_eq "write: one inherited name" 'env = ["work", "pmsec"]<LF>' "$(field out "$out")" || return 1
+  quiet=$(call_helper -- miserc_env_write_pmsec_text misc 'x = 1' a 2>&1)
+  assert_eq "write: prints nothing" "" "$quiet"
+}
+
+# `pmsec` is always last and appears exactly once, wherever it came in.
+t_miserc_write_pmsec_last_once() {
+  local out
+  out=$(miserc_write misc "" pmsec work pmsec extra pmsec)
+  assert_eq "write: pmsec first/middle/duplicated" 'env = ["work", "extra", "pmsec"]<LF>' "$(field out "$out")" || return 1
+  out=$(miserc_write misc "" work)
+  assert_eq "write: pmsec appended after the inherited list" 'env = ["work", "pmsec"]<LF>' "$(field out "$out")"
+}
+
+t_miserc_write_collapses_multiline() {
+  local out
+  out=$(miserc_write misc 'env = [
+  "work",
+  "pmsec",
+]
+other = 1' work)
+  assert_eq "write: multiline array becomes one line" 'env = ["work", "pmsec"]<LF>other = 1' "$(field out "$out")"
+}
+
+# Everything outside [START, END) is byte-identical: BOM, CRLF, a missing final
+# newline, indentation in front of the key, comments after it.
+t_miserc_write_preserves_bytes() {
+  local out text bom=$'\xEF\xBB\xBF'
+  text="${bom}a = 1"$'\r\n'"env = [\"w\"]  # keep"$'\r\n'"[t]"$'\r\n'"k = 1"$'\r\n'
+  out=$(miserc_write misc "$text" w)
+  assert_eq "write: BOM, CRLF, trailing comment" \
+    "${bom}a = 1<CR><LF>env = [\"w\", \"pmsec\"]  # keep<CR><LF>[t]<CR><LF>k = 1<CR><LF>" \
+    "$(field out "$out")" || return 1
+
+  out=$(miserc_write misc 'env = ["a"]
+x = 1' a)
+  assert_eq "write: no final newline" 'env = ["a", "pmsec"]<LF>x = 1' "$(field out "$out")" || return 1
+
+  out=$(miserc_write misc '  env = ["a"]' a)
+  assert_eq "write: indentation stays in front" '  env = ["a", "pmsec"]' "$(field out "$out")"
+}
+
+t_miserc_write_inserts_before_first_table() {
+  local out
+  out=$(miserc_write misc 'key = "v"
+
+[tool]
+x = 1' work)
+  assert_eq "write: inserted before the first table" 'key = "v"<LF><LF>env = ["work", "pmsec"]<LF>[tool]<LF>x = 1' \
+    "$(field out "$out")" || return 1
+
+  out=$(miserc_write misc 'key = "v"' work)
+  assert_eq "write: inserted at EOF with a trailing newline" 'key = "v"<LF>env = ["work", "pmsec"]<LF>' \
+    "$(field out "$out")" || return 1
+
+  # A header inside a multiline string does not move the insertion point.
+  out=$(miserc_write misc 'doc = """
+[tool]
+"""
+[real]' work)
+  assert_eq "write: insertion ignores headers inside strings" \
+    'doc = """<LF>[tool]<LF>"""<LF>env = ["work", "pmsec"]<LF>[real]' "$(field out "$out")"
+}
+
+t_miserc_write_reuses_local_tokens() {
+  local out
+  out=$(miserc_write misc "env = ['work']" work)
+  assert_eq "write: literal token reused" "env = ['work', \"pmsec\"]" "$(field out "$out")" || return 1
+  out=$(miserc_write misc 'env = ["work"]' work)
+  assert_eq "write: basic token reused" 'env = ["work", "pmsec"]' "$(field out "$out")" || return 1
+  out=$(miserc_write misc 'env = ["drop", "work"]' work)
+  assert_eq "write: name that is not inherited is dropped" 'env = ["work", "pmsec"]' "$(field out "$out")"
+}
+
+t_miserc_write_canonical_quoting() {
+  local out
+  out=$(miserc_write misc "" 'say "hi"')
+  assert_eq "write: double quote forces single quotes" "env = ['say \"hi\"', \"pmsec\"]<LF>" "$(field out "$out")" || return 1
+  out=$(miserc_write misc "" 'C:\tmp')
+  assert_eq "write: backslash forces single quotes" "env = ['C:\\tmp', \"pmsec\"]<LF>" "$(field out "$out")" || return 1
+  out=$(miserc_write misc "" "it's")
+  assert_eq "write: lone single quote stays double-quoted" "env = [\"it's\", \"pmsec\"]<LF>" "$(field out "$out")"
+}
+
+t_miserc_write_rejects_unrepresentable() {
+  local out
+  out=$(miserc_write misc "" 'a"b'"'"'c')
+  assert_eq "write: both quote kinds (rc)" "1" "$(field rc "$out")" || return 1
+  assert_eq "write: both quote kinds (reason)" "env name cannot be represented without escapes" \
+    "$(field reason "$out")" || return 1
+  assert_eq "write: both quote kinds (no output)" "" "$(field set "$out")" || return 1
+  out=$(miserc_write misc "" "a'b\\c")
+  assert_eq "write: quote plus backslash (reason)" "env name cannot be represented without escapes" \
+    "$(field reason "$out")" || return 1
+  out=$(miserc_write misc "" "$(printf 'a\tb')")
+  assert_eq "write: control byte (reason)" "env name cannot be represented without escapes" \
+    "$(field reason "$out")" || return 1
+  assert_eq "write: control byte (no output)" "" "$(field set "$out")" || return 1
+  out=$(miserc_write misc "" "$(printf 'a\nb')")
+  assert_eq "write: embedded newline (reason)" "env name cannot be represented without escapes" \
+    "$(field reason "$out")" || return 1
+  assert_eq "write: embedded newline (no output)" "" "$(field set "$out")"
+}
+
+# The env key already being a table anywhere in the file means the array and the
+# table would collide, so the write fails instead of producing invalid TOML.
+t_miserc_write_rejects_conflicts() {
+  local out
+  out=$(miserc_write misc '[env]
+x = 1')
+  assert_eq "write: [env] table (rc)" "1" "$(field rc "$out")" || return 1
+  assert_eq "write: [env] table (reason)" "env table conflicts with the env array" "$(field reason "$out")" || return 1
+  assert_eq "write: [env] table (no output)" "" "$(field set "$out")" || return 1
+  out=$(miserc_write misc '[[env]]
+x = 1')
+  assert_eq "write: [[env]] table (reason)" "env table conflicts with the env array" "$(field reason "$out")" || return 1
+  out=$(miserc_write misc 'env.foo = 1')
+  assert_eq "write: dotted env key (reason)" "env table conflicts with the env array" "$(field reason "$out")" || return 1
+  out=$(miserc_write misc '[tool]
+env.foo = 1')
+  assert_eq "write: scoped dotted env key (reason)" "env table conflicts with the env array" "$(field reason "$out")"
+}
+
+t_miserc_write_idempotent() {
+  local out
+  out=$(miserc_twice misc 'note = 1
+[tool]' work extra)
+  assert_eq "write: second write is identical (rc)" "" "$(field rc "$out")" || return 1
+  assert_eq "write: second write is identical" "1" "$(field same "$out")" || return 1
+  assert_eq "write: second write output" 'note = 1<LF>env = ["work", "extra", "pmsec"]<LF>[tool]' \
+    "$(field second "$out")"
+}
+
+# A failed write must not leave the previous write's text in MISEC_ENV_OUTPUT.
+t_miserc_write_error_clears_output() {
+  local out
+  out=$(call_snippet -- '
+    miserc_env_write_pmsec_text misc "" work || exit 1
+    printf "first=1\n"
+    miserc_env_write_pmsec_text misc "env = 1" work
+    printf "rc=%s set=%s\n" "$?" "${MISEC_ENV_OUTPUT+1}"
+  ')
+  assert_eq "write: failure unsets the output" 'first=1
+rc=1 set=' "$out"
+}
+
 T "sourcing bash/pmsec defines helpers without running main" t_source_guard_defines_without_running_main
 T "legacy path_mise resolver is unchanged" t_path_mise_legacy_untouched
 T "path_mise_dir override precedence" t_path_mise_dir_overrides
 T "derived mise config paths follow path_mise_dir" t_path_mise_derived_family
 T "system miserc resolution (override / POSIX / win32 drive root)" t_path_mise_system_miserc
 T "mise_supports_new_mode version x override matrix" t_mise_supports_new_mode_matrix
+T "miserc parse: no top-level env reads as not defined" t_miserc_parse_absent
+T "miserc parse: accepted array shapes and tokens" t_miserc_parse_shapes
+T "miserc parse: START/END byte offsets splice back exactly" t_miserc_parse_splice_offsets
+T "miserc parse: strings and comments stay opaque" t_miserc_parse_ignores_strings_and_comments
+T "miserc parse: one-line strings end with their line" t_miserc_parse_line_terminated_strings
+T "miserc parse: quoted env key rejected" t_miserc_parse_reject_quoted_key
+T "miserc parse: duplicate top-level env rejected" t_miserc_parse_reject_duplicate
+T "miserc parse: non-array env rejected" t_miserc_parse_reject_not_array
+T "miserc parse: non-string array elements rejected" t_miserc_parse_reject_element_forms
+T "miserc parse: escapes and multiline elements rejected" t_miserc_parse_reject_escapes_and_multiline_elements
+T "miserc parse: unterminated assignments rejected" t_miserc_parse_reject_unterminated
+T "miserc parse: malformed env key rejected" t_miserc_parse_reject_malformed_key
+T "miserc parse: malformed array separators rejected" t_miserc_parse_reject_separators
+T "miserc parse: trailing junk after the array rejected" t_miserc_parse_reject_trailing_junk
+T "miserc parse: unterminated unrelated string rejected" t_miserc_parse_reject_unterminated_file_string
+T "miserc error text shape" t_miserc_error_text_shape
+T "miserc write: fresh file and inherited names" t_miserc_write_fresh
+T "miserc write: pmsec last and once" t_miserc_write_pmsec_last_once
+T "miserc write: multiline array collapsed" t_miserc_write_collapses_multiline
+T "miserc write: surrounding bytes preserved" t_miserc_write_preserves_bytes
+T "miserc write: absent assignment inserted before the first table" t_miserc_write_inserts_before_first_table
+T "miserc write: existing tokens reused" t_miserc_write_reuses_local_tokens
+T "miserc write: canonical quoting for new names" t_miserc_write_canonical_quoting
+T "miserc write: unrepresentable names fail closed" t_miserc_write_rejects_unrepresentable
+T "miserc write: env table conflicts rejected" t_miserc_write_rejects_conflicts
+T "miserc write: idempotent" t_miserc_write_idempotent
+T "miserc write: failure leaves no output" t_miserc_write_error_clears_output
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
