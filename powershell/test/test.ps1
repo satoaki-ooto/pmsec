@@ -1458,6 +1458,304 @@ T 'mixed scopes keep version and environment per scope, with no leakage' {
   }
 }
 
+# ---------- mise layering: narrow miserc env helper ----------
+# Pure text helpers, so everything is asserted in process: the accepted subset,
+# the decoded names, the exact replaced range, and every frozen rejection
+# reason. Nothing here touches the filesystem.
+
+$script:NL = [string][char]10
+$script:DQ = [string][char]34
+$script:SQ = [string][char]39
+
+# Joins lines with LF and adds the final newline, so a multi-line case reads
+# like the miserc file it models.
+function MisercText([string[]]$Lines) {
+  return (($Lines -join $script:NL) + $script:NL)
+}
+
+function DqName([string]$Name) { return ($script:DQ + $Name + $script:DQ) }
+function SqName([string]$Name) { return ($script:SQ + $Name + $script:SQ) }
+function MisercArray([string[]]$Tokens) { return ('env = [' + ($Tokens -join ', ') + ']') }
+
+function ReadMiserc([string]$Text) { return (Read-MisercEnv -Text $Text -Path 'miserc.local.toml') }
+function WriteMiserc([string]$Text, [string[]]$Inherited) {
+  return (Update-MisercEnvText -Text $Text -Inherited $Inherited -Path 'miserc.local.toml')
+}
+function FormatMisercNames($Result) { return ((@($Result['Env'])) -join '|') }
+
+function AssertMisercUndefined([string]$Label, [string]$Text) {
+  $r = ReadMiserc $Text
+  $ok = AssertEq ($Label + ': ok') 'True' ([string]$r['Ok'])
+  $ok = $ok -and (AssertEq ($Label + ': defined') 'False' ([string]$r['Defined']))
+  $ok = $ok -and (AssertEq ($Label + ': names') '' (FormatMisercNames $r))
+  $ok = $ok -and (AssertEq ($Label + ': start') '-1' ([string]$r['Start']))
+  $ok = $ok -and (AssertEq ($Label + ': reason') '' ([string]$r['Reason']))
+  return ($ok -and (AssertEq ($Label + ': end') '-1' ([string]$r['End'])))
+}
+
+function AssertMisercNames([string]$Label, [string]$Text, [string]$Expected) {
+  $r = ReadMiserc $Text
+  $ok = AssertEq ($Label + ': ok') 'True' ([string]$r['Ok'])
+  $ok = $ok -and (AssertEq ($Label + ': defined') 'True' ([string]$r['Defined']))
+  $ok = $ok -and (AssertEq ($Label + ': reason') '' ([string]$r['Reason']))
+  return ($ok -and (AssertEq ($Label + ': names') $Expected (FormatMisercNames $r)))
+}
+
+function AssertMisercReject([hashtable]$Case) {
+  $r = ReadMiserc $Case['T']
+  $ok = AssertEq ($Case['N'] + ': ok') 'False' ([string]$r['Ok'])
+  $ok = $ok -and (AssertEq ($Case['N'] + ': reason') $Case['R'] ([string]$r['Reason']))
+  $ok = $ok -and (AssertEq ($Case['N'] + ': defined') 'False' ([string]$r['Defined']))
+  $ok = $ok -and (AssertEq ($Case['N'] + ': names') '' (FormatMisercNames $r))
+  $ok = $ok -and (AssertEq ($Case['N'] + ': start') '-1' ([string]$r['Start']))
+  return ($ok -and (AssertEq ($Case['N'] + ': end') '-1' ([string]$r['End'])))
+}
+
+function AssertMisercRejects($Cases) {
+  $ok = $true
+  foreach ($case in $Cases) { $ok = $ok -and (AssertMisercReject $case) }
+  return $ok
+}
+
+function AssertMisercWrite([string]$Label, [string]$Text, [string[]]$Inherited, [string]$Expected) {
+  $r = WriteMiserc $Text $Inherited
+  $ok = AssertEq ($Label + ': ok') 'True' ([string]$r['Ok'])
+  $ok = $ok -and (AssertEq ($Label + ': reason') '' ([string]$r['Reason']))
+  return ($ok -and (AssertEq ($Label + ': text') $Expected ([string]$r['Text'])))
+}
+
+function AssertMisercWriteReject([string]$Label, [string]$Text, [string[]]$Inherited, [string]$Reason) {
+  $r = WriteMiserc $Text $Inherited
+  $ok = AssertEq ($Label + ': ok') 'False' ([string]$r['Ok'])
+  $ok = $ok -and (AssertEq ($Label + ': reason') $Reason ([string]$r['Reason']))
+  $ok = $ok -and (AssertEq ($Label + ': text') '' ([string]$r['Text']))
+  if ($null -ne $r['Text']) { $script:LastFail = ($Label + ': the error result still carries text'); return $false }
+  return $ok
+}
+
+T 'miserc read: no top-level env assignment reads as not defined' {
+  $cases = @(
+    @{ N = 'empty file'; T = '' },
+    @{ N = 'unrelated keys'; T = (MisercText @('minimum_release_age = "1d"', 'experimental = true')) },
+    @{ N = 'envelope lookalikes'; T = (MisercText @('envelope = true', 'envoy = 1')) },
+    @{ N = 'env table only'; T = (MisercText @('[env]', 'a = 1')) },
+    @{ N = 'dotted env only'; T = (MisercText @('env.foo = 1')) },
+    @{ N = 'env inside a table'; T = (MisercText @('[tools]', (MisercArray @((DqName 'a'))))) },
+    @{ N = 'commented out'; T = (MisercText @('# env = ["a"]', '#env = ["b"]')) }
+  )
+  $ok = $true
+  foreach ($case in $cases) { $ok = $ok -and (AssertMisercUndefined $case['N'] $case['T']) }
+  return $ok
+}
+
+T 'miserc read: inline and empty arrays decode to names' {
+  $ok = AssertMisercNames 'empty array' (MisercText @('env = []')) ''
+  $ok = $ok -and (AssertMisercNames 'comments only' (MisercText @('env = [ # nothing here', ']')) '')
+  $ok = $ok -and (AssertMisercNames 'one inline' ((MisercArray @((DqName 'work')))) 'work')
+  $ok = $ok -and (AssertMisercNames 'three inline' ((MisercArray @((DqName 'a'), (SqName 'b'), (DqName 'c')))) 'a|b|c')
+  $ok = $ok -and (AssertMisercNames 'no spaces' 'env=["a","b"]' 'a|b')
+  $ok = $ok -and (AssertMisercNames 'padded brackets' 'env = [   "a"   ,   "b"   ]' 'a|b')
+  return $ok
+}
+
+T 'miserc read: a multiline array keeps offsets that slice back to the assignment' {
+  $text = MisercText @(
+    '# leading comment',
+    '  env = [',
+    '    ' + (DqName 'a') + ', # first',
+    '    ' + (SqName 'b') + ',',
+    '  ]  # trailing',
+    '',
+    '[tools]',
+    'x = 1'
+  )
+  $r = ReadMiserc $text
+  $ok = AssertEq 'ok' 'True' ([string]$r['Ok'])
+  $ok = $ok -and (AssertEq 'defined' 'True' ([string]$r['Defined']))
+  $ok = $ok -and (AssertEq 'names' 'a|b' (FormatMisercNames $r))
+  $start = [int]$r['Start']
+  $end = [int]$r['End']
+  $expectedSlice = (@('env = [', '    ' + (DqName 'a') + ', # first', '    ' + (SqName 'b') + ',', '  ]') -join $script:NL)
+  $ok = $ok -and (AssertEq 'slice' $expectedSlice $text.Substring($start, $end - $start))
+  $expectedTail = ('  # trailing' + $script:NL + $script:NL + '[tools]' + $script:NL + 'x = 1' + $script:NL)
+  return ($ok -and (AssertEq 'tail after end' $expectedTail $text.Substring($end)))
+}
+
+T 'miserc read: literal strings keep backslashes and quoted punctuation stays opaque' {
+  $ok = AssertMisercNames 'literal backslash' ('env = [' + (SqName 'say\hi') + ']') 'say\hi'
+  $ok = $ok -and (AssertMisercNames 'punctuation' ('env = [' + (DqName 'a#b, [c] = d') + ']') 'a#b, [c] = d')
+  $ok = $ok -and (AssertMisercNames 'duplicates kept in order' ((MisercArray @((DqName 'a'), (SqName 'a'), (DqName 'a')))) 'a|a|a')
+  return ($ok -and (AssertMisercNames 'trailing comma' ('env = [' + (DqName 'a') + ', ' + (DqName 'b') + ',]') 'a|b'))
+}
+
+T 'miserc read: env-like text inside comments, strings, and tables is unrelated' {
+  $ok = AssertMisercUndefined 'single-line string value' (MisercText @('note = "env = x"'))
+  $ok = $ok -and (AssertMisercUndefined 'brackets in a string value' (MisercText @('note = "[env]"')))
+  $ok = $ok -and (AssertMisercUndefined 'multiline string body' (MisercText @('note = """', (MisercArray @((DqName 'inner'))), '"""')))
+  $ok = $ok -and (AssertMisercUndefined 'literal multiline string body' (MisercText @("note = '''", (MisercArray @((SqName 'inner'))), "'''")))
+  $ok = $ok -and (AssertMisercUndefined 'env after a table' (MisercText @('[tools]', (MisercArray @((DqName 'late'))), 'x = 1')))
+  return $ok
+}
+
+T 'miserc read: a table header after a multiline string still ends the root region' {
+  $text = MisercText @(
+    'note = """',
+    '[env]',
+    '"""',
+    '',
+    'x = 1'
+  )
+  $ok = AssertMisercUndefined 'header inside the string is not a header' $text
+  $withEnv = MisercText @(
+    'note = """',
+    '[env]',
+    '"""',
+    '',
+    (MisercArray @((DqName 'real')))
+  )
+  return ($ok -and (AssertMisercNames 'env after the string is a real assignment' $withEnv 'real'))
+}
+
+T 'miserc read: quoted keys, duplicates, and shape errors fail closed' {
+  $ok = AssertMisercRejects @(
+    @{ N = 'double-quoted env key'; T = ((DqName 'env') + ' = [' + (DqName 'a') + ']'); R = 'quoted env key is unsupported' },
+    @{ N = 'single-quoted env key'; T = ((SqName 'env') + ' = [' + (DqName 'a') + ']'); R = 'quoted env key is unsupported' },
+    @{ N = 'duplicate assignment'; T = (MisercText @((MisercArray @((DqName 'a'))), (MisercArray @((DqName 'b'))))); R = 'duplicate top-level env assignment' },
+    @{ N = 'duplicate after comments'; T = (MisercText @('# one', (MisercArray @((DqName 'a'))), '', '# two', (MisercArray @((DqName 'b'))))); R = 'duplicate top-level env assignment' },
+    @{ N = 'string scalar'; T = ('env = ' + (DqName 'a')); R = 'env must be an array' },
+    @{ N = 'literal scalar'; T = ('env = ' + (SqName 'a')); R = 'env must be an array' },
+    @{ N = 'number scalar'; T = 'env = 3'; R = 'env must be an array' },
+    @{ N = 'bool scalar'; T = 'env = true'; R = 'env must be an array' },
+    @{ N = 'bare element'; T = 'env = [a]'; R = 'env array elements must be single-line quoted strings' },
+    @{ N = 'nested array element'; T = ('env = [[' + (DqName 'a') + ']]'); R = 'env array elements must be single-line quoted strings' },
+    @{ N = 'inline table element'; T = ('env = [{ a = ' + (DqName 'b') + ' }]'); R = 'env array elements must be single-line quoted strings' },
+    @{ N = 'missing equals'; T = ('env [' + (DqName 'a') + ']'); R = 'malformed env assignment' },
+    @{ N = 'bare key at end of file'; T = 'env'; R = 'malformed env assignment' },
+    @{ N = 'missing value'; T = 'env ='; R = 'unterminated env assignment' },
+    @{ N = 'comment instead of value'; T = 'env = # nothing'; R = 'unterminated env assignment' }
+  )
+  return $ok
+}
+
+T 'miserc read: out-of-subset strings fail closed with their own reason' {
+  return (AssertMisercRejects @(
+    @{ N = 'escape in a basic string'; T = ('env = [' + (DqName 'a\nb') + ']'); R = 'escape sequences are unsupported' },
+    @{ N = 'triple-quoted element'; T = ('env = [' + ($script:DQ + $script:DQ + $script:DQ) + 'a' + ($script:DQ + $script:DQ + $script:DQ) + ']'); R = 'multiline strings are unsupported' },
+    @{ N = 'literal triple-quoted element'; T = ("env = ['''a''']"); R = 'multiline strings are unsupported' },
+    @{ N = 'escape in a scalar'; T = ('env = ' + (DqName 'a\q')); R = 'escape sequences are unsupported' },
+    @{ N = 'unterminated basic string'; T = 'env = ["a'; R = 'unterminated env assignment' },
+    @{ N = 'unterminated literal string'; T = "env = ['a"; R = 'unterminated env assignment' },
+    @{ N = 'unterminated array'; T = ('env = [' + (DqName 'a')); R = 'unterminated env assignment' },
+    @{ N = 'unterminated array after comma'; T = ('env = [' + (DqName 'a') + ','); R = 'unterminated env assignment' },
+    @{ N = 'unterminated multiline string in the file'; T = (MisercText @('note = """', 'still open')); R = 'unterminated string in file' }
+  ))
+}
+
+T 'miserc read: separators and trailing content fail closed' {
+  return (AssertMisercRejects @(
+    @{ N = 'missing comma'; T = ('env = [' + (DqName 'a') + ' ' + (DqName 'b') + ']'); R = 'malformed env array separator' },
+    @{ N = 'missing comma across lines'; T = (MisercText @('env = [', '  ' + (DqName 'a'), '  ' + (DqName 'b'), ']')); R = 'malformed env array separator' },
+    @{ N = 'doubled comma'; T = ('env = [' + (DqName 'a') + ',, ' + (DqName 'b') + ']'); R = 'malformed env array separator' },
+    @{ N = 'leading comma'; T = ('env = [,' + (DqName 'a') + ']'); R = 'malformed env array separator' },
+    @{ N = 'junk after the array'; T = ((MisercArray @((DqName 'a'))) + ' x'); R = 'unexpected content after env array' },
+    @{ N = 'comma after the array'; T = ((MisercArray @((DqName 'a'))) + ','); R = 'unexpected content after env array' }
+  ))
+}
+
+T 'miserc write: empty input yields the canonical line' {
+  return (AssertMisercWrite 'empty' '' @() ((MisercArray @((DqName 'pmsec'))) + $script:NL))
+}
+
+T 'miserc write: pmsec is dropped from inherited and appended exactly once' {
+  $text = MisercText @('env = []')
+  $ok = AssertMisercWrite 'order kept' $text @('a','pmsec','b','pmsec') ('env = [' + (DqName 'a') + ', ' + (DqName 'b') + ', ' + (DqName 'pmsec') + ']' + $script:NL)
+  $ok = $ok -and (AssertMisercWrite 'pmsec first' $text @('pmsec','work') ('env = [' + (DqName 'work') + ', ' + (DqName 'pmsec') + ']' + $script:NL))
+  $ok = $ok -and (AssertMisercWrite 'only pmsec' $text @('pmsec','pmsec') ('env = [' + (DqName 'pmsec') + ']' + $script:NL))
+  return $ok
+}
+
+T 'miserc write: an existing multiline assignment collapses to one line in place' {
+  $text = MisercText @(
+    'minimum_release_age = "1d"',
+    'env = [',
+    '  ' + (DqName 'a') + ', # first',
+    '  ' + (SqName 'b') + ',',
+    ']',
+    'z = 9'
+  )
+  $expected = MisercText @('minimum_release_age = "1d"', ('env = [' + (SqName 'b') + ', ' + (DqName 'c') + ', ' + (DqName 'pmsec') + ']'), 'z = 9')
+  return (AssertMisercWrite 'collapse' $text @('b','c') $expected)
+}
+
+T 'miserc write: local quoting is reused, leftmost token first' {
+  $ok = AssertMisercWrite 'single-quoted local token' (MisercText @('env = [' + (SqName 'work') + ']')) @('work') ('env = [' + (SqName 'work') + ', ' + (DqName 'pmsec') + ']' + $script:NL)
+  $ok = $ok -and (AssertMisercWrite 'leftmost duplicate wins' (MisercText @((MisercArray @((DqName 'work'), (SqName 'work'))))) @('work') ((MisercArray @((DqName 'work'), (DqName 'pmsec'))) + $script:NL))
+  return $ok
+}
+
+T 'miserc write: inherited names are serialized canonically' {
+  $ok = AssertMisercWrite 'plain name' '' @('work') ('env = [' + (DqName 'work') + ', ' + (DqName 'pmsec') + ']' + $script:NL)
+  $ok = $ok -and (AssertMisercWrite 'double quote forces literals' '' @('a"b') ('env = [' + (SqName 'a"b') + ', ' + (DqName 'pmsec') + ']' + $script:NL))
+  $ok = $ok -and (AssertMisercWrite 'backslash forces literals' '' @('a\b') ('env = [' + (SqName 'a\b') + ', ' + (DqName 'pmsec') + ']' + $script:NL))
+  $ok = $ok -and (AssertMisercWriteReject 'both quote kinds' '' @('a"b''c') 'env name cannot be represented without escapes')
+  $ok = $ok -and (AssertMisercWriteReject 'control character' '' @('a' + [char]9 + 'b') 'env name cannot be represented without escapes')
+  return $ok
+}
+
+T 'miserc write: bytes outside the assignment are preserved' {
+  $bom = [string][char]0xFEFF
+  $crlf = [string][char]13 + $script:NL
+  $bomText = $bom + (MisercText @('env = [' + (DqName 'a') + ']'))
+  $bomExpected = $bom + (MisercText @((MisercArray @((DqName 'a'), (DqName 'pmsec')))))
+  $ok = AssertMisercWrite 'BOM' $bomText @('a') $bomExpected
+  $crlfText = 'env = [' + $crlf + '  ' + (DqName 'a') + ',' + $crlf + ']' + $crlf + 'x = 1' + $crlf
+  $crlfExpected = (MisercArray @((DqName 'a'), (DqName 'pmsec'))) + $crlf + 'x = 1' + $crlf
+  $ok = $ok -and (AssertMisercWrite 'CRLF' $crlfText @('a') $crlfExpected)
+  $noEolText = 'x = 1' + $script:NL + 'env = [' + (DqName 'a') + ']'
+  $noEolExpected = 'x = 1' + $script:NL + 'env = [' + (DqName 'a') + ', ' + (DqName 'pmsec') + ']'
+  $ok = $ok -and (AssertMisercWrite 'no final newline' $noEolText @('a') $noEolExpected)
+  $commentText = MisercText @('  env = [' + (DqName 'a') + '] # keep me', 'z = 1')
+  $commentExpected = MisercText @('  ' + (MisercArray @((DqName 'a'), (DqName 'pmsec'))) + ' # keep me', 'z = 1')
+  return ($ok -and (AssertMisercWrite 'indentation and trailing comment' $commentText @('a') $commentExpected))
+}
+
+T 'miserc write: an absent assignment is inserted before the first table' {
+  $text = MisercText @('minimum_release_age = "1d"', '', '[tools]', 'x = 1')
+  $expected = MisercText @('minimum_release_age = "1d"', '', (MisercArray @((DqName 'pmsec'))), '[tools]', 'x = 1')
+  $ok = AssertMisercWrite 'before the table' $text @() $expected
+  $ok = $ok -and (AssertMisercWrite 'file without a trailing newline' 'a = 1' @() ('a = 1' + $script:NL + (MisercArray @((DqName 'pmsec'))) + $script:NL))
+  $ok = $ok -and (AssertMisercWrite 'leading table' (MisercText @('[tools]', 'x = 1')) @() (MisercText @((MisercArray @((DqName 'pmsec'))), '[tools]', 'x = 1')))
+  $tableText = MisercText @('[a]', '[b]')
+  $tableExpected = MisercText @((MisercArray @((DqName 'work'), (DqName 'pmsec'))), '[a]', '[b]')
+  $ok = $ok -and (AssertMisercWrite 'tables without root content' $tableText @('work') $tableExpected)
+  return $ok
+}
+
+T 'miserc write: competing env tables and dotted keys are refused' {
+  $ok = AssertMisercWriteReject 'env table' (MisercText @('[env]', 'a = 1')) @('a') 'env table conflicts with the env array'
+  $ok = $ok -and (AssertMisercWriteReject 'array-of-tables header' (MisercText @('[[env]]', 'a = 1')) @('a') 'env table conflicts with the env array')
+  $ok = $ok -and (AssertMisercWriteReject 'padded header' (MisercText @('[ env ]', 'a = 1')) @('a') 'env table conflicts with the env array')
+  $ok = $ok -and (AssertMisercWriteReject 'double-quoted header' (MisercText @('["env"]', 'a = 1')) @('a') 'env table conflicts with the env array')
+  $ok = $ok -and (AssertMisercWriteReject 'single-quoted header' (MisercText @("['env']", 'a = 1')) @('a') 'env table conflicts with the env array')
+  $ok = $ok -and (AssertMisercWriteReject 'indented header' (MisercText @('  [env]', 'a = 1')) @('a') 'env table conflicts with the env array')
+  $ok = $ok -and (AssertMisercWriteReject 'dotted key' (MisercText @('env.foo = 1')) @('a') 'env table conflicts with the env array')
+  $ok = $ok -and (AssertMisercWriteReject 'dotted key in a table' (MisercText @('[tools]', 'env.foo = 1')) @('a') 'env table conflicts with the env array')
+  return $ok
+}
+
+T 'miserc write: writing the same inherited list twice is byte-identical' {
+  $text = MisercText @('env = [', '  ' + (DqName 'a'), ']', '[tools]', 'x = 1')
+  $first = WriteMiserc $text @('a','b')
+  $second = WriteMiserc ([string]$first['Text']) @('a','b')
+  $ok = AssertEq 'first ok' 'True' ([string]$first['Ok'])
+  return ($ok -and (AssertEq 'second write is identical' ([string]$first['Text']) ([string]$second['Text'])))
+}
+
+T 'miserc error text keeps the frozen envelope' {
+  $ok = AssertEq 'shape' ('invalid env in miserc.local.toml: env must be an array') (Get-MisercErrorText -Path 'miserc.local.toml' -Reason 'env must be an array')
+  return ($ok -and (AssertEq 'windows path' ('invalid env in C:\Users\me\.config\mise\miserc.local.toml: malformed env array separator') (Get-MisercErrorText -Path 'C:\Users\me\.config\mise\miserc.local.toml' -Reason 'malformed env array separator')))
+}
+
 # ---------- mise layering: CLI smoke ----------
 
 T 'legacy CLI smoke: enable and check on the default fake scope are unchanged' {

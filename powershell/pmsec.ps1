@@ -797,6 +797,508 @@ function Get-MiseScopeContext($Scope) {
   return $ctx
 }
 
+# ---- narrow miserc env helper ----
+
+# The only multi-line shape pmsec needs out of a miserc file: a bare top-level
+# `env = [...]` array of one-line quoted strings. These helpers are pure text
+# transformations - no filesystem access, no throw at the public boundary - so a
+# caller can validate, report, and only then write. Read-MisercEnv returns the
+# decoded names plus the exact character range the writer replaces; everything
+# outside that range is preserved byte for byte.
+#
+# The "root region" is everything from the start of the text (after a leading
+# BOM, which is skipped but preserved) to the first line whose first
+# non-whitespace character is `[` outside a string or a comment. Only a bare,
+# case-sensitive `env` key there is a target. The scanner tracks enough
+# structure (basic/literal strings, `"""`/`'''` blocks, comments) to keep
+# env-like text and table headers inside them from being misparsed; it does not
+# validate TOML in general.
+#
+# deliberate: Issue-#194 TOML subset only; unsupported forms fail closed. Upgrade path: extend this parser per port behind the same contract.
+#
+# node/src/util/miseconf.mjs and python/src/pmsec/util/miseconf.py implement the
+# same contract. The Reason strings are frozen across ports and must stay
+# identical: they are the diagnostic a later phase surfaces verbatim.
+#
+# Offsets are UTF-16 code-unit indices (PowerShell strings are UTF-16), which is
+# also what Substring takes, so splicing is exact. Unicode names pass through
+# opaque: only ASCII boundaries are ever compared or cut on.
+
+# A bare `env` token only counts when followed by one of these, so `envelope`
+# and `envoy` stay unrelated keys.
+$script:MisercBareKeyEnd = [char[]]@(' ', "`t", "`r", "`n", [char]12, [char]11, '=')
+
+# Internal failure signal. PowerShell wraps a thrown exception differently
+# between 5.1 and 7, so the reason rides inside the message behind a fixed
+# marker that only this file produces; the public helpers catch it and turn it
+# into the structured result. Unexpected exceptions are rethrown instead of
+# being reported as a parse reason.
+$script:MisercReasonMarker = 'pmsec miserc env: '
+
+function Stop-MisercParse([string]$Reason) {
+  throw ($script:MisercReasonMarker + $Reason)
+}
+
+function Get-MisercCaughtReason($ErrorRecord) {
+  $message = ''
+  try { $message = [string]$ErrorRecord.Exception.Message } catch { $message = '' }
+  if ([string]::IsNullOrEmpty($message)) { return $null }
+  $at = $message.IndexOf($script:MisercReasonMarker, [StringComparison]::Ordinal)
+  if ($at -lt 0) { return $null }
+  return $message.Substring($at + $script:MisercReasonMarker.Length)
+}
+
+# `invalid env in <path>: <reason>` - the one envelope every port prints.
+function Get-MisercErrorText([string]$Path, [string]$Reason) {
+  return ('invalid env in ' + $Path + ': ' + $Reason)
+}
+
+# Reads the top-level `env` array of a miserc file.
+#   Success: @{ Ok = $true; Defined = $true; Env = <string[]>; Start; End; Reason = '' }
+#            Start is the offset of the bare `env` key, End one past the closing
+#            `]`; with no top-level assignment Defined = $false and Start = End = -1.
+#   Failure: @{ Ok = $false; Defined = $false; Env = @(); Start = -1; End = -1; Reason = <reason> }
+# -Path is part of the API so callers can hand the same pair to
+# Get-MisercErrorText; the result carries the bare reason.
+function Read-MisercEnv([string]$Text, [string]$Path) {
+  if ($null -eq $Text) { $Text = '' }
+  $analysis = $null
+  try {
+    $analysis = Get-MisercAnalysis $Text
+  } catch {
+    $reason = Get-MisercCaughtReason $_
+    if ($null -eq $reason) { throw }
+    return @{ Ok = $false; Defined = $false; Env = @(); Start = -1; End = -1; Reason = $reason }
+  }
+  $assignment = $analysis['Assignment']
+  if ($null -eq $assignment) {
+    return @{ Ok = $true; Defined = $false; Env = @(); Start = -1; End = -1; Reason = '' }
+  }
+  $names = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($element in $assignment['Elements']) { $names.Add([string]$element['Value']) }
+  return @{
+    Ok = $true; Defined = $true; Env = $names.ToArray()
+    Start = [int]$assignment['KeyStart']; End = [int]$assignment['End']; Reason = ''
+  }
+}
+
+# Rewrites the top-level `env` array so it holds -Inherited (every exact `pmsec`
+# removed) plus one `pmsec` last, as a single canonical line. An existing
+# assignment is replaced from its bare key through its closing `]`, reusing the
+# local quoting of names that are already present (leftmost token wins); every
+# other byte - BOM, CRLF, comments, unrelated tables, a missing final newline -
+# is preserved. Without an assignment, one line is inserted at the end of the
+# root region. The result is byte-identical when applied twice.
+#   Success: @{ Ok = $true; Text = <string>; Reason = '' }
+#   Failure: @{ Ok = $false; Text = $null; Reason = <reason> }
+function Update-MisercEnvText([string]$Text, [string[]]$Inherited, [string]$Path) {
+  if ($null -eq $Text) { $Text = '' }
+  if ($null -eq $Inherited) { $Inherited = @() }
+  $output = $null
+  try {
+    $analysis = Get-MisercAnalysis $Text
+    # Validate before touching the text: a conflicting shape must never be
+    # rewritten, since a later mise would then see two sources for `env`.
+    if ($analysis['EnvTable'] -ge 0 -or $analysis['DottedEnv'] -ge 0) {
+      Stop-MisercParse 'env table conflicts with the env array'
+    }
+    $assignment = $analysis['Assignment']
+    $local = @()
+    if ($null -ne $assignment) { $local = $assignment['Elements'] }
+
+    $names = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in $Inherited) {
+      if ($null -eq $name) { continue }
+      if ([string]$name -ceq 'pmsec') { continue }
+      $names.Add([string]$name)
+    }
+    $names.Add('pmsec')
+
+    $tokens = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in $names) {
+      $token = $null
+      foreach ($element in $local) {
+        if ([string]$element['Value'] -ceq $name) { $token = [string]$element['Token']; break }
+      }
+      if ($null -eq $token) { $tokens.Add((ConvertTo-MisercEnvToken $name)) } else { $tokens.Add($token) }
+    }
+    $line = 'env = []'
+    if ($tokens.Count -gt 0) { $line = 'env = [' + ($tokens -join ', ') + ']' }
+
+    if ($null -ne $assignment) {
+      $start = [int]$assignment['KeyStart']
+      $end = [int]$assignment['End']
+      $output = $Text.Substring(0, $start) + $line + $Text.Substring($end)
+    } else {
+      # Absent assignment: land on the last line of the root region, i.e. just
+      # before the first real table header (or at the end of the file).
+      $at = $Text.Length
+      if ([int]$analysis['RootEnd'] -ge 0) { $at = [int]$analysis['RootEnd'] }
+      $before = $Text.Substring(0, $at)
+      $separator = ''
+      if ($before.Length -gt 0 -and -not $before.EndsWith("`n")) { $separator = "`n" }
+      $output = $before + $separator + $line + "`n" + $Text.Substring($at)
+    }
+  } catch {
+    $reason = Get-MisercCaughtReason $_
+    if ($null -eq $reason) { throw }
+    return @{ Ok = $false; Text = $null; Reason = $reason }
+  }
+  return @{ Ok = $true; Text = $output; Reason = '' }
+}
+
+# ---- narrow miserc env helper: scanner ----
+
+# Ordinal prefix test that tolerates a truncated tail: PowerShell 5.1's .NET has
+# no StartsWith(string, int) overload, and CompareOrdinal throws out of range.
+function Test-MisercAt([string]$Text, [int]$Index, [string]$Token) {
+  if (([string]::IsNullOrEmpty($Token))) { return $true }
+  if ($Index -lt 0) { return $false }
+  if ($Index + $Token.Length -gt $Text.Length) { return $false }
+  return ([string]::CompareOrdinal($Text, $Index, $Token, 0, $Token.Length) -eq 0)
+}
+
+function Test-MisercSpace([char]$Char) {
+  return ($Char -eq ' ' -or $Char -eq "`t" -or $Char -eq "`r" -or $Char -eq "`n")
+}
+
+# TOML lets a multiline string end with up to two quotes that belong to its
+# content (`"""a""""`), so consume the whole run instead of stopping short.
+function Get-MisercQuoteRun([string]$Text, [int]$Index) {
+  $quote = $Text[$Index]
+  $j = $Index
+  while ($j -lt $Text.Length -and $Text[$j] -eq $quote -and ($j - $Index) -lt 5) { $j++ }
+  return ($j - $Index)
+}
+
+# Header name without brackets, or $null when the line is not a closed header.
+# Keeps quoted segments intact so `["env"]` still yields `"env"` for unquoting.
+function Get-MisercHeaderName([string]$Text, [int]$Index) {
+  $double = ($Index + 1 -lt $Text.Length -and $Text[$Index + 1] -eq '[')
+  $quote = ''
+  $name = New-Object System.Text.StringBuilder
+  $start = $Index + 1
+  if ($double) { $start = $Index + 2 }
+  for ($j = $start; $j -lt $Text.Length; $j++) {
+    $c = $Text[$j]
+    if ($c -eq "`n") { return $null }
+    if ($quote -ne '') {
+      if ([string]$c -eq $quote) { $quote = '' }
+      [void]$name.Append($c)
+      continue
+    }
+    if ($c -eq '"' -or $c -eq "'") { $quote = [string]$c; [void]$name.Append($c); continue }
+    if ($c -eq '#') { return $null }
+    if ($c -eq ']') {
+      if ($double) {
+        if ($j + 1 -ge $Text.Length -or $Text[$j + 1] -ne ']') { return $null }
+      }
+      return $name.ToString().Trim()
+    }
+    [void]$name.Append($c)
+  }
+  return $null
+}
+
+function Remove-MisercQuotes([string]$Value) {
+  if ($Value.Length -lt 2) { return $Value }
+  $first = $Value[0]
+  if (($first -eq '"' -or $first -eq "'") -and $Value[$Value.Length - 1] -eq $first) {
+    return $Value.Substring(1, $Value.Length - 2)
+  }
+  return $Value
+}
+
+# `["env"]`, `[ 'env' ]`, `[env]` all name the same table.
+function ConvertTo-MisercHeaderKey([string]$Name) {
+  $parts = $Name.Split('.')
+  for ($k = 0; $k -lt $parts.Count; $k++) { $parts[$k] = Remove-MisercQuotes $parts[$k].Trim() }
+  return ($parts -join '.')
+}
+
+# Classifies one line-start token. `bare` is the exact token `env` followed by
+# whitespace/`=`/end-of-line; `dotted` is `env.` (a dotted key, never the array);
+# `quoted` is `"env"`/`'env'` used as a key, which is outside the subset. $null
+# means "unrelated", which is the answer for nearly every line.
+function Get-MisercKeyKind([string]$Text, [int]$Index, [int]$Len) {
+  $c = $Text[$Index]
+  if ($c -eq '"' -or $c -eq "'") {
+    $quote = [string]$c
+    if (Test-MisercAt $Text $Index ($quote + $quote + $quote)) { return $null }
+    $raw = ''
+    $j = $Index + 1
+    while ($j -lt $Len -and $Text[$j] -ne $c) {
+      if ($Text[$j] -eq "`n") { return $null }
+      if ($c -eq '"' -and $Text[$j] -eq '\') {
+        # A quoted key with escapes is out of subset either way; copy the pair
+        # so it can never read as the bare `env` token.
+        if ($j + 1 -lt $Len) { $raw = $raw + $Text.Substring($j, 2) } else { $raw = $raw + [string]$Text[$j] }
+        $j = $j + 2
+        continue
+      }
+      $raw = $raw + [string]$Text[$j]
+      $j++
+    }
+    if ($j -ge $Len -or $raw -ne 'env') { return $null }
+    if ($j + 1 -lt $Len -and $Text[$j + 1] -eq '.') { return $null }
+    $k = $j + 1
+    while ($k -lt $Len -and (Test-MisercSpace $Text[$k])) { $k++ }
+    if ($k -lt $Len -and $Text[$k] -eq '=') { return 'quoted' }
+    return $null
+  }
+  if (Test-MisercAt $Text $Index 'env') {
+    # A bare key may end the file; that still counts, so the assignment parser
+    # can report the missing `=`.
+    if ($Index + 3 -ge $Len) { return 'bare' }
+    $next = $Text[$Index + 3]
+    if ($next -eq '.') { return 'dotted' }
+    if ($script:MisercBareKeyEnd -contains $next) { return 'bare' }
+  }
+  return $null
+}
+
+# One pass over the whole text. Tracks strings and comments so their contents
+# are never read as structure, and records every offset the callers need:
+#   RootEnd     - line start of the first table header (-1 when there is none)
+#   BareEnv     - root-region offsets of bare `env` keys, in text order
+#   QuotedEnv   - first root-region `"env"`/`'env'` key, or -1
+#   DottedEnv   - first `env.` key anywhere, or -1
+#   EnvTable    - first `[env]`/`[[env]]` header anywhere, or -1
+#   Unterminated- a `"""`/`'''` block that never closes
+function Get-MisercLex([string]$Text) {
+  $n = $Text.Length
+  $i = 0
+  if ($n -gt 0 -and $Text[0] -eq [char]0xFEFF) { $i = 1 }
+  $state = 'code'
+  $atLineStart = $true
+  $lineStart = $i
+  $inRoot = $true
+  $rootEnd = -1
+  $quotedEnv = -1
+  $dottedEnv = -1
+  $envTable = -1
+  $bareEnv = New-Object 'System.Collections.Generic.List[int]'
+
+  while ($i -lt $n) {
+    $c = $Text[$i]
+    if ($state -eq 'comment') {
+      if ($c -eq "`n") { $state = 'code'; $atLineStart = $true; $lineStart = $i + 1 }
+      $i++
+      continue
+    }
+    if ($state -eq 'ml-basic' -or $state -eq 'ml-literal') {
+      if ($state -eq 'ml-basic' -and $c -eq '\') { $i = $i + 2; $atLineStart = $false; continue }
+      $delim = '"""'
+      if ($state -eq 'ml-literal') { $delim = "'''" }
+      if (Test-MisercAt $Text $i $delim) {
+        $state = 'code'
+        $i = $i + (Get-MisercQuoteRun $Text $i)
+        $atLineStart = $false
+        continue
+      }
+      $atLineStart = ($c -eq "`n")
+      if ($atLineStart) { $lineStart = $i + 1 }
+      $i++
+      continue
+    }
+    if ($state -eq 'basic' -or $state -eq 'literal') {
+      if ($state -eq 'basic' -and $c -eq '\') { $i = $i + 2; continue }
+      $quote = "'"
+      if ($state -eq 'basic') { $quote = '"' }
+      if ([string]$c -eq $quote) { $state = 'code'; $i++; continue }
+      # A one-line string cannot span a newline; the subset does not try to
+      # validate that, so the line simply ends it.
+      if ($c -eq "`n") { $state = 'code'; $atLineStart = $true; $lineStart = $i + 1 }
+      $i++
+      continue
+    }
+    # state -eq 'code'
+    if ($c -eq "`n") { $atLineStart = $true; $lineStart = $i + 1; $i++; continue }
+    if ($c -eq ' ' -or $c -eq "`t" -or $c -eq "`r" -or $c -eq [char]12 -or $c -eq [char]11) { $i++; continue }
+    if ($c -eq '#') { $state = 'comment'; $i++; continue }
+    if ($atLineStart) {
+      $atLineStart = $false
+      if ($c -eq '[') {
+        $name = Get-MisercHeaderName $Text $i
+        if ($inRoot) { $inRoot = $false; $rootEnd = $lineStart }
+        if ($envTable -lt 0 -and $null -ne $name -and (ConvertTo-MisercHeaderKey $name) -eq 'env') { $envTable = $i }
+      } else {
+        $kind = Get-MisercKeyKind $Text $i $n
+        if ($null -ne $kind) {
+          if ($kind -eq 'dotted') {
+            if ($dottedEnv -lt 0) { $dottedEnv = $i }
+          } elseif ($inRoot) {
+            if ($kind -eq 'quoted') {
+              if ($quotedEnv -lt 0) { $quotedEnv = $i }
+            } else {
+              $bareEnv.Add($i)
+            }
+          }
+        }
+      }
+    }
+    if ($c -eq '"') {
+      if (Test-MisercAt $Text $i '"""') { $state = 'ml-basic'; $i = $i + 3 } else { $state = 'basic'; $i++ }
+      continue
+    }
+    if ($c -eq "'") {
+      if (Test-MisercAt $Text $i "'''") { $state = 'ml-literal'; $i = $i + 3 } else { $state = 'literal'; $i++ }
+      continue
+    }
+    $i++
+  }
+
+  return @{
+    RootEnd = $rootEnd
+    BareEnv = $bareEnv
+    QuotedEnv = $quotedEnv
+    DottedEnv = $dottedEnv
+    EnvTable = $envTable
+    Unterminated = ($state -eq 'ml-basic' -or $state -eq 'ml-literal')
+  }
+}
+
+# Skips spaces, tabs, CRs, newlines, and `#` comments. Used between every token
+# of an assignment, so an array may be spread over any number of lines.
+function Skip-MisercTrivia([string]$Text, [int]$Index) {
+  $n = $Text.Length
+  $i = $Index
+  while ($true) {
+    while ($i -lt $n -and (Test-MisercSpace $Text[$i])) { $i++ }
+    if ($i -lt $n -and $Text[$i] -eq '#') {
+      while ($i -lt $n -and $Text[$i] -ne "`n") { $i++ }
+      continue
+    }
+    return $i
+  }
+}
+
+# Scans a one-line basic string starting at the opening `"` and returns the
+# offset of the closing quote. The subset carries no escapes, so a backslash is
+# fatal rather than decoded.
+function Read-MisercBasicString([string]$Text, [int]$Index) {
+  if (Test-MisercAt $Text $Index '"""') { Stop-MisercParse 'multiline strings are unsupported' }
+  $j = $Index + 1
+  while ($true) {
+    if ($j -ge $Text.Length -or $Text[$j] -eq "`n") { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$j] -eq '\') { Stop-MisercParse 'escape sequences are unsupported' }
+    if ($Text[$j] -eq '"') { return $j }
+    $j++
+  }
+}
+
+# Scans a one-line literal string starting at the opening `'`. Backslashes are
+# ordinary content here, which is why `['say\hi']` is accepted verbatim.
+function Read-MisercLiteralString([string]$Text, [int]$Index) {
+  if (Test-MisercAt $Text $Index "'''") { Stop-MisercParse 'multiline strings are unsupported' }
+  $j = $Index + 1
+  while ($true) {
+    if ($j -ge $Text.Length -or $Text[$j] -eq "`n") { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$j] -eq "'") { return $j }
+    $j++
+  }
+}
+
+# Parses the array that must follow `env =`. $Start is the offset of `[`.
+# Returns the offset just past the closing `]` plus every element's original
+# token and decoded value.
+function Read-MisercArray([string]$Text, [int]$Start) {
+  $n = $Text.Length
+  $elements = New-Object 'System.Collections.Generic.List[hashtable]'
+  $i = $Start + 1
+  while ($true) {
+    $i = Skip-MisercTrivia $Text $i
+    if ($i -ge $n) { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$i] -eq ']') { $i++; break }
+    # A comma where an element is expected is leading or doubled.
+    if ($Text[$i] -eq ',') { Stop-MisercParse 'malformed env array separator' }
+    $at = $i
+    $close = -1
+    if ($Text[$i] -eq '"') {
+      $close = Read-MisercBasicString $Text $i
+    } elseif ($Text[$i] -eq "'") {
+      $close = Read-MisercLiteralString $Text $i
+    } else {
+      Stop-MisercParse 'env array elements must be single-line quoted strings'
+    }
+    $elements.Add(@{
+      Token = $Text.Substring($at, $close + 1 - $at)
+      Value = $Text.Substring($at + 1, $close - $at - 1)
+    })
+    $i = Skip-MisercTrivia $Text ($close + 1)
+    if ($i -ge $n) { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$i] -eq ',') { $i++; continue }
+    if ($Text[$i] -eq ']') { $i++; break }
+    Stop-MisercParse 'malformed env array separator'
+  }
+  $end = $i
+  # Only whitespace and a trailing comment may follow the closing bracket.
+  $j = $i
+  while ($j -lt $n -and ($Text[$j] -eq ' ' -or $Text[$j] -eq "`t" -or $Text[$j] -eq "`r")) { $j++ }
+  if ($j -lt $n -and $Text[$j] -eq '#') { while ($j -lt $n -and $Text[$j] -ne "`n") { $j++ } }
+  if ($j -lt $n -and $Text[$j] -ne "`n") { Stop-MisercParse 'unexpected content after env array' }
+  return @{ End = $end; Elements = $elements }
+}
+
+# Parses one top-level `env` key occurrence. $KeyStart is the offset of the
+# `env` token; the returned range spans the key through the closing `]` so the
+# writer can replace exactly those characters.
+function Read-MisercAssignment([string]$Text, [int]$KeyStart) {
+  $n = $Text.Length
+  $i = Skip-MisercTrivia $Text ($KeyStart + 3)
+  if ($i -ge $n -or $Text[$i] -ne '=') { Stop-MisercParse 'malformed env assignment' }
+  $i = Skip-MisercTrivia $Text ($i + 1)
+  if ($i -ge $n) { Stop-MisercParse 'unterminated env assignment' }
+  # Any scalar is the wrong shape; a string is still scanned first so an
+  # unterminated or escaped one reports its own cause.
+  if ($Text[$i] -eq '"') {
+    [void](Read-MisercBasicString $Text $i)
+    Stop-MisercParse 'env must be an array'
+  }
+  if ($Text[$i] -eq "'") {
+    [void](Read-MisercLiteralString $Text $i)
+    Stop-MisercParse 'env must be an array'
+  }
+  if ($Text[$i] -ne '[') { Stop-MisercParse 'env must be an array' }
+  $array = Read-MisercArray $Text $i
+  return @{ KeyStart = $KeyStart; End = [int]$array['End']; Elements = $array['Elements'] }
+}
+
+# Validates everything before a caller can act on the result: a rejected file
+# must report one structured reason and never a partial reading.
+function Get-MisercAnalysis([string]$Text) {
+  $lex = Get-MisercLex $Text
+  if ([int]$lex['QuotedEnv'] -ge 0) { Stop-MisercParse 'quoted env key is unsupported' }
+  # Keep scanning past the first assignment so a second top-level `env` key is
+  # reported as a duplicate instead of the first one being returned silently.
+  $assignment = $null
+  foreach ($offset in $lex['BareEnv']) {
+    if ($null -ne $assignment) { Stop-MisercParse 'duplicate top-level env assignment' }
+    $assignment = Read-MisercAssignment $Text $offset
+  }
+  if ($lex['Unterminated']) { Stop-MisercParse 'unterminated string in file' }
+  return @{
+    Assignment = $assignment
+    RootEnd = [int]$lex['RootEnd']
+    EnvTable = [int]$lex['EnvTable']
+    DottedEnv = [int]$lex['DottedEnv']
+  }
+}
+
+# Serializes a name the subset can express without escapes: double quotes by
+# default, single quotes when the value holds `"` or a backslash, and a hard
+# failure when neither form can carry it (both quote kinds, or a control
+# character that a one-line string cannot hold).
+function ConvertTo-MisercEnvToken([string]$Value) {
+  if ($Value -match '[\x00-\x1F\x7F]') { Stop-MisercParse 'env name cannot be represented without escapes' }
+  $needsLiteral = $false
+  if ($Value.Contains('"')) { $needsLiteral = $true }
+  if ($Value.Contains('\')) { $needsLiteral = $true }
+  if (-not $needsLiteral) { return ('"' + $Value + '"') }
+  if ($Value.Contains("'")) { Stop-MisercParse 'env name cannot be represented without escapes' }
+  return ("'" + $Value + "'")
+}
+
 # ---------- line buffer ----------
 # Mirrors node/src/util/lines.mjs. LinesBuf is an ArrayList of strings; the
 # rendered file is buf joined by \n with a trailing \n iff non-empty.
