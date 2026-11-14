@@ -214,6 +214,15 @@ def _scan_structure(text: str) -> _Structure:
             # A one-line string. Backslashes escape in basic strings, so a
             # `\"` inside one must not be taken for the closing quote.
             if state == '"' and ch == "\\":
+                if index + 1 >= length or text[index + 1] == "\n":
+                    # A trailing backslash cannot carry a one-line string across
+                    # the newline: this subset does not validate general TOML, so
+                    # the string simply ends with its line. Leaving `index` on the
+                    # newline hands the rest of the file back to code state.
+                    state = ""
+                    opened_at = -1
+                    index += 1
+                    continue
                 index += 2
                 continue
             if ch == state:

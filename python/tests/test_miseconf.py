@@ -122,6 +122,25 @@ def test_one_line_strings_elsewhere_do_not_hide_the_key():
     assert read_env("a = \"x\" # env = [\"fake\"]\nb = 'y'\nenv = [\"real\"]\n") == ["real"]
 
 
+def test_a_trailing_backslash_ends_the_one_line_string_at_the_newline():
+    # The subset does not validate general TOML, so a backslash that lands on the
+    # line end does not let the string cross the newline: the line still ends it.
+    assert read_env('x = "abc\\\nenv = ["work"]\n') == ["work"]
+    assert read_env('x = "abc\\\ny = "def\\\nenv = ["work"]\n') == ["work"]
+
+
+def test_a_trailing_backslash_in_a_literal_string_also_ends_the_line():
+    assert read_env("x = 'abc\\\nenv = [\"work\"]\n") == ["work"]
+
+
+def test_an_escaped_quote_does_not_close_the_string_but_the_newline_does():
+    assert read_env('x = "a\\"b\nenv = ["work"]\n') == ["work"]
+
+
+def test_an_env_assignment_before_a_trailing_backslash_opener_is_found():
+    assert read_env('env = ["work"]\nx = "abc\\\n') == ["work"]
+
+
 def test_no_final_newline_is_fine():
     assert read_env('env = ["a"]') == ["a"]
 
