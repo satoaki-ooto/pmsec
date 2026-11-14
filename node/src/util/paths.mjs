@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { dirname, join, isAbsolute } from "node:path";
+import { dirname, join, isAbsolute, posix, win32 } from "node:path";
 import { existsSync } from "node:fs";
 
 export function npmrcPath(env = process.env, home = homedir()) {
@@ -72,6 +72,31 @@ export function miseConfigPath(env = process.env, home = homedir(), platform = p
   }
   const base = env.XDG_CONFIG_HOME || join(home, ".config");
   return join(base, "mise", "config.toml");
+}
+
+// Every path the layered (post-2026.11) config layout touches, resolved at once
+// so a caller can never mix legacy and new locations. Pure: no filesystem
+// access, and joins follow the requested platform rather than the host so
+// simulated-win32 tests stay deterministic. `legacyConfig` deliberately keeps
+// delegating to miseConfigPath (including its truthiness rule for an empty
+// MISE_GLOBAL_CONFIG_FILE); `miseDir` never falls back to Windows'
+// %LOCALAPPDATA% — it is ~/.config/mise on every OS unless overridden.
+export function misePaths(env = process.env, home = homedir(), platform = process.platform, cwd = process.cwd()) {
+  const p = platform === "win32" ? win32 : posix;
+  const miseDir = env.MISE_CONFIG_DIR
+    || (env.XDG_CONFIG_HOME ? p.join(env.XDG_CONFIG_HOME, "mise") : p.join(home, ".config", "mise"));
+  const systemMiserc = env.MISE_SYSTEM_CONFIG_DIR
+    ? p.join(env.MISE_SYSTEM_CONFIG_DIR, "miserc.toml")
+    : (platform === "win32" ? p.join(win32.parse(cwd).root, "etc", "mise", "miserc.toml") : "/etc/mise/miserc.toml");
+  return {
+    legacyConfig: miseConfigPath(env, home, platform),
+    miseDir,
+    baseConfig: p.join(miseDir, "config.toml"),
+    pmsecConfig: p.join(miseDir, "config.pmsec.toml"),
+    localMiserc: p.join(miseDir, "miserc.local.toml"),
+    sharedMiserc: p.join(miseDir, "miserc.toml"),
+    systemMiserc,
+  };
 }
 
 export function aubeConfigPath(env = process.env, home = homedir(), platform = process.platform) {
