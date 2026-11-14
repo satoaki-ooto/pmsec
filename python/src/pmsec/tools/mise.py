@@ -8,13 +8,17 @@ from pmsec.util.extras import apply_extras, read_extras, remove_extras
 from pmsec.util.io import write_atomic
 from pmsec.util.lines import read_key, remove_key, set_key
 from pmsec.util.paths import mise_config_path
-from pmsec.util.version import build_preflight
+from pmsec.util.version import build_preflight, detect_version, gte
 
 NAME = "mise"
 KEY = "minimum_release_age"
 SECTION = "settings"
 DOCS = "https://mise.jdx.dev/configuration/settings.html#minimum_release_age"
 MIN_BIN = (2026, 4, 22)
+# mise 2026.11.0 is the first version that reads config.pmsec.toml beside its
+# own config.toml. This gate is independent of the cooldown floor above: the
+# floor decides whether to warn, this one decides which config layout we use.
+NEW_MODE_MIN = (2026, 11, 0)
 EXTRAS = [
     {"key": "paranoid", "expected": "true", "line": "paranoid = true", "section": SECTION},
     {"key": "gpg_verify", "expected": "true", "line": "gpg_verify = true", "section": SECTION},
@@ -49,6 +53,29 @@ _DURATION = re.compile(
 
 def path(ctx: Context) -> Path:
     return mise_config_path(ctx.env, ctx.home, ctx.platform)
+
+
+# Same override variable build_preflight derives, so one pin drives both the
+# cooldown preflight and the config mode.
+_VERSION_ENV = f"PMSEC_{NAME.upper()}_VERSION"
+
+
+def supports_new_mode(ctx: Context) -> bool:
+    """True when the layered config.pmsec.toml mode applies.
+
+    Two independent conditions: mise is new enough to read the layered config,
+    and the user has not pinned mise to one file with MISE_GLOBAL_CONFIG_FILE
+    (empty counts as unset, per the Phase-1 contract).
+
+    The version is detected on every call. Nothing is cached: mode can change
+    between invocations of the same process env (mise upgraded, file override
+    added), and tests must be able to flip the answer on a reused Context.
+    Undetectable (`none`), unknown and malformed versions stay in legacy mode.
+    """
+    version = detect_version(NAME, env=ctx.env, override_key=_VERSION_ENV)
+    if not gte(version, NEW_MODE_MIN):
+        return False
+    return not ctx.env.get("MISE_GLOBAL_CONFIG_FILE")
 
 
 def _parse_days(value: str | None) -> int | None:
