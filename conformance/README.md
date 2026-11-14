@@ -32,14 +32,17 @@ carries the step's exit code, stdout, and stderr. In `expected_files`, a
 `null` value asserts the file does not exist; any other value is the exact
 expected file body.
 
-Every case runs against a pinned environment: `HOME`, `XDG_CONFIG_HOME`, and
-`MISE_SYSTEM_CONFIG_DIR` (`<HOME>/etc-mise`, which keeps a host
-`/etc/mise/miserc.toml` out of system-selector cases) point inside the temp
-dir, and every `PMSEC_<TOOL>_VERSION` defaults to `none`. A case can pin
-mise's reported version via `PMSEC_MISE_VERSION` in `env`: `2026.11.0`
-selects the new config mode, `2026.10.25` the legacy one, and `none` — the
-runner default — means mise is undetectable and ports take the legacy path.
-Existing mise cases rely on `none`.
+Every case runs against a pinned environment: `HOME`, `XDG_CONFIG_HOME`,
+`COMPOSER_HOME`, and `MISE_SYSTEM_CONFIG_DIR` (`<HOME>/etc-mise`, so a host
+`/etc/mise/miserc.toml` can never reach a case) point inside the temp dir,
+and `PMSEC_<TOOL>_VERSION` is `none` for every tool pmsec supports, so no
+host-installed version leaks into the output. A case can override a tool's
+reported version in `env`, e.g. `PMSEC_MISE_VERSION`. Existing mise cases
+rely on the default `none` (mise undetectable).
+
+No port selects a mise config mode by version yet. Fixtures that pin
+`PMSEC_MISE_VERSION=2026.11.0` (planned new config mode) or `2026.10.25`
+(old mise, legacy mode) are added together with that implementation.
 
 ## Run
 
