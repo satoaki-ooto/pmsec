@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,14 @@ class ConformanceEnvTest(unittest.TestCase):
             with self.subTest(impl=impl):
                 env = run.env_for(impl, home)
                 self.assertEqual(env["MISE_SYSTEM_CONFIG_DIR"], str(home / "etc-mise"))
+
+    def test_every_tool_version_is_pinned_to_none(self):
+        usage = (run.REPO / "node" / "src" / "cli.mjs").read_text()
+        tools = re.search(r"Restrict to specific tools \(([^)]+)\)", usage).group(1).split(",")
+        env = run.env_for("node", Path("/tmp/pmsec-conformance-home"))
+        for tool in tools:
+            with self.subTest(tool=tool):
+                self.assertEqual(env[f"PMSEC_{tool.upper()}_VERSION"], "none")
 
     def test_composer_cases_expect_the_pinned_composer_home(self):
         home = Path("/tmp/pmsec-conformance-home")
