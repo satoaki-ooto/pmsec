@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -58,6 +59,34 @@ class CaseEnvTest(unittest.TestCase):
         home = Path("/tmp/pmsec-conf-home")
         env = run.case_env("python", home, {"MISE_CONFIG_DIR": "/plain/path"})
         self.assertEqual(env["MISE_CONFIG_DIR"], "/plain/path")
+
+
+class RunCaseTest(unittest.TestCase):
+    def test_failing_pre_step_fails_the_case_with_captured_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            case_path = Path(td) / "bad_pre.json"
+            case_path.write_text(json.dumps({
+                "pre": [["--tool", "nosuchtool"]],
+                "args": ["--tool", "npm", "--days", "7", "--json"],
+                "expected_json": {},
+            }))
+            ok, msg = run.run_case("python", case_path)
+        self.assertFalse(ok)
+        self.assertIn("pre step 0", msg)
+        self.assertIn("--tool nosuchtool", msg)
+        self.assertIn("exit 1", msg)
+        self.assertIn("unknown tool", msg)
+
+
+class CheckFilesTest(unittest.TestCase):
+    def test_null_expects_the_file_to_be_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            self.assertIsNone(run.check_files(home, {"absent.txt": None}))
+            (home / "absent.txt").write_text("boom")
+            err = run.check_files(home, {"absent.txt": None})
+        self.assertIsNotNone(err)
+        self.assertIn("absent.txt", err)
 
 
 if __name__ == "__main__":
