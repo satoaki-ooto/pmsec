@@ -272,6 +272,15 @@ function lex(text) {
     }
     if (state === "basic" || state === "literal") {
       if (state === "basic" && c === "\\") {
+        // A backslash that reaches the end of the line (or the file) does not
+        // carry the string over it: the line still ends the string, and the
+        // scan resumes in code state on the next line. Escapes strictly within
+        // the line keep skipping their pair, so `\"` never closes it.
+        if (i + 1 >= n || text[i + 1] === "\n") {
+          state = "code";
+          i++;
+          continue;
+        }
         i += 2;
         continue;
       }

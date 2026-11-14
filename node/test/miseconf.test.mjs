@@ -121,6 +121,18 @@ test("read: env-like text inside an unrelated one-line string is ignored", () =>
   assert.equal(readEnv('note = \'env = []\'\n'), null);
 });
 
+test("read: a one-line string ends with its line, trailing backslash or not", () => {
+  // The subset does not validate general TOML: a backslash at the end of the
+  // line does not let a one-line string cross it, so the next line is read as
+  // structure again and its bare `env` key is still found.
+  assert.deepEqual(readEnv('x = "abc\\\nenv = ["work"]\n'), ["work"]);
+  assert.deepEqual(readEnv("x = 'abc\\\nenv = ['work']\n"), ["work"]);
+  // An escaped quote inside the line is not a closer; the line still ends it.
+  assert.deepEqual(readEnv('x = "a\\"b\nenv = ["work"]\n'), ["work"]);
+  // An assignment before that opener is read rather than swallowed by it.
+  assert.deepEqual(readEnv('env = ["work"]\nx = "abc\\'), ["work"]);
+});
+
 test("read: a table header after a multiline string still ends the root region", () => {
   const text = ['note = """', "[t]", '"""', "[tool.env]", 'env = ["nested"]'].join("\n");
   assert.equal(readEnv(text), null);
