@@ -520,6 +520,33 @@ if ($casefold) {
   Write-Host 'SKIP  mise case-variant alias (needs a case-insensitive filesystem)'
 }
 
+T 'mise cleanup fails closed on a cyclic MISE_GLOBAL_CONFIG_FILE link' {
+  $h = NewHome
+  try {
+    $cycle = PathJoin $h 'cycle'
+    try {
+      [void](New-Item -ItemType SymbolicLink -Path $cycle -Target $cycle)
+    } catch {
+      Write-Host 'SKIP  mise cyclic-link cleanup (symlink creation blocked)'
+      return $true
+    }
+    $d = PathJoin $h '.config' 'mise'
+    [void](New-Item -ItemType Directory -Path $d -Force)
+    $pmsecPath = PathJoin $d 'config.pmsec.toml'
+    $selectorPath = PathJoin $d 'miserc.local.toml'
+    [System.IO.File]::WriteAllText($pmsecPath, "[settings]`nminimum_release_age = `"3d`"`n")
+    [System.IO.File]::WriteAllText($selectorPath, "env = [`"pmsec`"]`n")
+    $r = InvokePmsec $h @{
+      PMSEC_MISE_VERSION = '2026.10.25'
+      MISE_GLOBAL_CONFIG_FILE = (PathJoin $cycle 'config.toml')
+    } @('--disable','--tool','mise')
+    if ($r.Code -eq 0) { $script:LastFail = "cleanup reported success through a cyclic link`n$($r.Out)"; return $false }
+    if (-not (Test-Path -LiteralPath $pmsecPath)) { $script:LastFail = 'cyclic link allowed destructive cleanup'; return $false }
+    if (-not (Test-Path -LiteralPath $selectorPath)) { $script:LastFail = 'cyclic link allowed selector cleanup'; return $false }
+    return $true
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
 T 'Windows mise legacy migration follows MISE_CONFIG_DIR' {
   $h = NewHome
   try {
@@ -552,8 +579,9 @@ T 'Windows scope ignores XDG_CONFIG_HOME for uv' {
 T 'WSL scope resolves mise from the distro env, not the Windows env' {
   # The POSIX-rooted override below is spelled with the host path convention,
   # so the end-to-end assertion only holds on non-Windows hosts; the resolver
-  # probe test covers the same rules on every host.
-  if ($IsWindows) { return $true }
+  # probe test covers the same rules on every host. `$onWindows` also covers
+  # Windows PowerShell 5.1, where `$IsWindows` does not exist.
+  if ($onWindows) { return $true }
   $h = NewHome
   try {
     $wslHome = PathJoin $h 'wsl-home'
@@ -582,6 +610,22 @@ T '--json emits parseable JSON for check' {
     if ($data.rows.Count -ne 10) { $script:LastFail = "expected 10 rows, got $($data.rows.Count)"; return $false }
     $names = ($data.rows | ForEach-Object { $_.tool }) -join ','
     if ($names -ne 'npm,pnpm,yarn,bun,cargo,mise,uv,bundler,aube,composer') { $script:LastFail = "row order: $names"; return $false }
+    return $true
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+T 'mise JSON escapes a control character in an unsafe environment name' {
+  $h = NewHome
+  try {
+    [void](New-Item -ItemType Directory -Force -Path (PathJoin $h '.config' 'mise'))
+    [System.IO.File]::WriteAllText((PathJoin $h '.config' 'mise' 'miserc.local.toml'), 'env = ["a\u0007x"]' + "`n")
+    $r = InvokePmsec $h @{ PMSEC_MISE_VERSION = '2026.11.0' } @('--tool','mise','--json')
+    if ($r.Code -eq 0) { $script:LastFail = "unsafe mise environment accepted`n$($r.Out)"; return $false }
+    $data = $null
+    try { $data = $r.Out | ConvertFrom-Json } catch { $script:LastFail = "json parse failed: $_`n$($r.Out)"; return $false }
+    $row = @($data.results)[0]
+    if ($r.Out.IndexOf('a\u0007x') -lt 0 -or [string]::IsNullOrEmpty($row.error) -or $row.ok -ne $false) { $script:LastFail = "unsafe environment did not produce a structured escaped error`n$($r.Out)"; return $false }
+    if (Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'config.pmsec.toml')) { $script:LastFail = 'pmsec layer written before the unsafe environment failed'; return $false }
     return $true
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
 }
@@ -1118,7 +1162,7 @@ $script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
       $r = & $probe
       foreach ($k in $Expected.Keys) {
         if ($r[$k] -cne $Expected[$k]) {
-          $script:LastFail = "$Label: $k = $($r[$k]), expected $($Expected[$k])"
+          $script:LastFail = "${Label}: $k = $($r[$k]), expected $($Expected[$k])"
           return $false
         }
       }

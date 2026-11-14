@@ -123,7 +123,17 @@ def _parse_array(lines: list[str], start_line: int, start_col: int) -> tuple[lis
                     value += _decode_basic("\\" + nxt)
                     k += 2
                     continue
-                if line.startswith(quote * 3, k):
+                # One or two content quotes may precede the closing delimiter,
+                # so a four-/five-quote run closes on its final three quotes.
+                closing = 0
+                while closing < 5 and k + closing < len(line) and line[k + closing] == quote:
+                    closing += 1
+                if closing in (4, 5):
+                    value += quote * (closing - 3)
+                    k += closing
+                    closed = True
+                    break
+                if closing == 3:
                     k += 3
                     closed = True
                     break

@@ -47,7 +47,12 @@ export function scanView(lines) {
         // Inside a multiline basic string a backslash escapes the next char,
         // so `\"""` does not close the delimiter; literal strings have none.
         if (open === '"""' && line[i] === "\\") { i += 2; continue; }
-        if (line.startsWith(open, i)) { open = null; i += 3; }
+        // One or two content quotes may precede the closing delimiter, so a
+        // four-/five-quote run closes on its final three quotes.
+        let closing = 0;
+        while (closing < 5 && line[i + closing] === open[0]) closing++;
+        if (closing === 4 || closing === 5) { open = null; i += closing; }
+        else if (closing === 3) { open = null; i += 3; }
         else i++;
         continue;
       }

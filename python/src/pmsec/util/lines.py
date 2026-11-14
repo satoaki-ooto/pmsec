@@ -62,7 +62,15 @@ def scan_view(lines: list[str]) -> list[str]:
                 if open_ == '"""' and line[i] == "\\":
                     i += 2
                     continue
-                if line.startswith(open_, i):
+                # One or two content quotes may precede the closing delimiter,
+                # so a four-/five-quote run closes on its final three quotes.
+                closing = 0
+                while closing < 5 and i + closing < n and line[i + closing] == open_[0]:
+                    closing += 1
+                if closing in (4, 5):
+                    open_ = None
+                    i += closing
+                elif closing == 3:
                     open_ = None
                     i += 3
                 else:

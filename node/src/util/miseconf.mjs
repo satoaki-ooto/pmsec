@@ -107,7 +107,17 @@ function parseArray(lines, startLine, startCol) {
           k += 2;
           continue;
         }
-        if (line.startsWith(mlTok, k)) { k += 3; closed = true; break; }
+        // One or two content quotes may precede the closing delimiter, so a
+        // four-/five-quote run closes on its final three quotes.
+        let closing = 0;
+        while (closing < 5 && line[k + closing] === mlTok[0]) closing++;
+        if (closing === 4 || closing === 5) {
+          value += mlTok[0].repeat(closing - 3);
+          k += closing;
+          closed = true;
+          break;
+        }
+        if (closing === 3) { k += 3; closed = true; break; }
         value += c;
         k++;
       }

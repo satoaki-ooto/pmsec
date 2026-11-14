@@ -422,8 +422,17 @@ function LinesScanView {
         # Inside a multiline basic string a backslash escapes the next char,
         # so `\"""` does not close the delimiter; literal strings have none.
         if ($open -ceq '"""' -and $line[$i] -ceq '\') { $i += 2; continue }
-        if ($i + 3 -le $line.Length -and $line.Substring($i, 3) -ceq $open) { $open = $null; $i += 3 }
-        else { $i++ }
+        # One or two content quotes may precede the closing delimiter, so a
+        # four-/five-quote run closes on its final three quotes.
+        $closing = 0
+        while ($i + $closing -lt $line.Length -and
+               "$($line[$i + $closing])" -ceq "$($open[0])") {
+          $closing++
+          if ($closing -ge 5) { break }
+        }
+        if ($closing -ceq 4 -or $closing -ceq 5) { $open = $null; $i += $closing; continue }
+        if ($closing -ceq 3) { $open = $null; $i += 3; continue }
+        $i++
         continue
       }
       $ch = $line[$i]
@@ -1257,7 +1266,20 @@ function MisercParseArray {
         continue
       }
       if ($ml) {
-        if ($script:MsK + 3 -le $line.Length -and $line.Substring($script:MsK, 3) -ceq ($quote + $quote + $quote)) {
+        # One or two content quotes may precede the closing delimiter, so a
+        # four-/five-quote run closes on its final three quotes.
+        $closing = 0
+        while ($script:MsK + $closing -lt $line.Length -and
+               "$($line[$script:MsK + $closing])" -ceq $quote) {
+          $closing++
+          if ($closing -ge 5) { break }
+        }
+        if ($closing -ceq 4 -or $closing -ceq 5) {
+          [void]$val.Append($quote)
+          if ($closing -ceq 5) { [void]$val.Append($quote) }
+          $script:MsK += $closing; $closed = $true; break
+        }
+        if ($closing -ceq 3) {
           $script:MsK += 3; $closed = $true; break
         }
       } elseif ("$c" -eq $quote) {
@@ -1804,6 +1826,7 @@ public static class PmsecFileId {
 # real directory; a dangling symlink ancestor leaves the outcome unknown.
 function MiseProvablyMissing([string]$Path) {
   $dir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
+  $seen = [System.Collections.Generic.HashSet[string]]::new()
   while ($true) {
     $parent = [IO.Path]::GetDirectoryName($dir)
     if ($parent -eq $dir -or -not $parent) {
@@ -1818,8 +1841,10 @@ function MiseProvablyMissing([string]$Path) {
     }
     # Follow links: an ancestor reached through a valid symlink/junction is
     # still a real directory, so it can prove absence; only a dangling link
-    # (or an unreadable target) leaves the outcome unknown.
+    # (or an unreadable target) leaves the outcome unknown. A link cycle is
+    # unknown too: never resolve the same link twice.
     while ($item.LinkType) {
+      if (-not $seen.Add($item.FullName)) { return $false }
       $target = @($item.Target)[0]
       if (-not $target) { return $false }
       if (-not [IO.Path]::IsPathRooted($target)) {
@@ -2121,10 +2146,21 @@ function JsonString([string]$S) {
   $e = $S
   $e = $e -replace '\\', '\\'
   $e = $e -replace '"', '\"'
-  $e = $e -replace "`n", '\n'
-  $e = $e -replace "`r", '\r'
-  $e = $e -replace "`t", '\t'
-  return '"' + $e + '"'
+  # Exception text is emitted into JSON and may embed the offending control
+  # character (for example a bell in an unsafe mise environment name), so
+  # every JSON-forbidden C0 character must be escaped.
+  $out = [System.Text.StringBuilder]::new()
+  foreach ($ch in $e.ToCharArray()) {
+    $code = [int]$ch
+    if ($code -eq 8) { [void]$out.Append('\b'); continue }
+    if ($code -eq 9) { [void]$out.Append('\t'); continue }
+    if ($code -eq 10) { [void]$out.Append('\n'); continue }
+    if ($code -eq 12) { [void]$out.Append('\f'); continue }
+    if ($code -eq 13) { [void]$out.Append('\r'); continue }
+    if ($code -ge 0 -and $code -lt 32) { [void]$out.Append(('\u{0:x4}' -f $code)); continue }
+    [void]$out.Append($ch)
+  }
+  return '"' + $out.ToString() + '"'
 }
 
 function JsonStrOrNull($S) {

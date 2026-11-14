@@ -23,6 +23,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 NEW_MODE = {"PMSEC_MISE_VERSION": "2026.11.0"}
+DQ = '"'
+SQ = "'"
 
 # name, setup, setup_from (copy expected_files of an earlier case first),
 # env overrides, args
@@ -560,12 +562,29 @@ CASES = [
         NEW_MODE,
         ["--tool", "mise", "--days", "1", "--json"],
     ),
+    # TOML allows one or two content quotes immediately before a multiline
+    # closing delimiter. Disable must therefore preserve the decoded names
+    # while removing only the real pmsec selector.
+    (
+        "disable_mise_new_mode_multiline_closing_quotes",
+        {
+            ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\nparanoid = true\nexperimental = true\n',
+            ".config/mise/miserc.local.toml": (
+                'env = ["""basic-one' + DQ * 4 + ', """basic-two' + DQ * 5
+                + ", '''literal-one" + SQ * 4 + ", '''literal-two" + SQ * 5
+                + ', "pmsec"]\nother = 1\n'
+            ),
+        },
+        None,
+        NEW_MODE,
+        ["--disable", "--tool", "mise", "--json"],
+    ),
     # An escaped delimiter inside a multiline basic string (`\"""`) does not
     # close it: the env line below stays inside the string body and is not a
     # real selector, so enable starts fresh instead of migrating "work".
     (
         "enable_mise_new_mode_multiline_escaped_delim_hides_env",
-        {".config/mise/miserc.local.toml": 'note = """say \\"\nenv = ["work"]\n"""\nother = 1\n'},
+        {".config/mise/miserc.local.toml": 'note = """say \\"""\nenv = ["work"]\n"""\nother = 1\n'},
         None,
         NEW_MODE,
         ["--tool", "mise", "--days", "1", "--json"],

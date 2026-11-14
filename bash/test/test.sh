@@ -866,10 +866,18 @@ fi
 # bare `pmsec` (a full enable) while printing the text.
 t_mise_help_does_not_execute_usage_backticks() {
   local home; home=$(mktemp -d)
-  local d="$home/.config/mise" rc
+  local d="$home/.config/mise" rc marker shim
   mkdir -p "$d"
-  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 -- --help >/dev/null 2>&1; rc=$?
+  # Install a recording shim so an executed bare `pmsec` is detected even on
+  # a host that has no pmsec executable on PATH.
+  marker="$home/pmsec-called"
+  shim="$home/shim"
+  mkdir -p "$shim"
+  printf '#!/bin/sh\n: > "$PMSEC_HELP_MARKER"\n' > "$shim/pmsec"
+  chmod +x "$shim/pmsec"
+  run_pmsec "$home" PMSEC_HELP_MARKER="$marker" PATH="$shim:$PATH" -- --help >/dev/null 2>&1; rc=$?
   [ "$rc" = "0" ] || { LAST_FAIL="help exited $rc"; rm -rf -- "$home"; return 1; }
+  [ ! -e "$marker" ] || { LAST_FAIL="help executed the bare pmsec backtick"; rm -rf -- "$home"; return 1; }
   [ ! -e "$d/config.toml" ] || { LAST_FAIL="help wrote a legacy config (backtick substitution ran pmsec)"; rm -rf -- "$home"; return 1; }
   [ ! -e "$d/config.pmsec.toml" ] || { LAST_FAIL="help wrote config.pmsec.toml"; rm -rf -- "$home"; return 1; }
   [ ! -e "$d/miserc.local.toml" ] || { LAST_FAIL="help wrote miserc.local.toml"; rm -rf -- "$home"; return 1; }
@@ -881,11 +889,14 @@ T "mise --help does not execute the USAGE backticks" t_mise_help_does_not_execut
 # so a pmsec selector stays an active artifact for check to report.
 t_mise_parsed_empty_mise_env_hides_nothing() {
   local home; home=$(mktemp -d)
-  local d="$home/.config/mise" rc
+  local d="$home/.config/mise" rc out
   mkdir -p "$d"
   printf '[settings]\nminimum_release_age = "1d"\n' > "$d/config.toml"
   printf 'env = ["pmsec"]\n' > "$d/miserc.local.toml"
-  run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 MISE_ENV=, -- --tool mise --days 1 --check >/dev/null 2>&1; rc=$?
+  out=$(run_pmsec "$home" PMSEC_MISE_VERSION=2026.10.25 MISE_ENV=, -- --tool mise --days 1 --check 2>&1); rc=$?
+  # Extras are missing too, so assert the selector-specific diagnostic: the
+  # parsed-empty list must not hide the active pmsec artifact.
+  assert_match "selector diagnostic" 'a previous new-style mise configuration exists' "$out" || { rm -rf -- "$home"; return 1; }
   [ "$rc" != "0" ] || { LAST_FAIL="check reported OK while the pmsec selector is active"; rm -rf -- "$home"; return 1; }
   rm -rf -- "$home"
 }

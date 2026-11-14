@@ -197,7 +197,16 @@ lines_scan() {
         # Inside a multiline basic string a backslash escapes the next char,
         # so `\"""` does not close the delimiter; literal strings have none.
         if [ "$open" = '"""' ] && [ "${line:j:1}" = '\' ]; then j=$((j+2)); continue; fi
-        if [ "${line:j:3}" = "$open" ]; then open=""; j=$((j+3)); else j=$((j+1)); fi
+        # One or two content quotes may precede the closing delimiter, so a
+        # four-/five-quote run closes on its final three quotes.
+        local closing=0
+        while [ "${line:$((j+closing)):1}" = "${open:0:1}" ]; do
+          closing=$((closing+1))
+          [ "$closing" -lt "5" ] || break
+        done
+        if [ "$closing" = "4" ] || [ "$closing" = "5" ]; then open=""; j=$((j+closing)); continue; fi
+        if [ "$closing" = "3" ]; then open=""; j=$((j+3)); continue; fi
+        j=$((j+1))
         continue
       fi
       ch="${line:j:1}"
@@ -1269,7 +1278,7 @@ _miserc_decode_basic() {
 }
 
 _miserc_parse_array() {
-  local line ch quote val closed need_sep=0 ml=0
+  local line ch quote val closed need_sep=0 ml=0 closing
   _miserc_skip || return 1
   [ "$MISERC_CH" = "[" ] || { MISERC_ERR='miserc env must be an array'; return 1; }
   MISERC_K=$((MISERC_K+1))
@@ -1340,7 +1349,18 @@ _miserc_parse_array() {
           fi
           continue
         fi
-        if [ "${line:MISERC_K:3}" = "$quote$quote$quote" ]; then
+        # One or two content quotes may precede the closing delimiter, so a
+        # four-/five-quote run closes on its final three quotes.
+        closing=0
+        while [ "${line:$((MISERC_K+closing)):1}" = "$quote" ]; do
+          closing=$((closing+1))
+          [ "$closing" -lt "5" ] || break
+        done
+        if [ "$closing" = "4" ] || [ "$closing" = "5" ]; then
+          val+="$quote"; [ "$closing" = "5" ] && val+="$quote"
+          MISERC_K=$((MISERC_K+closing)); closed=1; break
+        fi
+        if [ "$closing" = "3" ]; then
           MISERC_K=$((MISERC_K+3)); closed=1; break
         fi
         val+="$ch"; MISERC_K=$((MISERC_K+1))
