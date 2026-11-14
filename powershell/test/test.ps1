@@ -1616,6 +1616,23 @@ T 'miserc read: a table header after a multiline string still ends the root regi
   return ($ok -and (AssertMisercNames 'env after the string is a real assignment' $withEnv 'real'))
 }
 
+# A one-line string ends with its line: the subset does not validate general
+# TOML, so a trailing backslash is content, not an escape that swallows the
+# newline. Scanning resumes in code state on the next line, where a real `env`
+# assignment is still found.
+T 'miserc read: a one-line string ends at the newline even after a backslash' {
+  # Each element is parenthesized: inside @(), the comma binds tighter than `+`.
+  $basic = MisercText @(('x = ' + (DqName 'abc\')), (MisercArray @((DqName 'work'))))
+  $literal = MisercText @(('x = ' + (SqName 'abc\')), (MisercArray @((DqName 'work'))))
+  # An escaped quote does not close the string mid-line; the line still ends it.
+  $escaped = MisercText @(('x = ' + $script:DQ + 'a\' + $script:DQ + 'b'), (MisercArray @((DqName 'work'))))
+  $before = MisercText @((MisercArray @((DqName 'work'))), ('x = ' + (DqName 'abc\')))
+  $ok = AssertMisercNames 'trailing backslash in a basic string' $basic 'work'
+  $ok = $ok -and (AssertMisercNames 'trailing backslash in a literal string' $literal 'work')
+  $ok = $ok -and (AssertMisercNames 'escaped quote does not close the string' $escaped 'work')
+  return ($ok -and (AssertMisercNames 'assignment before a trailing opener' $before 'work'))
+}
+
 T 'miserc read: quoted keys, duplicates, and shape errors fail closed' {
   $ok = AssertMisercRejects @(
     @{ N = 'double-quoted env key'; T = ((DqName 'env') + ' = [' + (DqName 'a') + ']'); R = 'quoted env key is unsupported' },

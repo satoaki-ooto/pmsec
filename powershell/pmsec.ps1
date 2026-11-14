@@ -1102,7 +1102,15 @@ function Get-MisercLex([string]$Text) {
       continue
     }
     if ($state -eq 'basic' -or $state -eq 'literal') {
-      if ($state -eq 'basic' -and $c -eq '\') { $i = $i + 2; continue }
+      if ($state -eq 'basic' -and $c -eq '\') {
+        # A one-line string ends with its line, so an escape pair may not reach
+        # past the newline: a trailing `\` is content like any other character
+        # and the newline closes the string. Only a `"""`/`'''` block that never
+        # closes is `unterminated string in file`.
+        if ($i + 1 -ge $n -or $Text[$i + 1] -eq "`n") { $state = 'code'; $i++; continue }
+        $i = $i + 2
+        continue
+      }
       $quote = "'"
       if ($state -eq 'basic') { $quote = '"' }
       if ([string]$c -eq $quote) { $state = 'code'; $i++; continue }
