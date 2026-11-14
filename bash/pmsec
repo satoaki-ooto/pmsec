@@ -806,7 +806,15 @@ _miseconf_parse_env_assignment() {
   fi
   _ME_POS=$((_ME_POS+1))
   _miseconf_skip_ws_comments || { _miseconf_fail "unterminated env assignment"; return 1; }
-  if [ "${_ME_LINE:_ME_POS:1}" != "[" ]; then _miseconf_fail "env must be an array"; return 1; fi
+  if [ "${_ME_LINE:_ME_POS:1}" != "[" ]; then
+    # A scalar is the wrong shape, but a quoted one is scanned first so a
+    # multiline, unterminated or escaped one reports its own cause, exactly
+    # like the array path.
+    case "${_ME_LINE:_ME_POS:1}" in
+      '"'|"'") _miseconf_parse_env_element || return 1 ;;
+    esac
+    _miseconf_fail "env must be an array"; return 1
+  fi
   _ME_POS=$((_ME_POS+1))
   while :; do
     _miseconf_skip_ws_comments || { _miseconf_fail "unterminated env assignment"; return 1; }
