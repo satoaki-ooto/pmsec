@@ -1064,6 +1064,213 @@ miserc_error_text() {
   printf 'invalid env in %s: %s\n' "$MISEC_ERROR_PATH" "$MISEC_ERROR_REASON"
 }
 
+# ---------- mise config layer: selector and local writer ----------
+# Effective env resolution shared by both helpers below: a non-empty MISE_ENV
+# decides alone and touches no file; otherwise local, shared and system miserc
+# are read in that order and the first one that defines a top-level `env` wins
+# outright — the whole list is adopted (never merged) and nothing lower is read
+# afterwards. No definition anywhere is an empty list attributed to the local
+# path, because that is the file the writer would create.
+#
+# The writer deliberately ignores MISE_ENV and inherits the file-based list
+# only: a one-off `MISE_ENV=ci pmsec enable` must not rewrite the local file
+# from a list the file chain never contained. Every read, parse and replacement
+# plan runs before write_atomic is called, so a rejected input leaves the
+# target, its .bak and any *.tmp exactly as they were.
+#
+# Direct-call convention, like the miserc text helpers above: these print
+# nothing, report through globals, and return nonzero on failure. The `_MS_*`
+# globals and the `_mise_*` / `_miserc_*` helpers are private to this section
+# (bash 3.2 has no namerefs, so the scan result is shared instead of returned).
+
+MISE_ERROR_PATH=""
+MISE_ERROR_REASON=""
+MISE_SELECTOR_PATH=""
+MISE_SELECTOR_ENV=()
+MISE_SELECTOR_WIRED=0
+
+# Shared scan result: the attributed path, the adopted decoded names, and the
+# last file body read. `_MS_TEXT` is a global because a second `$(...)` in a
+# caller would strip the trailing newlines the reader just preserved.
+_MS_PATH=""
+_MS_ENV=()
+_MS_TEXT=""
+
+# One failure shape for both helpers and both spellings: the miserc parse layer
+# reports MISEC_ERROR_*, the selector exposes MISE_ERROR_*. Keeping the pair in
+# sync means `miserc_error_text` stays usable on a selector failure and a
+# caller reads one credential-free path/reason pair whatever layer raised it.
+_mise_selector_fail() {
+  MISE_ERROR_REASON="$1"
+  MISE_ERROR_PATH="$2"
+  MISEC_ERROR_REASON="$1"
+  MISEC_ERROR_PATH="$2"
+  return 1
+}
+
+# Read a file byte-for-byte into _MS_TEXT. The sentinel byte guards the
+# trailing newlines `$(...)` would eat, and the result has to land in a global
+# rather than on stdout: a second command substitution in the caller would
+# strip them all over again. `&&` keeps cat's own failure visible, since a
+# partial read must never pass as a shorter file, and stderr is dropped so the
+# caller reports one structured reason instead of a raw coreutils message.
+_miserc_file_text() {
+  local t
+  _MS_TEXT=""
+  t=$(cat -- "$1" 2>/dev/null && printf x) || return 1
+  _MS_TEXT="${t%x}"
+  return 0
+}
+
+# Split $MISE_ENV the way mise 2026.11.0 does: commas separate, empty elements
+# are dropped, nothing is trimmed ("a, b" yields "a" and " b"). Result lands in
+# _MS_ENV so it can share the publishing path with a parsed file list.
+_mise_split_env_tokens() {
+  local rest="$1" elem
+  _MS_ENV=()
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *,*) elem="${rest%%,*}"; rest="${rest#*,}" ;;
+      *)   elem="$rest"; rest="" ;;
+    esac
+    if [ -n "$elem" ]; then _MS_ENV[${#_MS_ENV[@]}]="$elem"; fi
+  done
+  return 0
+}
+
+# Exact, case-sensitive `pmsec` membership. Last position is not required and
+# mise's env_sets are never expanded, so nothing else can make a list wired.
+_mise_list_has_pmsec() {
+  local name
+  for name in "$@"; do
+    if [ "$name" = "pmsec" ]; then return 0; fi
+  done
+  return 1
+}
+
+# Read local, shared, system in precedence order and stop at the first file
+# that defines a top-level env. A missing file is skipped; anything else that
+# cannot be read or parsed fails closed — never a silent skip and never a
+# fallback to a lower-precedence file, because a local typo must not quietly
+# change what the rest of the CLI believes. Sets _MS_PATH / _MS_ENV.
+_miserc_file_selector_read() {
+  local paths=() file text i=0 j=0
+  _MS_PATH=""
+  _MS_ENV=()
+  paths[0]=$(path_mise_local_miserc)
+  paths[1]=$(path_mise_shared_miserc)
+  paths[2]=$(path_mise_system_miserc)
+  while [ "$i" -lt "${#paths[@]}" ]; do
+    file="${paths[i]}"
+    i=$((i+1))
+    [ -e "$file" ] || continue
+    # Only a readable regular file is a candidate: a directory or FIFO would
+    # report EISDIR or block, and both are read errors, not "absent".
+    if [ ! -f "$file" ] || [ ! -r "$file" ] || ! _miserc_file_text "$file"; then
+      _mise_selector_fail "cannot read file" "$file"
+      return 1
+    fi
+    text="$_MS_TEXT"
+    # The parser's own path/reason propagate untouched, so a caller can point
+    # at the exact file and cause.
+    if ! miserc_env_parse_text "$file" "$text"; then
+      _mise_selector_fail "$MISEC_ERROR_REASON" "$MISEC_ERROR_PATH"
+      return 1
+    fi
+    # `env = []` counts as a definition: it adopts an empty list and stops the
+    # search, so a shared list can never reappear under an explicit local reset.
+    if [ "$MISEC_ENV_FOUND" = "1" ]; then
+      _MS_PATH="$file"
+      j=0
+      while [ "$j" -lt "${#MISEC_ENV_VALUES[@]}" ]; do
+        _MS_ENV[${#_MS_ENV[@]}]="${MISEC_ENV_VALUES[j]}"
+        j=$((j+1))
+      done
+      return 0
+    fi
+  done
+  # No file defines: the local path is still the attribution, because that is
+  # the file the writer would create.
+  _MS_PATH="${paths[0]}"
+  return 0
+}
+
+# Copy _MS_PATH / _MS_ENV into the public selector globals and derive `wired`
+# from the adopted list rather than the raw text, so both branches judge the
+# same way.
+_mise_publish_selector() {
+  local i=0
+  MISE_SELECTOR_PATH="$_MS_PATH"
+  MISE_SELECTOR_ENV=()
+  while [ "$i" -lt "${#_MS_ENV[@]}" ]; do
+    MISE_SELECTOR_ENV[${#MISE_SELECTOR_ENV[@]}]="${_MS_ENV[i]}"
+    i=$((i+1))
+  done
+  MISE_SELECTOR_WIRED=0
+  if _mise_list_has_pmsec "${_MS_ENV[@]}"; then MISE_SELECTOR_WIRED=1; fi
+  return 0
+}
+
+# Effective env for this invocation. On failure the selector globals stay empty
+# and MISE_ERROR_PATH/MISE_ERROR_REASON say what broke; stdout is never used.
+mise_selector_read() {
+  MISE_SELECTOR_PATH=""
+  MISE_SELECTOR_ENV=()
+  MISE_SELECTOR_WIRED=0
+  MISE_ERROR_PATH=""
+  MISE_ERROR_REASON=""
+  # Non-empty MISE_ENV short-circuits every filesystem access: this branch has
+  # to succeed even when the local miserc is unreadable or not a file at all.
+  if [ -n "${MISE_ENV-}" ]; then
+    _mise_split_env_tokens "$MISE_ENV"
+    _MS_PATH="MISE_ENV"
+    _mise_publish_selector
+    return 0
+  fi
+  _miserc_file_selector_read || return 1
+  _mise_publish_selector
+  return 0
+}
+
+# Write the local miserc so its env list is the inherited file-based list plus
+# exactly one trailing `pmsec`. Shared and system files are never written, and
+# nothing is touched until every read, parse and plan step has succeeded.
+miserc_env_write_pmsec() {
+  local target text
+  MISE_ERROR_PATH=""
+  MISE_ERROR_REASON=""
+  unset MISEC_ENV_OUTPUT
+  _miserc_file_selector_read || return 1
+  target=$(path_mise_local_miserc)
+  text=""
+  if [ -e "$target" ]; then
+    if [ ! -f "$target" ] || [ ! -r "$target" ] || ! _miserc_file_text "$target"; then
+      _mise_selector_fail "cannot read file" "$target"
+      return 1
+    fi
+    text="$_MS_TEXT"
+  fi
+  # Empty inherited list passes no names at all: an empty `"${_MS_ENV[@]}"` is
+  # zero words today, but spelling the two calls out keeps the text writer's
+  # `$@` contract obvious to the next reader.
+  if [ "${#_MS_ENV[@]}" -gt 0 ]; then
+    if ! miserc_env_write_pmsec_text "$target" "$text" "${_MS_ENV[@]}"; then
+      _mise_selector_fail "$MISEC_ERROR_REASON" "$MISEC_ERROR_PATH"
+      return 1
+    fi
+  elif ! miserc_env_write_pmsec_text "$target" "$text"; then
+    _mise_selector_fail "$MISEC_ERROR_REASON" "$MISEC_ERROR_PATH"
+    return 1
+  fi
+  if ! printf '%s' "$MISEC_ENV_OUTPUT" | write_atomic "$target"; then
+    # write_atomic already named the failing step on stderr; the globals still
+    # identify the file so a caller can report it without parsing stderr.
+    _mise_selector_fail "cannot write file" "$target"
+    return 1
+  fi
+  return 0
+}
+
 # ---------- minimal JSON object editor ----------
 # Composer stores config as JSON. A full JSON parser would be overkill (and
 # bash has none built in), so edit the pretty-printed object in place. Only

@@ -928,7 +928,12 @@ t_source_guard_defines_without_running_main() {
   local home out rc wrote=0
   home=$(setup_home)
   out=$(env -i PATH="$PATH" HOME="$home" XDG_CONFIG_HOME="$home/.config" \
-    bash -c '. "$1" && declare -F path_mise_dir >/dev/null && declare -F path_mise_system_miserc >/dev/null && declare -F mise_supports_new_mode >/dev/null' \
+    bash -c '. "$1" || exit 1
+      for fn in path_mise_dir path_mise_system_miserc mise_supports_new_mode \
+                miserc_env_parse_text miserc_env_write_pmsec_text \
+                mise_selector_read miserc_env_write_pmsec; do
+        declare -F "$fn" >/dev/null || exit 1
+      done' \
     _ "$PMSEC" 2>&1); rc=$?
   [ -e "$home/.npmrc" ] && wrote=1
   rm -rf -- "$home"
@@ -1423,6 +1428,438 @@ t_miserc_write_error_clears_output() {
 rc=1 set=' "$out"
 }
 
+# ---------- mise config layer: selector and local writer ----------
+# Same direct-call convention as the helpers above: nothing on stdout, the
+# result lives in globals. Every call passes MISE_CONFIG_DIR and
+# MISE_SYSTEM_CONFIG_DIR so neither the host's mise config nor the real
+# /etc/mise/miserc.toml can leak into an expectation.
+
+MISE_SELECTOR_PROBE=$(cat <<'SNIPPET'
+mise_selector_read; rc=$?
+printf 'rc=%s\npath=%s\nwired=%s\nerrpath=%s\nerrreason=%s\n' \
+  "$rc" "${MISE_SELECTOR_PATH-}" "${MISE_SELECTOR_WIRED-}" \
+  "${MISE_ERROR_PATH-}" "${MISE_ERROR_REASON-}"
+names=""; sep=""; i=0
+while [ "$i" -lt "${#MISE_SELECTOR_ENV[@]}" ]; do
+  names="$names$sep${MISE_SELECTOR_ENV[i]}"
+  sep='|'
+  i=$((i+1))
+done
+printf 'nenv=%s\nnames=%s\n' "${#MISE_SELECTOR_ENV[@]}" "$names"
+SNIPPET
+)
+
+MISERC_LOCAL_WRITE_PROBE=$(cat <<'SNIPPET'
+miserc_env_write_pmsec; rc=$?
+printf 'rc=%s\nerrpath=%s\nerrreason=%s\n' \
+  "$rc" "${MISE_ERROR_PATH-}" "${MISE_ERROR_REASON-}"
+SNIPPET
+)
+
+miserc_selector() { call_snippet "$@" -- "$MISE_SELECTOR_PROBE"; }
+miserc_local_write() { call_snippet "$@" -- "$MISERC_LOCAL_WRITE_PROBE"; }
+
+# selector_expect LABEL NAMES WIRED [VAR=val ...]
+# The read must succeed and adopt exactly NAMES (`|`-joined, "" for none) with
+# the wired flag WIRED.
+selector_expect() {
+  local label="$1" names="$2" wired="$3"; shift 3
+  local out
+  out=$(miserc_selector "$@")
+  assert_eq "selector[$label]: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "selector[$label]: names" "$names" "$(field names "$out")" || return 1
+  assert_eq "selector[$label]: wired" "$wired" "$(field wired "$out")"
+}
+
+# write_file PATH CONTENT — `printf '%s'` keeps CONTENT byte-exact, so a test
+# can build BOM / CRLF / no-final-newline bodies inline.
+write_file() { printf '%s' "$2" > "$1"; }
+
+# count_scratch DIR — backup and atomic-writer scratch files left in DIR. A
+# successful first write legitimately leaves one .bak; a failed one leaves none
+# and never leaves a mktemp scratch file.
+count_scratch() {
+  local n=0 f
+  for f in "$1"/*.bak "$1"/*.tmp "$1"/*.??????; do
+    if [ -e "$f" ]; then n=$((n+1)); fi
+  done
+  printf '%s' "$n"
+}
+
+# assert_same_file LABEL A B — the two files must be byte-identical.
+assert_same_file() {
+  if cmp -s -- "$2" "$3"; then return 0; fi
+  LAST_FAIL="$1
+  $(diff -u -- "$2" "$3" 2>&1 | head -20)"
+  return 1
+}
+
+# rm_tree DIR — restore modes first: a chmod 000 fixture would otherwise make
+# the temp tree undeletable for a non-root test user.
+rm_tree() {
+  chmod -R u+rwx -- "$1" 2>/dev/null || true
+  rm -rf -- "$1"
+}
+
+# MISE_ENV decides on its own, with mise 2026.11.0 tokenization: commas split,
+# empty elements vanish, nothing is trimmed. `wired` is exact and
+# case-sensitive, so "Pmsec", " pmsec" and "pmsecx" never count.
+t_selector_mise_env_branch() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  selector_expect "duplicates and empty elements" "a|pmsec|b" 1 \
+    MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="a,,pmsec,b" || return 1
+  selector_expect "trailing comma" "a" 0 \
+    MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="a," || return 1
+  selector_expect "only commas" "" 0 \
+    MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV=",," || return 1
+  selector_expect "spaces are not trimmed" "a| b" 0 \
+    MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="a, b" || return 1
+  selector_expect "space keeps pmsec inexact" " pmsec" 0 \
+    MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV=" pmsec" || return 1
+  selector_expect "case sensitive" "Pmsec" 0 \
+    MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="Pmsec" || return 1
+  selector_expect "prefix is not pmsec" "pmsecx" 0 \
+    MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="pmsecx" || return 1
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="work,pmsec")
+  assert_eq "selector[MISE_ENV path]: MISE_ENV" "MISE_ENV" "$(field path "$out")" || return 1
+  assert_eq "selector[MISE_ENV path]: wired last" "1" "$(field wired "$out")" || return 1
+  assert_eq "selector[MISE_ENV path]: no error path" "" "$(field errpath "$out")"
+  rm_tree "$h"
+}
+
+# The MISE_ENV branch must not touch the filesystem at all: a directory (or an
+# unreadable file) where the local miserc belongs would fail the file branch
+# with "cannot read file", so success here proves nothing was opened.
+t_selector_mise_env_no_filesystem() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  mkdir "$d/miserc.local.toml"
+  mkdir "$s/miserc.toml"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="work")
+  assert_eq "MISE_ENV fs: rc over a directory" "0" "$(field rc "$out")" || return 1
+  assert_eq "MISE_ENV fs: path over a directory" "MISE_ENV" "$(field path "$out")" || return 1
+  assert_eq "MISE_ENV fs: names over a directory" "work" "$(field names "$out")" || return 1
+  assert_eq "MISE_ENV fs: no error reason" "" "$(field errreason "$out")" || return 1
+  rmdir "$d/miserc.local.toml" "$s/miserc.toml"
+  write_file "$d/miserc.local.toml" 'env = ["x"]'
+  chmod 000 "$d/miserc.local.toml"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="pmsec")
+  assert_eq "MISE_ENV fs: rc over an unreadable file" "0" "$(field rc "$out")" || return 1
+  assert_eq "MISE_ENV fs: wired over an unreadable file" "1" "$(field wired "$out")"
+  rm_tree "$h"
+}
+
+# MISE_ENV="" is the settled "unset" spelling, so it falls back to the files.
+t_selector_mise_env_empty_falls_back() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$d/miserc.local.toml" 'env = ["work"]'
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV=)
+  assert_eq "empty MISE_ENV: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
+  assert_eq "empty MISE_ENV: names" "work" "$(field names "$out")" || return 1
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "unset MISE_ENV: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
+  assert_eq "unset MISE_ENV: names" "work" "$(field names "$out")"
+  rm_tree "$h"
+}
+
+# local, then shared, then system; the first definition is adopted whole and
+# nothing lower is read. The lower-precedence files carry chmod 000 wherever the
+# stop is the point: a fallback would fail the call instead of quietly adopting
+# a different list.
+t_selector_file_precedence() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$s/miserc.toml" 'env = ["system"]'
+  chmod 000 "$s/miserc.toml"
+
+  write_file "$d/miserc.local.toml" 'env = ["work", "pmsec"]'
+  write_file "$d/miserc.toml" 'env = ["shared"]'
+  chmod 000 "$d/miserc.toml"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "local defines: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "local defines: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
+  assert_eq "local defines: names" "work|pmsec" "$(field names "$out")" || return 1
+  assert_eq "local defines: wired" "1" "$(field wired "$out")" || return 1
+  assert_eq "local defines: no error" "" "$(field errreason "$out")"
+
+  rm -f "$d/miserc.local.toml"
+  chmod 644 "$d/miserc.toml"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "shared defines: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "shared defines: path" "$d/miserc.toml" "$(field path "$out")" || return 1
+  assert_eq "shared defines: names" "shared" "$(field names "$out")" || return 1
+  assert_eq "shared defines: wired" "0" "$(field wired "$out")" || return 1
+  assert_eq "shared defines: no error" "" "$(field errreason "$out")"
+
+  rm -f "$d/miserc.toml"
+  chmod 644 "$s/miserc.toml"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "system defines: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "system defines: path" "$s/miserc.toml" "$(field path "$out")" || return 1
+  assert_eq "system defines: names" "system" "$(field names "$out")"
+  rm_tree "$h"
+}
+
+# `env = []` is a definition: it adopts an empty list and stops the search, so
+# a shared list can never reappear under an explicit local reset.
+t_selector_empty_array_stops_inheritance() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$d/miserc.local.toml" 'env = []'
+  write_file "$d/miserc.toml" 'env = ["shared", "pmsec"]'
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "env = []: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "env = []: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
+  assert_eq "env = []: nenv" "0" "$(field nenv "$out")" || return 1
+  assert_eq "env = []: wired" "0" "$(field wired "$out")"
+  rm_tree "$h"
+}
+
+t_selector_no_definition() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "no definition: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "no definition: path is the local file" "$d/miserc.local.toml" "$(field path "$out")" || return 1
+  assert_eq "no definition: nenv" "0" "$(field nenv "$out")" || return 1
+  assert_eq "no definition: wired" "0" "$(field wired "$out")"
+  rm_tree "$h"
+}
+
+# A local file that cannot be parsed or read fails closed with the parser's own
+# reason and path — never a silent skip and never a fallback to shared/system.
+t_selector_fails_closed() {
+  local h d s out quiet
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$d/miserc.toml" 'env = ["shared"]'
+  write_file "$d/miserc.local.toml" 'env = "work"'
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "selector parse error: rc" "1" "$(field rc "$out")" || return 1
+  assert_eq "selector parse error: reason" "env must be an array" "$(field errreason "$out")" || return 1
+  assert_eq "selector parse error: path" "$d/miserc.local.toml" "$(field errpath "$out")" || return 1
+  assert_eq "selector parse error: wired" "0" "$(field wired "$out")" || return 1
+  quiet=$(call_helper MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" -- mise_selector_read 2>&1)
+  assert_eq "selector parse error: silent" "" "$quiet" || return 1
+
+  write_file "$d/miserc.local.toml" 'env = ["work"]'
+  chmod 000 "$d/miserc.local.toml"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "selector read error: rc" "1" "$(field rc "$out")" || return 1
+  assert_eq "selector read error: reason" "cannot read file" "$(field errreason "$out")" || return 1
+  assert_eq "selector read error: path" "$d/miserc.local.toml" "$(field errpath "$out")" || return 1
+  quiet=$(call_helper MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" -- mise_selector_read 2>&1)
+  assert_eq "selector read error: silent" "" "$quiet" || return 1
+
+  # A directory in the miserc slot is a read error too, not "absent".
+  rm -f "$d/miserc.local.toml"
+  mkdir "$d/miserc.local.toml"
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "selector directory: reason" "cannot read file" "$(field errreason "$out")"
+  rm_tree "$h"
+}
+
+t_local_write_fresh() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write fresh: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "write fresh: no error" "" "$(field errreason "$out")" || return 1
+  assert_file_eq "write fresh: local file bytes" 'env = ["pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
+  assert_eq "write fresh: no .bak or scratch" "0" "$(count_scratch "$d")"
+  rm_tree "$h"
+}
+
+# The inherited list comes from the first file that defines one, and only the
+# local file is ever written. Chmod 000 keeps "the shared/system file was not
+# rewritten" honest even for a writer that tried and failed.
+t_local_write_inherits_shared() {
+  local h d s out expected_shared expected_sys
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  expected_shared='env = ["work", "pmsec", "y"]'$'\n'
+  expected_sys='env = ["sys"]'$'\n'
+  write_file "$d/miserc.toml" "$expected_shared"
+  write_file "$s/miserc.toml" "$expected_sys"
+  chmod 000 "$s/miserc.toml"
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write shared: rc" "0" "$(field rc "$out")" || return 1
+  assert_file_eq "write shared: local inherits minus pmsec plus pmsec" \
+    'env = ["work", "y", "pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
+  assert_file_eq "write shared: shared unchanged" "$expected_shared" "$d/miserc.toml"
+  rm_tree "$h"
+}
+
+t_local_write_inherits_system() {
+  local h d s out expected_sys
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  expected_sys='# system
+env = ["z"]
+'$'\n'
+  write_file "$s/miserc.toml" "$expected_sys"
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write system: rc" "0" "$(field rc "$out")" || return 1
+  assert_file_eq "write system: local inherits the system list" \
+    'env = ["z", "pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
+  assert_file_eq "write system: system unchanged" "$expected_sys" "$s/miserc.toml"
+  rm_tree "$h"
+}
+
+# Replacing an existing assignment keeps the file's local quoting and every
+# byte outside the assignment: BOM, CRLF, a trailing comment, a missing final
+# newline and unrelated tables.
+t_local_write_replaces_assignment() {
+  local h d s out original bom=$'\xEF\xBB\xBF'
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  original="${bom}a = 1"$'\r\n'"env = ['work']  # keep"$'\r\n'"[t]"$'\r\n'"k = 1"
+  write_file "$d/miserc.local.toml" "$original"
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write local: rc" "0" "$(field rc "$out")" || return 1
+  assert_file_eq "write local: token reused and bytes preserved" \
+    "${bom}a = 1"$'\r\n'"env = ['work', \"pmsec\"]  # keep"$'\r\n'"[t]"$'\r\n'"k = 1" \
+    "$d/miserc.local.toml" || return 1
+  assert_file_eq "write local: one-shot backup holds the original" "$original" "$d/miserc.local.toml.bak" || return 1
+
+  write_file "$d/miserc.local.toml" 'env = ["work"]'
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write local: double-quoted rc" "0" "$(field rc "$out")" || return 1
+  assert_file_eq "write local: double-quoted token stays" 'env = ["work", "pmsec"]' "$d/miserc.local.toml"
+  rm_tree "$h"
+}
+
+t_local_write_idempotent() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$d/miserc.local.toml" 'note = 1
+env = ["work"]
+[tool]
+x = 1
+'
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write twice: first rc" "0" "$(field rc "$out")" || return 1
+  cp -- "$d/miserc.local.toml" "$h/first"
+  cp -- "$d/miserc.local.toml.bak" "$h/first-bak"
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write twice: second rc" "0" "$(field rc "$out")" || return 1
+  assert_same_file "write twice: bytes unchanged" "$h/first" "$d/miserc.local.toml" || return 1
+  assert_same_file "write twice: existing .bak preserved" "$h/first-bak" "$d/miserc.local.toml.bak" || return 1
+  assert_file_eq "write twice: first write shape" 'note = 1
+env = ["work", "pmsec"]
+[tool]
+x = 1
+' "$d/miserc.local.toml"
+  rm_tree "$h"
+}
+
+# The writer inherits the file-based list only: a one-off MISE_ENV in the
+# invoking shell must never reach the local file.
+t_local_write_ignores_mise_env() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="a,b")
+  assert_eq "write ignores MISE_ENV: rc" "0" "$(field rc "$out")" || return 1
+  assert_file_eq "write ignores MISE_ENV: no definition" 'env = ["pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
+  rm -f "$d/miserc.local.toml"
+  write_file "$d/miserc.toml" 'env = ["y"]'
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="a,b")
+  assert_eq "write ignores MISE_ENV: shared rc" "0" "$(field rc "$out")" || return 1
+  assert_file_eq "write ignores MISE_ENV: shared list wins" 'env = ["y", "pmsec"]'$'\n' "$d/miserc.local.toml"
+  rm_tree "$h"
+}
+
+t_local_write_local_empty_array() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$d/miserc.local.toml" 'env = []'
+  write_file "$d/miserc.toml" 'env = ["shared"]'
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write local []: rc" "0" "$(field rc "$out")" || return 1
+  assert_file_eq "write local []: becomes pmsec only" 'env = ["pmsec"]'$'\n' "$d/miserc.local.toml"
+  rm_tree "$h"
+}
+
+# Every failure mode must leave the target, its .bak and any scratch file
+# exactly as they were: nothing is written before all reads and the plan have
+# succeeded.
+t_local_write_failure_leaves_target_untouched() {
+  local h d s out original
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  # The target must stay writable-looking but free of a top-level env, so the
+  # scan really reaches the broken shared file instead of stopping at local.
+  original='# keep me
+x = 1
+'
+  write_file "$d/miserc.local.toml" "$original"
+
+  write_file "$d/miserc.toml" 'env = "work"'
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write fail parse: rc" "1" "$(field rc "$out")" || return 1
+  assert_eq "write fail parse: reason" "env must be an array" "$(field errreason "$out")" || return 1
+  assert_eq "write fail parse: path" "$d/miserc.toml" "$(field errpath "$out")" || return 1
+  assert_file_eq "write fail parse: local untouched" "$original" "$d/miserc.local.toml" || return 1
+  assert_eq "write fail parse: no .bak or scratch" "0" "$(count_scratch "$d")" || return 1
+
+  # Local collision: with no lower file left to fail on, planning against the
+  # target itself must be what rejects the write.
+  rm -f "$d/miserc.toml"
+  write_file "$d/miserc.local.toml" '[env]
+x = 1
+'
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write fail conflict: rc" "1" "$(field rc "$out")" || return 1
+  assert_eq "write fail conflict: reason" "env table conflicts with the env array" \
+    "$(field errreason "$out")" || return 1
+  assert_eq "write fail conflict: path" "$d/miserc.local.toml" "$(field errpath "$out")" || return 1
+  assert_file_eq "write fail conflict: local untouched" '[env]
+x = 1
+' "$d/miserc.local.toml" || return 1
+  assert_eq "write fail conflict: no .bak or scratch" "0" "$(count_scratch "$d")" || return 1
+
+  write_file "$d/miserc.local.toml" "$original"
+  write_file "$d/miserc.toml" 'env = ["a"]'
+  chmod 000 "$d/miserc.toml"
+  out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write fail unreadable: rc" "1" "$(field rc "$out")" || return 1
+  assert_eq "write fail unreadable: reason" "cannot read file" "$(field errreason "$out")" || return 1
+  assert_eq "write fail unreadable: path" "$d/miserc.toml" "$(field errpath "$out")" || return 1
+  assert_file_eq "write fail unreadable: local untouched" "$original" "$d/miserc.local.toml" || return 1
+  assert_eq "write fail unreadable: no .bak or scratch" "0" "$(count_scratch "$d")"
+  rm_tree "$h"
+}
+
+# write_atomic creates missing parent directories, so the only thing keeping a
+# rejected run from leaving an empty tree behind is that validation happens
+# before the write.
+t_local_write_failure_creates_no_directory() {
+  local h s root out
+  h=$(setup_home); s="$h/sys"; root="$h/missing/deep"
+  mkdir -p "$s"
+  write_file "$s/miserc.toml" 'env = "work"'
+  out=$(miserc_local_write MISE_CONFIG_DIR="$root" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "write no dir: rc" "1" "$(field rc "$out")" || return 1
+  assert_eq "write no dir: reason" "env must be an array" "$(field errreason "$out")" || return 1
+  if [ -e "$h/missing" ]; then
+    LAST_FAIL="a rejected write created $h/missing"
+    rm_tree "$h"
+    return 1
+  fi
+  rm_tree "$h"
+}
+
 T "sourcing bash/pmsec defines helpers without running main" t_source_guard_defines_without_running_main
 T "legacy path_mise resolver is unchanged" t_path_mise_legacy_untouched
 T "path_mise_dir override precedence" t_path_mise_dir_overrides
@@ -1456,6 +1893,22 @@ T "miserc write: unrepresentable names fail closed" t_miserc_write_rejects_unrep
 T "miserc write: env table conflicts rejected" t_miserc_write_rejects_conflicts
 T "miserc write: idempotent" t_miserc_write_idempotent
 T "miserc write: failure leaves no output" t_miserc_write_error_clears_output
+T "selector: MISE_ENV tokenization and exact membership" t_selector_mise_env_branch
+T "selector: MISE_ENV branch never touches the filesystem" t_selector_mise_env_no_filesystem
+T "selector: empty and unset MISE_ENV fall back to files" t_selector_mise_env_empty_falls_back
+T "selector: local / shared / system precedence" t_selector_file_precedence
+T "selector: env = [] stops inheritance" t_selector_empty_array_stops_inheritance
+T "selector: no definition attributes the local path" t_selector_no_definition
+T "selector: parse and read errors fail closed" t_selector_fails_closed
+T "local write: fresh file" t_local_write_fresh
+T "local write: inherits a shared list, writes local only" t_local_write_inherits_shared
+T "local write: inherits a system list" t_local_write_inherits_system
+T "local write: replaces the assignment, surrounding bytes kept" t_local_write_replaces_assignment
+T "local write: idempotent with the .bak preserved" t_local_write_idempotent
+T "local write: MISE_ENV never feeds inheritance" t_local_write_ignores_mise_env
+T "local write: local env = [] becomes [pmsec]" t_local_write_local_empty_array
+T "local write: failures leave the target untouched" t_local_write_failure_leaves_target_untouched
+T "local write: a rejected write creates no directory" t_local_write_failure_creates_no_directory
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
