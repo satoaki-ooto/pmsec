@@ -17,8 +17,6 @@
 # accepts unique prefixes, so `pmsec -V` would bind to `-Verbose` instead of
 # reaching us as the `--version` short flag. Reading $args directly bypasses
 # parameter binding entirely.
-$Argv = $args
-
 $ErrorActionPreference = 'Stop'
 $script:PmsecVersion = '2026.11.8'
 # Default cooldown for the hardening bundle. Override per-invocation with
@@ -32,21 +30,38 @@ $script:Tools = @('npm','pnpm','yarn','bun','cargo','mise','uv','bundler','aube'
 # Windows host) or 'linux' (a WSL distribution accessed via UNC path).
 # CmdEnable / CmdCheck / CmdDisable iterate scopes and assign $script:Scope
 # so the path/IO helpers below resolve against the active scope.
+#
+# Scope records also carry the mise-layering fields the per-scope seams need
+# (see the "mise layering" section): Fake ($true for PMSEC_FAKE_SCOPES test
+# scopes), Distro + WslRoot (real WSL scopes only), FakeState (per-scope
+# PMSEC_FAKE_SCOPE_DATA, parsed lazily), and the lazy Environment / MiseContext
+# caches. None of them reach CLI output.
 $script:Scope = $null
 
-function Get-PmsecPlatform {
-  if ($script:Scope) { return $script:Scope.Platform }
+# Scope-record accessors that take the record explicitly. Helpers that must work
+# for a scope other than $script:Scope (the test-only seams, and anything called
+# while enumerating scopes) go through these instead of the ambient variable.
+function Get-ScopePlatform($Scope) {
+  if ($null -ne $Scope) { return $Scope['Platform'] }
   return 'win32'
+}
+
+function Get-PmsecPlatform {
+  return (Get-ScopePlatform $script:Scope)
+}
+
+function Get-ScopeHome($Scope) {
+  if ($null -ne $Scope) { return $Scope['Home'] }
+  if ($env:PMSEC_HOME) { return $env:PMSEC_HOME }
+  if ($env:USERPROFILE) { return $env:USERPROFILE }
+  return $HOME
 }
 
 # Pmsec ignores PowerShell's session-static $HOME so tests can override paths
 # via $env:USERPROFILE / $env:PMSEC_HOME at runtime. Honored only outside an
 # active scope (i.e., for raw helpers, not for per-scope file operations).
 function Get-PmsecHome {
-  if ($script:Scope) { return $script:Scope.Home }
-  if ($env:PMSEC_HOME) { return $env:PMSEC_HOME }
-  if ($env:USERPROFILE) { return $env:USERPROFILE }
-  return $HOME
+  return (Get-ScopeHome $script:Scope)
 }
 
 # Env-var overrides for tool config paths only apply when writing to the
@@ -122,12 +137,7 @@ function Get-CargoPath {
   return (PathJoin (Get-PmsecHome) '.cargo' 'config.toml')
 }
 function Get-MisePath {
-  if ((Get-PmsecPlatform) -eq 'win32') {
-    if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
-    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-PmsecHome) 'AppData' 'Local' }
-    return (PathJoin $base 'mise' 'config.toml')
-  }
-  return (PathJoin (Get-PmsecHome) '.config' 'mise' 'config.toml')
+  return (Get-MisePathForScope $script:Scope)
 }
 # Bundler's global config. BUNDLE_USER_CONFIG points at the file directly;
 # BUNDLE_USER_HOME points at the home dir (config = <home>/config). Both
@@ -166,6 +176,19 @@ function Get-ComposerPath {
 
 # ---------- scope discovery ----------
 
+# One shape for every scope record, including the mise-layering fields. Fake
+# marks the PMSEC_FAKE_SCOPES stand-ins: they must never spawn a host binary or
+# wsl.exe, and their environment paths are host paths (no UNC translation).
+# Distro/WslRoot stay empty for the Windows host and are filled in for real WSL
+# scopes by Get-WslDistros.
+function New-ScopeRecord([string]$Label, [string]$ScopeHome, [string]$Platform, [bool]$Fake) {
+  return @{
+    Label = $Label; Home = $ScopeHome; Platform = $Platform
+    Fake = $Fake; Distro = $null; WslRoot = $null
+    FakeState = $null; Environment = $null; MiseContext = $null
+  }
+}
+
 # Build the list of scopes pmsec writes to:
 #   1. The Windows host (always present).
 #   2. Each installed WSL distribution, accessed via the `\\wsl$\<distro>\...`
@@ -181,7 +204,7 @@ function Get-PmsecScopes([bool]$IncludeWsl) {
       if ([string]::IsNullOrWhiteSpace($spec)) { continue }
       $parts = $spec -split '\|', 3
       if ($parts.Count -lt 3) { continue }
-      $entry = @{ Label = $parts[0]; Home = $parts[1]; Platform = $parts[2] }
+      $entry = New-ScopeRecord $parts[0] $parts[1] $parts[2] $true
       # Treat any non-win32 fake scope as a stand-in for a WSL distro so
       # --no-wsl / PMSEC_NO_WSL=1 has the same effect under test.
       if (-not $IncludeWsl -and $entry.Platform -ne 'win32') { continue }
@@ -191,7 +214,7 @@ function Get-PmsecScopes([bool]$IncludeWsl) {
   }
   $hostHome = if ($env:PMSEC_HOME) { $env:PMSEC_HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
   $list = New-Object System.Collections.Generic.List[hashtable]
-  $list.Add(@{ Label = 'windows'; Home = $hostHome; Platform = 'win32' })
+  $list.Add((New-ScopeRecord 'windows' $hostHome 'win32' $false))
   if ($IncludeWsl) {
     foreach ($d in (Get-WslDistros)) { $list.Add($d) }
   }
@@ -227,9 +250,551 @@ function Get-WslDistros {
     $wslHome = ([string]$wslHome).Trim() -replace "`0",''
     if ($wslHome -eq '' -or -not $wslHome.StartsWith('/')) { continue }
     $unc = '\\wsl$\' + $name + ($wslHome -replace '/', '\')
-    $list.Add(@{ Label = "wsl-$name"; Home = $unc; Platform = 'linux' })
+    # Home stays the exact UNC string pmsec has always written through; the
+    # distro name and root are kept separately so the mise seams can probe the
+    # same distro and translate POSIX paths back into this scope's filesystem.
+    $entry = New-ScopeRecord "wsl-$name" $unc 'linux' $false
+    $entry.Distro = $name
+    $entry.WslRoot = '\\wsl$\' + $name
+    $list.Add($entry)
   }
   return ,$list.ToArray()
+}
+
+# ---------- mise layering (Issue #194) ----------
+# mise >= 2026.11 can host pmsec's settings in a dedicated `config.pmsec.toml`
+# layer that a `pmsec` selector in miserc.local.toml wires in. This section is
+# the phase-2 substrate only: the new path family, a per-scope environment
+# source, and the mode gate. No CLI flow consumes it yet.
+#
+# The one intentional, human-approved behavior change in this phase lives here
+# too: a non-win32 scope resolves its *legacy* mise config from its own
+# environment (Get-MisePathForScope) instead of always <home>/.config/mise.
+# Without that, a WSL-scope MISE_GLOBAL_CONFIG_FILE would gate legacy mode while
+# pmsec wrote the default path.
+#
+# Every seam below takes a scope record instead of reading $script:Scope: the
+# Windows host and each WSL distro can see a different mise version and a
+# different environment. Version/environment probes may spawn wsl.exe, so their
+# results are memoized on the scope record (one probe per scope per invocation).
+
+# The mise variables a scope can override. Empty means unset (Phase-1 frozen
+# answer 3), so every reader below treats '' as absent.
+$script:MiseEnvKeys = @(
+  'MISE_GLOBAL_CONFIG_FILE',
+  'MISE_CONFIG_DIR',
+  'XDG_CONFIG_HOME',
+  'MISE_SYSTEM_CONFIG_DIR',
+  'MISE_ENV'
+)
+# First mise release whose config layering pmsec can use. Deliberately separate
+# from the 2026.4.22 cooldown-key floor in ToolPreflight: they gate different
+# things and must not drift into each other.
+$script:MiseNewModeFloor = @(2026, 11, 0)
+
+# Fixed probe that reads the scoped environment from inside a distro. The
+# command text is built from the constant key list above (never from scope or
+# filesystem data), and the distro name is passed as an argv element, so nothing
+# untrusted reaches a shell. Fields are separated by \002 and the whole run is
+# wrapped in \001B ... \001E (octal escapes that both dash and bash printf
+# understand) so a corrupted pipe can be detected instead of misparsed.
+$script:WslEnvProbeParts = New-Object System.Collections.Generic.List[string]
+$script:WslEnvProbeParts.Add('printf "\001B"')
+foreach ($envKey in $script:MiseEnvKeys) {
+  $script:WslEnvProbeParts.Add('printf "\002"')
+  $script:WslEnvProbeParts.Add("printenv $envKey")
+}
+$script:WslEnvProbeParts.Add('printf "\001E"')
+$script:WslEnvProbe = ($script:WslEnvProbeParts -join '; ')
+
+function Test-ScopeFake($Scope) {
+  if ($null -eq $Scope) { return $false }
+  return [bool]$Scope['Fake']
+}
+
+# A real WSL scope is the only kind whose environment paths live inside another
+# filesystem (and therefore need the \\wsl$\<distro>\... translation).
+function Test-RealWslScope($Scope) {
+  if ($null -eq $Scope) { return $false }
+  if (Test-ScopeFake $Scope) { return $false }
+  return -not [string]::IsNullOrEmpty($Scope['WslRoot'])
+}
+
+# New-mode paths describe where mise will look, so joins follow the scope's
+# platform rather than the host PowerShell happens to run on: simulated win32
+# and WSL scopes must produce the same bytes on a Linux test runner as on
+# Windows. Legacy resolvers keep PathJoin (host-shaped) to stay byte-identical.
+function Get-ScopePathSeparator($Scope) {
+  if (Test-RealWslScope $Scope) { return '\' }
+  if ((Get-ScopePlatform $Scope) -eq 'win32') { return '\' }
+  return '/'
+}
+
+function Join-ScopePath($Scope, [string]$Base, [string[]]$Parts) {
+  $sep = Get-ScopePathSeparator $Scope
+  $result = [string]$Base
+  foreach ($p in $Parts) {
+    if ([string]::IsNullOrEmpty($p)) { continue }
+    if ($result -eq '') { $result = $p; continue }
+    if ($result.EndsWith($sep)) { $result = $result + $p } else { $result = $result + $sep + $p }
+  }
+  return $result
+}
+
+# ---- scoped environment ----
+
+function Get-MiseProcessValues {
+  $values = @{}
+  foreach ($k in $script:MiseEnvKeys) {
+    $v = [Environment]::GetEnvironmentVariable($k, 'Process')
+    if (-not [string]::IsNullOrEmpty($v)) { $values[$k] = $v }
+  }
+  return $values
+}
+
+# JSON -> nested hashtables, because ConvertFrom-Json hands back PSCustomObject
+# on 5.1 as well as on 7. $null means "ignore": PMSEC_FAKE_SCOPE_DATA is
+# test-only data, so malformed content must never throw into a CLI flow.
+function ConvertFrom-PmsecJsonMap([string]$Text) {
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+  try { $obj = ConvertFrom-Json -InputObject $Text -ErrorAction Stop } catch { return $null }
+  return (ConvertTo-PmsecMap $obj)
+}
+
+function ConvertTo-PmsecMap($Value) {
+  if ($null -eq $Value) { return $null }
+  if ($Value -is [string]) { return $Value }
+  if ($Value -is [System.Collections.IDictionary]) {
+    $out = @{}
+    foreach ($k in $Value.Keys) { $out[[string]$k] = ConvertTo-PmsecMap $Value[$k] }
+    return $out
+  }
+  if ($Value -is [System.Management.Automation.PSCustomObject]) {
+    $out = @{}
+    foreach ($p in $Value.PSObject.Properties) { $out[$p.Name] = ConvertTo-PmsecMap $p.Value }
+    return $out
+  }
+  return $Value
+}
+
+# Per-scope injection for fake scopes, keyed by label:
+#   { "<label>": { "Version": "2026.11.0", "Env": { "MISE_ENV": "work" } } }
+# Parsed once per scope per invocation and cached in FakeState.
+function Get-FakeScopeData($Scope) {
+  $state = $Scope['FakeState']
+  if ($null -eq $state) {
+    $state = @{ Loaded = $false; Version = $null; Env = @{} }
+    $Scope['FakeState'] = $state
+  }
+  if ($state['Loaded']) { return $state }
+  $state['Loaded'] = $true
+  $raw = [Environment]::GetEnvironmentVariable('PMSEC_FAKE_SCOPE_DATA', 'Process')
+  $map = ConvertFrom-PmsecJsonMap ([string]$raw)
+  if ($map -isnot [System.Collections.IDictionary]) { return $state }
+  $entry = $map[[string]$Scope['Label']]
+  if ($entry -isnot [System.Collections.IDictionary]) { return $state }
+  $version = $entry['Version']
+  if ($version -is [string] -and $version -ne '') { $state['Version'] = $version }
+  $envMap = $entry['Env']
+  if ($envMap -is [System.Collections.IDictionary]) { $state['Env'] = $envMap }
+  return $state
+}
+
+# Fake scopes read the process environment so existing conformance/CLI overrides
+# keep reaching the default fake scope, then take the per-scope injections.
+# Only the five mise variables are overlaid; everything else stays process-level.
+function Get-FakeScopeEnvironment($Scope) {
+  $values = Get-MiseProcessValues
+  $injected = (Get-FakeScopeData $Scope)['Env']
+  foreach ($k in $script:MiseEnvKeys) {
+    if (-not $injected.Contains($k)) { continue }
+    $v = $injected[$k]
+    if ($v -isnot [string]) { continue }
+    if ($v -eq '') { [void]$values.Remove($k) } else { $values[$k] = $v }
+  }
+  return $values
+}
+
+# Fixed-output parser for $script:WslEnvProbe: returns the value map, or $null
+# when the stream lost its sentinels / field count, or when a value arrived with
+# an embedded newline or control byte. Callers turn $null into a fail-safe
+# legacy context.
+function ConvertFrom-WslEnvProbe([string]$Text) {
+  $begin = [string][char]1 + 'B'
+  $end = [string][char]1 + 'E'
+  if ([string]::IsNullOrEmpty($Text)) { return $null }
+  $start = $Text.IndexOf($begin, [StringComparison]::Ordinal)
+  if ($start -lt 0) { return $null }
+  $stop = $Text.IndexOf($end, $start + $begin.Length, [StringComparison]::Ordinal)
+  if ($stop -lt 0) { return $null }
+  $body = $Text.Substring($start + $begin.Length, $stop - ($start + $begin.Length))
+  $parts = $body.Split([char]2)
+  if ($parts.Count -ne ($script:MiseEnvKeys.Count + 1)) { return $null }
+  if ($parts[0] -ne '') { return $null }
+  $values = @{}
+  for ($i = 0; $i -lt $script:MiseEnvKeys.Count; $i++) {
+    $seg = [string]$parts[$i + 1]
+    if ($seg.EndsWith("`n")) { $seg = $seg.Substring(0, $seg.Length - 1) }
+    if ($seg -match '[\x00-\x1F]') { return $null }
+    if ($seg -eq '') { continue }
+    $values[$script:MiseEnvKeys[$i]] = $seg
+  }
+  return $values
+}
+
+function Read-WslScopeEnvironment($Scope) {
+  $label = [string]$Scope['Label']
+  $distro = [string]$Scope['Distro']
+  if ([string]::IsNullOrEmpty($distro) -or $distro -match '[\s\\/]') {
+    return @{ Values = @{}; Error = "wsl scope '$label' has no usable distro name" }
+  }
+  if (-not (Get-Command wsl.exe -ErrorAction Ignore)) {
+    return @{ Values = @{}; Error = "wsl.exe is not available for scope '$label'" }
+  }
+  $text = ''
+  try {
+    $lines = @(& wsl.exe -d $distro -- sh -c $script:WslEnvProbe 2>$null)
+    $text = ($lines | ForEach-Object { [string]$_ }) -join "`n"
+  } catch {
+    return @{ Values = @{}; Error = "mise environment probe failed in '$distro': $($_.Exception.Message)" }
+  }
+  $values = ConvertFrom-WslEnvProbe $text
+  if ($null -eq $values) {
+    return @{ Values = @{}; Error = "unreadable mise environment in '$distro'" }
+  }
+  return @{ Values = $values; Error = $null }
+}
+
+# The mise environment for one scope: @{ Values; Error }. Real Windows and fake
+# scopes read the process environment (fake scopes with per-scope injections),
+# real WSL asks its own distro. Memoized on the scope record.
+function Get-MiseScopeEnvironment($Scope) {
+  if ($null -ne $Scope) {
+    $cached = $Scope['Environment']
+    if ($null -ne $cached) { return $cached }
+  }
+  $info = $null
+  try {
+    if ($null -eq $Scope) {
+      $info = @{ Values = (Get-MiseProcessValues); Error = $null }
+    } elseif (Test-ScopeFake $Scope) {
+      $info = @{ Values = (Get-FakeScopeEnvironment $Scope); Error = $null }
+    } elseif ((Get-ScopePlatform $Scope) -eq 'win32') {
+      $info = @{ Values = (Get-MiseProcessValues); Error = $null }
+    } else {
+      $info = Read-WslScopeEnvironment $Scope
+    }
+  } catch {
+    $info = @{ Values = @{}; Error = "mise environment unavailable: $($_.Exception.Message)" }
+  }
+  if ($null -eq $info) { $info = @{ Values = @{}; Error = 'mise environment unavailable' } }
+  if ($null -ne $Scope) { $Scope['Environment'] = $info }
+  return $info
+}
+
+# Translates an absolute POSIX path reported from inside a WSL distro into the
+# \\wsl$\<distro>\... form pmsec can address from Windows. Anything else -
+# relative paths, drive-qualified or UNC input, backslashes, NUL/control bytes,
+# and '.'/'..' traversal segments - yields $null so callers fail safe instead of
+# writing a path mise never reads. The result is only ever used as text.
+function Convert-WslPosixPath($Scope, [string]$PosixPath) {
+  if (-not (Test-RealWslScope $Scope)) { return $null }
+  $root = [string]$Scope['WslRoot']
+  if ($root -notmatch '^\\\\wsl\$\\[^\\/]+$') { return $null }
+  if ([string]::IsNullOrEmpty($PosixPath)) { return $null }
+  if ($PosixPath -match '[\x00-\x1F]') { return $null }
+  if ($PosixPath.Contains('\')) { return $null }
+  if (-not $PosixPath.StartsWith('/')) { return $null }
+  if ($PosixPath.StartsWith('//')) { return $null }
+  $segments = New-Object System.Collections.Generic.List[string]
+  foreach ($seg in ($PosixPath -split '/')) {
+    if ($seg -eq '') { continue }
+    if ($seg -eq '.' -or $seg -eq '..') { return $null }
+    $segments.Add($seg)
+  }
+  if ($segments.Count -eq 0) { return $root }
+  return ($root + '\' + ($segments.ToArray() -join '\'))
+}
+
+# Maps a scoped environment path onto something this host can address: real WSL
+# scopes report POSIX paths (translated to UNC), fake scopes carry host test
+# paths (kept verbatim so conformance temp dirs keep working). $null means the
+# value cannot be addressed, and every caller fails safe on it.
+function Convert-ScopePathForWrite($Scope, [string]$Value) {
+  if ([string]::IsNullOrEmpty($Value)) { return $null }
+  if ($Value -match '[\x00-\x1F]') { return $null }
+  if (-not (Test-RealWslScope $Scope)) { return $Value }
+  return (Convert-WslPosixPath $Scope $Value)
+}
+
+function New-ScopePathError($Scope, [string]$Name, [string]$Value) {
+  $label = ''
+  if ($null -ne $Scope) { $label = [string]$Scope['Label'] }
+  $shown = $Value -replace '[\x00-\x1F]', '?'
+  return ("unusable $Name for scope '$label': $shown")
+}
+
+# ---- legacy path, now scope-aware ----
+
+# The single global config file mise reads today. Windows resolution is
+# unchanged byte for byte. A non-win32 scope (WSL or fake) now resolves from its
+# own environment - nonempty MISE_GLOBAL_CONFIG_FILE, else nonempty
+# XDG_CONFIG_HOME/mise, else <home>/.config/mise - which is the phase-2
+# intentional fix. Joins stay host-shaped (PathJoin) so existing output does not
+# move; real-WSL values arrive as POSIX paths and are translated to UNC first.
+function Get-MisePathForScope($Scope) {
+  if ((Get-ScopePlatform $Scope) -eq 'win32') {
+    if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
+    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-ScopeHome $Scope) 'AppData' 'Local' }
+    return (PathJoin $base 'mise' 'config.toml')
+  }
+  $values = (Get-MiseScopeEnvironment $Scope)['Values']
+  if ($null -ne $values) {
+    $global = $values['MISE_GLOBAL_CONFIG_FILE']
+    if (-not [string]::IsNullOrEmpty($global)) {
+      $mapped = Convert-ScopePathForWrite $Scope $global
+      if (-not [string]::IsNullOrEmpty($mapped)) { return $mapped }
+    }
+    $xdg = $values['XDG_CONFIG_HOME']
+    if (-not [string]::IsNullOrEmpty($xdg)) {
+      $mapped = Convert-ScopePathForWrite $Scope $xdg
+      if (-not [string]::IsNullOrEmpty($mapped)) {
+        # A real WSL value is a \\wsl$\... UNC path, which Join-Path cannot
+        # resolve off-drive; the scope separator yields the same bytes Windows
+        # produces and stays testable on a non-Windows host.
+        if (Test-RealWslScope $Scope) { return (Join-ScopePath $Scope $mapped @('mise', 'config.toml')) }
+        return (PathJoin $mapped 'mise' 'config.toml')
+      }
+    }
+  }
+  return (PathJoin (Get-ScopeHome $Scope) '.config' 'mise' 'config.toml')
+}
+
+# ---- new path family ----
+
+# Where mise's system-wide config lives. Windows: under the *current* drive root
+# ($DriveRoot is injected for tests; production derives it from the working
+# location, since a D:-only host must not read C:). WSL: /etc/mise inside the
+# distro, expressed as a UNC path under this scope.
+function Get-DefaultSystemMiserc($Scope, [string]$DriveRoot) {
+  if (Test-RealWslScope $Scope) {
+    $unc = Convert-WslPosixPath $Scope '/etc/mise/miserc.toml'
+    if (-not [string]::IsNullOrEmpty($unc)) { return $unc }
+    return '/etc/mise/miserc.toml'
+  }
+  if ((Get-ScopePlatform $Scope) -eq 'win32') {
+    $root = [string]$DriveRoot
+    if (-not [string]::IsNullOrEmpty($root)) { $root = $root.TrimEnd([char[]]@('\', '/')) }
+    if ([string]::IsNullOrEmpty($root)) { return '\etc\mise\miserc.toml' }
+    return ($root + '\etc\mise\miserc.toml')
+  }
+  return '/etc/mise/miserc.toml'
+}
+
+# Production drive root for the win32 system miserc default.
+function Get-CurrentDriveRoot {
+  $path = $null
+  try { $path = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath } catch { $path = $null }
+  if ([string]::IsNullOrEmpty($path)) {
+    try { $path = (Get-Location).Path } catch { $path = $null }
+  }
+  if ([string]::IsNullOrEmpty($path)) { return '' }
+  try { return [string][System.IO.Path]::GetPathRoot($path) } catch { return '' }
+}
+
+# The whole layered path family for one scope. Pure: no filesystem access, no
+# probe, no throw. `MiseDir` never falls back to %LOCALAPPDATA% - it is
+# ~/.config/mise on every OS unless MISE_CONFIG_DIR / XDG_CONFIG_HOME say
+# otherwise. `Error` is non-empty when a scoped override could not be addressed
+# (a relative WSL path, a traversal segment, ...), in which case that field fell
+# back to the next candidate and the mode gate must refuse the new layout.
+function Resolve-MiseNewPaths($Scope, $Environment, [string]$DriveRoot) {
+  if ($null -eq $Environment) { $Environment = @{} }
+  $pathError = $null
+
+  $miseDir = $null
+  $rawDir = $Environment['MISE_CONFIG_DIR']
+  if (-not [string]::IsNullOrEmpty($rawDir)) {
+    $miseDir = Convert-ScopePathForWrite $Scope $rawDir
+    if ([string]::IsNullOrEmpty($miseDir)) { $pathError = New-ScopePathError $Scope 'MISE_CONFIG_DIR' $rawDir }
+  }
+  if ([string]::IsNullOrEmpty($miseDir)) {
+    $rawXdg = $Environment['XDG_CONFIG_HOME']
+    if (-not [string]::IsNullOrEmpty($rawXdg)) {
+      $xdg = Convert-ScopePathForWrite $Scope $rawXdg
+      if ([string]::IsNullOrEmpty($xdg)) {
+        if ([string]::IsNullOrEmpty($pathError)) { $pathError = New-ScopePathError $Scope 'XDG_CONFIG_HOME' $rawXdg }
+      } else {
+        $miseDir = Join-ScopePath $Scope $xdg @('mise')
+      }
+    }
+  }
+  if ([string]::IsNullOrEmpty($miseDir)) { $miseDir = Join-ScopePath $Scope (Get-ScopeHome $Scope) @('.config', 'mise') }
+
+  $systemMiserc = $null
+  $rawSystem = $Environment['MISE_SYSTEM_CONFIG_DIR']
+  if (-not [string]::IsNullOrEmpty($rawSystem)) {
+    $systemDir = Convert-ScopePathForWrite $Scope $rawSystem
+    if ([string]::IsNullOrEmpty($systemDir)) {
+      if ([string]::IsNullOrEmpty($pathError)) { $pathError = New-ScopePathError $Scope 'MISE_SYSTEM_CONFIG_DIR' $rawSystem }
+    } else {
+      $systemMiserc = Join-ScopePath $Scope $systemDir @('miserc.toml')
+    }
+  }
+  if ([string]::IsNullOrEmpty($systemMiserc)) { $systemMiserc = Get-DefaultSystemMiserc $Scope $DriveRoot }
+
+  return @{
+    MiseDir = $miseDir
+    BaseConfig = (Join-ScopePath $Scope $miseDir @('config.toml'))
+    PmsecConfig = (Join-ScopePath $Scope $miseDir @('config.pmsec.toml'))
+    LocalMiserc = (Join-ScopePath $Scope $miseDir @('miserc.local.toml'))
+    SharedMiserc = (Join-ScopePath $Scope $miseDir @('miserc.toml'))
+    SystemMiserc = $systemMiserc
+    Error = $pathError
+  }
+}
+
+# ---- version + mode gate ----
+
+# Parses the first X.Y.Z triple in $Text into the shape VersionGte expects. The
+# same regex as VersionDetect, so the mode gate and the cooldown preflight floor
+# can never disagree about what a version string means.
+function Parse-VersionText([string]$Text) {
+  if ([string]::IsNullOrEmpty($Text)) { return $null }
+  if ($Text -notmatch '(\d+)\.(\d+)\.(\d+)') { return $null }
+  return @{ Major = [int]$Matches[1]; Minor = [int]$Matches[2]; Patch = [int]$Matches[3]; Raw = $Matches[0] }
+}
+
+# PMSEC_MISE_VERSION applies to every scope (it is the deterministic test/CI
+# pin). Set=$false mirrors VersionDetect: a value that carries no version falls
+# through to real detection rather than being treated as a pin.
+function Get-MiseVersionOverride {
+  $raw = [Environment]::GetEnvironmentVariable('PMSEC_MISE_VERSION', 'Process')
+  if ([string]::IsNullOrEmpty($raw)) { return @{ Set = $false; Version = $null } }
+  if ($raw -eq 'none') { return @{ Set = $true; Version = $null } }
+  $v = Parse-VersionText $raw
+  if ($null -ne $v) { return @{ Set = $true; Version = $v } }
+  return @{ Set = $false; Version = $null }
+}
+
+function Get-WslMiseVersion($Scope) {
+  $distro = [string]$Scope['Distro']
+  if ([string]::IsNullOrEmpty($distro) -or $distro -match '[\s\\/]') { return $null }
+  if (-not (Get-Command wsl.exe -ErrorAction Ignore)) { return $null }
+  $text = ''
+  try {
+    $lines = @(& wsl.exe -d $distro -- mise --version 2>$null)
+    $text = ($lines | ForEach-Object { [string]$_ }) -join "`n"
+  } catch { return $null }
+  return (Parse-VersionText $text)
+}
+
+# The mise version as seen inside the scope: injected fake value -> global
+# PMSEC_MISE_VERSION -> real detection (host for Windows, the distro's own mise
+# for WSL). Fake scopes never spawn a host binary or wsl.exe, so anything they
+# cannot resolve stays unknown and the gate keeps them on legacy.
+function Get-ScopedMiseVersion($Scope) {
+  if (Test-ScopeFake $Scope) {
+    $data = Get-FakeScopeData $Scope
+    $injected = [string]$data['Version']
+    if ($injected -ne '') {
+      if ($injected -eq 'none') { return $null }
+      return (Parse-VersionText $injected)
+    }
+    $ovr = Get-MiseVersionOverride
+    if ($ovr['Set']) { return $ovr['Version'] }
+    return $null
+  }
+  if ((Get-ScopePlatform $Scope) -eq 'win32') { return (VersionDetect 'mise') }
+  $ovr = Get-MiseVersionOverride
+  if ($ovr['Set']) { return $ovr['Version'] }
+  return (Get-WslMiseVersion $Scope)
+}
+
+# One context per scope per invocation:
+#   Version          detected (or injected) mise version, $null when unknown
+#   Environment      the five mise variables as this scope sees them
+#   Paths            the new path family plus LegacyConfig
+#   SupportsNewMode  version >= 2026.11.0, no MISE_GLOBAL_CONFIG_FILE, probes ok
+#   Error            probe / path problems, '' when everything resolved
+# Failures never throw: a failed WSL probe or an unusable scoped path degrades
+# to legacy mode with Error populated.
+function New-MiseScopeContext($Scope) {
+  $envInfo = Get-MiseScopeEnvironment $Scope
+  $values = $envInfo['Values']
+  if ($null -eq $values) { $values = @{} }
+  $ctxError = $envInfo['Error']
+  if ($null -eq $ctxError) { $ctxError = '' }
+  $envFailed = ($ctxError -ne '')
+
+  $version = $null
+  try { $version = Get-ScopedMiseVersion $Scope } catch { $version = $null }
+
+  $paths = $null
+  try { $paths = Resolve-MiseNewPaths $Scope $values (Get-CurrentDriveRoot) } catch { $paths = $null }
+  if ($null -eq $paths) {
+    $paths = @{
+      MiseDir = ''; BaseConfig = ''; PmsecConfig = ''
+      LocalMiserc = ''; SharedMiserc = ''; SystemMiserc = ''
+      Error = 'mise path resolution failed'
+    }
+  }
+  $paths['LegacyConfig'] = ''
+  try {
+    $paths['LegacyConfig'] = [string](Get-MisePathForScope $Scope)
+  } catch {
+    # Legacy resolution is host-shaped (PathJoin) and can fail on a synthetic
+    # scope whose home belongs to another OS; keep the rest of the family and
+    # report it instead of losing the whole context.
+    if ([string]::IsNullOrEmpty($paths['Error'])) { $paths['Error'] = 'legacy mise path unavailable: ' + $_.Exception.Message }
+  }
+  $pathError = $paths['Error']
+  if ($null -eq $pathError) { $pathError = '' }
+  if ($pathError -ne '') {
+    if ($envFailed) { $ctxError = $ctxError + '; ' + $pathError } else { $ctxError = $pathError }
+  }
+
+  $supports = $true
+  if ($envFailed) { $supports = $false }
+  if ($null -eq $version) { $supports = $false }
+  elseif (-not (VersionGte $version $script:MiseNewModeFloor)) { $supports = $false }
+  if (-not [string]::IsNullOrEmpty($values['MISE_GLOBAL_CONFIG_FILE'])) { $supports = $false }
+  if ($pathError -ne '') { $supports = $false }
+
+  return @{
+    Version = $version
+    Environment = $values
+    Paths = $paths
+    SupportsNewMode = $supports
+    Error = $ctxError
+  }
+}
+
+# Cached per scope: callers repeat this for every tool, and a real WSL scope
+# pays for two wsl.exe calls to build it. A context is never reused across CLI
+# invocations because scope records are rebuilt per invocation.
+function Get-MiseScopeContext($Scope) {
+  if ($null -eq $Scope) { return (New-MiseScopeContext $null) }
+  $cached = $Scope['MiseContext']
+  if ($null -ne $cached) { return $cached }
+  $ctx = $null
+  try {
+    $ctx = New-MiseScopeContext $Scope
+  } catch {
+    $message = 'mise context unavailable'
+    try { if ($_.Exception.Message) { $message = 'mise context unavailable: ' + $_.Exception.Message } } catch { }
+    $ctx = @{
+      Version = $null; Environment = @{}
+      Paths = @{
+        MiseDir = ''; BaseConfig = ''; PmsecConfig = ''; LocalMiserc = ''
+        SharedMiserc = ''; SystemMiserc = ''; LegacyConfig = ''
+        Error = $message
+      }
+      SupportsNewMode = $false; Error = $message
+    }
+  }
+  $Scope['MiseContext'] = $ctx
+  return $ctx
 }
 
 # ---------- line buffer ----------
@@ -1787,38 +2352,46 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
 }
 
 # ---------- entry ----------
+# Dot-sourcing (`. ./pmsec.ps1`) only defines the functions above so tests and
+# operators can call them in-process; it must not parse argv, write files, or
+# exit. `$MyInvocation.InvocationName` is exactly '.' when the script was
+# dot-sourced, and stays the script path for `pwsh -File pmsec.ps1` / `.\pmsec.ps1`,
+# so the guarded block below runs byte-for-byte as it always has.
+if ($MyInvocation.InvocationName -ne '.') {
+  $Argv = $args
 
-try {
-  $opts = ParseArgs $Argv
-} catch {
-  StdErr "pmsec: $_"
-  exit 2
-}
-
-if ($opts.Version) { Write-Output "pmsec $($script:PmsecVersion)"; exit 0 }
-if ($opts.Help) { PrintUsage; exit 0 }
-
-try {
-  $targets = SelectTools $opts.Only
-} catch {
-  StdErr "pmsec: $_"
-  exit 2
-}
-
-$scopes = Get-PmsecScopes (-not $opts.NoWsl)
-if ($scopes.Count -eq 0) {
-  StdErr 'pmsec: no scopes resolved (PMSEC_FAKE_SCOPES set but empty?)'
-  exit 2
-}
-
-try {
-  switch ($opts.Mode) {
-    'check'   { exit (CmdCheck $targets $opts.Json $opts.Days $scopes) }
-    'disable' { exit (CmdDisable $targets $opts.Json $scopes) }
-    'doctor'  { exit (CmdDoctor $targets $opts.Json $scopes) }
-    default   { exit (CmdEnable $targets $opts.Json $opts.Days $opts.Force $scopes) }
+  try {
+    $opts = ParseArgs $Argv
+  } catch {
+    StdErr "pmsec: $_"
+    exit 2
   }
-} catch {
-  StdErr "pmsec: $_"
-  exit 1
+
+  if ($opts.Version) { Write-Output "pmsec $($script:PmsecVersion)"; exit 0 }
+  if ($opts.Help) { PrintUsage; exit 0 }
+
+  try {
+    $targets = SelectTools $opts.Only
+  } catch {
+    StdErr "pmsec: $_"
+    exit 2
+  }
+
+  $scopes = Get-PmsecScopes (-not $opts.NoWsl)
+  if ($scopes.Count -eq 0) {
+    StdErr 'pmsec: no scopes resolved (PMSEC_FAKE_SCOPES set but empty?)'
+    exit 2
+  }
+
+  try {
+    switch ($opts.Mode) {
+      'check'   { exit (CmdCheck $targets $opts.Json $opts.Days $scopes) }
+      'disable' { exit (CmdDisable $targets $opts.Json $scopes) }
+      'doctor'  { exit (CmdDoctor $targets $opts.Json $scopes) }
+      default   { exit (CmdEnable $targets $opts.Json $opts.Days $opts.Force $scopes) }
+    }
+  } catch {
+    StdErr "pmsec: $_"
+    exit 1
+  }
 }

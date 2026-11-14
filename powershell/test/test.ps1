@@ -41,15 +41,17 @@ function NewHome {
   return $d
 }
 
-function InvokePmsec([string]$HomeDir, [hashtable]$Extra, [string[]]$Argv) {
+function InvokePmsec([string]$HomeDir, [hashtable]$Extra, [string[]]$Argv, [string]$ScriptPath = '') {
   $envKeys = @(
     'NPM_CONFIG_USERCONFIG','UV_CONFIG_FILE','BUN_CONFIG_FILE',
     'PMSEC_PNPM_CONFIG_FILE','PMSEC_PNPM_CONFIG_YAML',
     'YARN_RC_FILENAME','CARGO_HOME','MISE_GLOBAL_CONFIG_FILE',
+    'MISE_CONFIG_DIR','MISE_ENV','MISE_SYSTEM_CONFIG_DIR',
     'AUBE_CONFIG_FILE','COMPOSER_HOME',
     'BUNDLE_USER_CONFIG','BUNDLE_USER_HOME',
     'APPDATA','LOCALAPPDATA','XDG_CONFIG_HOME',
     'PMSEC_HOME','HOME','USERPROFILE','PMSEC_FAKE_SCOPES','PMSEC_NO_WSL',
+    'PMSEC_FAKE_SCOPE_DATA',
     'PMSEC_NPM_VERSION','PMSEC_PNPM_VERSION','PMSEC_YARN_VERSION',
     'PMSEC_BUN_VERSION','PMSEC_CARGO_VERSION','PMSEC_MISE_VERSION','PMSEC_UV_VERSION',
     'PMSEC_AUBE_VERSION',
@@ -90,8 +92,9 @@ function InvokePmsec([string]$HomeDir, [hashtable]$Extra, [string[]]$Argv) {
   $errFile = [System.IO.Path]::GetTempFileName()
   $oldEAP = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
+  $target = if ($ScriptPath) { $ScriptPath } else { $Pmsec }
   try {
-    $stdout = (& $PwshExe -NoProfile -File $Pmsec @Argv 2>$errFile | Out-String)
+    $stdout = (& $PwshExe -NoProfile -File $target @Argv 2>$errFile | Out-String)
     $code = $LASTEXITCODE
     $stderr = [System.IO.File]::ReadAllText($errFile)
   } finally {
@@ -121,6 +124,20 @@ function AssertMatch([string]$Label, [string]$Pattern, [string]$Haystack) {
   return $false
 }
 
+function AssertEq([string]$Label, [string]$Expected, [string]$Actual) {
+  if ($Expected -ceq $Actual) { return $true }
+  $script:LastFail = "$Label`n  expected: $Expected`n  actual:   $Actual"
+  return $false
+}
+
+# Replaces a temp home with <HOME> and normalizes newlines so two runs in
+# different sandboxes can be compared byte for byte.
+function NormalizeHome([string]$Text, [string]$HomeDir) {
+  if ($null -eq $Text) { return '' }
+  $normalized = ($Text -replace [regex]::Escape($HomeDir), '<HOME>') -replace "`r`n", "`n"
+  return $normalized
+}
+
 function T([string]$Name, [scriptblock]$Body) {
   try {
     if (& $Body) {
@@ -136,6 +153,60 @@ function T([string]$Name, [scriptblock]$Body) {
     Write-Host "FAIL  $Name (exception)"
     Write-Host $_.ToString()
   }
+}
+
+# ---------- production functions, loaded in-process ----------
+# The mise-layering seams are pure (path family, mode gate, WSL path mapping,
+# probe parsing), so they are unit tested directly. pmsec.ps1's dot-source guard
+# keeps `. $Pmsec` from parsing argv, writing files, or exiting; every
+# end-to-end assertion below still drives the real CLI as a child process.
+. $Pmsec
+
+# Fake-scope record ("one WSL distro stand-in", or a simulated Windows host)
+# built through the production constructor so it carries the same fields.
+function NewTestScope([string]$Label, [string]$ScopeHome, [string]$Platform) {
+  return (New-ScopeRecord $Label $ScopeHome $Platform $true)
+}
+
+# Synthetic real-WSL scope: not fake, with a distro name and \\wsl$\<distro> root.
+function NewWslTestScope([string]$Label, [string]$Distro) {
+  $s = New-ScopeRecord $Label ('\\wsl$\' + $Distro + '\home\user') 'linux' $false
+  $s.Distro = $Distro
+  $s.WslRoot = '\\wsl$\' + $Distro
+  return $s
+}
+
+# Baseline env for in-process seam tests: every mise variable cleared, the mise
+# version pinned away from the host, and no fake scopes unless the case sets them.
+function NewMiseEnvScrub {
+  return @{
+    'MISE_GLOBAL_CONFIG_FILE' = $null; 'MISE_CONFIG_DIR' = $null; 'XDG_CONFIG_HOME' = $null
+    'MISE_SYSTEM_CONFIG_DIR' = $null; 'MISE_ENV' = $null
+    'PMSEC_MISE_VERSION' = 'none'; 'PMSEC_FAKE_SCOPES' = $null; 'PMSEC_FAKE_SCOPE_DATA' = $null
+  }
+}
+
+function InvokeWithEnv([hashtable]$Values, [scriptblock]$Body) {
+  $saved = @{}
+  foreach ($k in @($Values.Keys)) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
+    [Environment]::SetEnvironmentVariable($k, $Values[$k], 'Process')
+  }
+  try { return (& $Body) } finally {
+    foreach ($k in @($Values.Keys)) {
+      [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process')
+    }
+  }
+}
+
+# PMSEC_FAKE_SCOPE_DATA payload for one scope label.
+function NewFakeScopeData([string]$Label, [string]$Version, [hashtable]$ScopeEnv) {
+  $entry = @{}
+  if (-not [string]::IsNullOrEmpty($Version)) { $entry['Version'] = $Version }
+  if ($null -ne $ScopeEnv) { $entry['Env'] = $ScopeEnv }
+  $map = @{}
+  $map[$Label] = $entry
+  return ($map | ConvertTo-Json -Compress -Depth 6)
 }
 
 # ---------- tests ----------
@@ -909,6 +980,505 @@ T 'composer preserves unrelated JSON keys and honors COMPOSER_HOME' {
     if ($text -match '"period"') { $script:LastFail = 'composer cooldown not removed'; return $false }
     return (AssertMatch 'preferred-install kept after disable' '"preferred-install": "dist"' $text)
   } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+# ---------- mise layering: dot-source guard ----------
+
+T 'dot-sourcing pmsec.ps1 defines functions without running the CLI' {
+  $h = NewHome
+  $harness = Join-Path $h 'harness.ps1'
+  $errFile = [System.IO.Path]::GetTempFileName()
+  $savedScopes = [Environment]::GetEnvironmentVariable('PMSEC_FAKE_SCOPES', 'Process')
+  $savedVersion = [Environment]::GetEnvironmentVariable('PMSEC_MISE_VERSION', 'Process')
+  try {
+    $template = @'
+. __PMSEC__
+Write-Output ('fn=' + [bool](Get-Command Get-MiseScopeContext -ErrorAction Ignore))
+Write-Output ('legacy=' + [bool](Get-Command Get-MisePathForScope -ErrorAction Ignore))
+Write-Output ('ver=' + $script:PmsecVersion)
+'@
+    $quoted = "'" + $Pmsec.Replace("'", "''") + "'"
+    [System.IO.File]::WriteAllText($harness, $template.Replace('__PMSEC__', $quoted))
+    $oldEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+      # A scope pointing inside the sandbox: if the entry block ran, it would
+      # write configs into $h before this harness could print anything.
+      [Environment]::SetEnvironmentVariable('PMSEC_FAKE_SCOPES', "test|$h|linux", 'Process')
+      [Environment]::SetEnvironmentVariable('PMSEC_MISE_VERSION', 'none', 'Process')
+      $out = (& $PwshExe -NoProfile -File $harness 2>$errFile | Out-String)
+      $code = $LASTEXITCODE
+      $err = [System.IO.File]::ReadAllText($errFile)
+    } finally {
+      $ErrorActionPreference = $oldEAP
+      [Environment]::SetEnvironmentVariable('PMSEC_FAKE_SCOPES', $savedScopes, 'Process')
+      [Environment]::SetEnvironmentVariable('PMSEC_MISE_VERSION', $savedVersion, 'Process')
+    }
+    if ($code -ne 0) { $script:LastFail = "harness exit $code`n$out`n$err"; return $false }
+    if ($err.Trim() -ne '') { $script:LastFail = "sourcing wrote stderr:`n$err"; return $false }
+    $expected = "fn=True`nlegacy=True`nver=2026.11.8`n"
+    if (-not (AssertEq 'sourcing output' $expected (NormalizeHome ([string]$out) $h))) { return $false }
+    $left = @(Get-ChildItem -LiteralPath $h -Force)
+    if ($left.Count -ne 1) {
+      $names = ($left | ForEach-Object { $_.Name }) -join ','
+      $script:LastFail = "sourcing executed the CLI: extra files in the sandbox home ($names)"
+      return $false
+    }
+    return $true
+  } finally {
+    Remove-Item -Force -LiteralPath $errFile -ErrorAction Ignore
+    Remove-Item -Recurse -Force -LiteralPath $h
+  }
+}
+
+T 'the dot-source guard leaves -File invocations byte-identical' {
+  $h1 = NewHome
+  $h2 = NewHome
+  try {
+    $source = [System.IO.File]::ReadAllText($Pmsec)
+    $guard = "if (`$MyInvocation.InvocationName -ne '.') {"
+    if (-not $source.Contains($guard)) { $script:LastFail = 'entry guard not found in pmsec.ps1'; return $false }
+    # Same file with the guard made unconditional == the pre-guard script.
+    $unguarded = Join-Path $h2 'pmsec-unguarded.ps1'
+    [System.IO.File]::WriteAllText($unguarded, $source.Replace($guard, 'if ($true) {'))
+    $runs = @(
+      @('--version'),
+      @('--tool','mise','--days','7'),
+      @('--check','--json','--tool','mise'),
+      @('--disable','--tool','mise')
+    )
+    foreach ($argv in $runs) {
+      $a = InvokePmsec $h1 $null $argv
+      $b = InvokePmsec $h2 $null $argv -ScriptPath $unguarded
+      $label = ($argv -join ' ')
+      if ($a.Code -ne $b.Code) { $script:LastFail = "exit code differs for '$label': $($a.Code) vs $($b.Code)"; return $false }
+      if (-not (AssertEq "stdout: $label" (NormalizeHome ([string]$a.Out) $h1) (NormalizeHome ([string]$b.Out) $h2))) { return $false }
+      if (-not (AssertEq "stderr: $label" (NormalizeHome ([string]$a.Err) $h1) (NormalizeHome ([string]$b.Err) $h2))) { return $false }
+    }
+    $f1 = PathJoin $h1 '.config' 'mise' 'config.toml'
+    $f2 = PathJoin $h2 '.config' 'mise' 'config.toml'
+    if (-not (Test-Path -LiteralPath $f1) -or -not (Test-Path -LiteralPath $f2)) {
+      $script:LastFail = 'guarded and unguarded runs did not write the same mise config'
+      return $false
+    }
+    return (AssertEq 'mise config bytes' ([System.IO.File]::ReadAllText($f1)) ([System.IO.File]::ReadAllText($f2)))
+  } finally {
+    Remove-Item -Recurse -Force -LiteralPath $h1
+    Remove-Item -Recurse -Force -LiteralPath $h2
+  }
+}
+
+# ---------- mise layering: legacy paths ----------
+
+T 'win32 legacy mise path keeps LOCALAPPDATA and the MISE_GLOBAL_CONFIG_FILE override' {
+  $h = NewHome
+  try {
+    $local = PathJoin $h 'localappdata'
+    $winScope = "windows|$h|win32"
+    $r = InvokePmsec $h @{ LOCALAPPDATA = $local; PMSEC_FAKE_SCOPES = $winScope } @('--tool','mise')
+    if ($r.Code -ne 0) { $script:LastFail = "enable exit $($r.Code)`n$($r.Err)"; return $false }
+    if (-not (Test-Path -LiteralPath (PathJoin $local 'mise' 'config.toml'))) {
+      $script:LastFail = "win32 mise config not under LOCALAPPDATA`n$($r.Out)"
+      return $false
+    }
+    $pinned = PathJoin $h 'pinned' 'mise.toml'
+    $r = InvokePmsec $h @{ LOCALAPPDATA = $local; MISE_GLOBAL_CONFIG_FILE = $pinned; PMSEC_FAKE_SCOPES = $winScope } @('--tool','mise','--days','2')
+    if ($r.Code -ne 0) { $script:LastFail = "pinned enable exit $($r.Code)`n$($r.Err)"; return $false }
+    if (-not (Test-Path -LiteralPath $pinned)) { $script:LastFail = "pinned mise config missing: $pinned`n$($r.Out)"; return $false }
+    return (AssertMatch 'pinned cooldown' '(?m)^minimum_release_age = "2d"$' ([System.IO.File]::ReadAllText($pinned)))
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+T 'fake linux scope honors a scoped MISE_GLOBAL_CONFIG_FILE for the legacy path' {
+  $h = NewHome
+  try {
+    $pinned = PathJoin $h 'custom' 'mise.toml'
+    $r = InvokePmsec $h @{ MISE_GLOBAL_CONFIG_FILE = $pinned } @('--tool','mise')
+    if ($r.Code -ne 0) { $script:LastFail = "enable exit $($r.Code)`n$($r.Err)"; return $false }
+    if (-not (Test-Path -LiteralPath $pinned)) { $script:LastFail = "scoped override ignored, expected $pinned`n$($r.Out)"; return $false }
+    if (Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'config.toml')) {
+      $script:LastFail = 'enable also wrote the default path for an overridden scope'
+      return $false
+    }
+    $c = InvokePmsec $h @{ MISE_GLOBAL_CONFIG_FILE = $pinned } @('--check','--json','--tool','mise')
+    $row = ($c.Out | ConvertFrom-Json).rows[0]
+    if (-not (AssertEq 'check path' $pinned ([string]$row.path))) { return $false }
+    return (AssertEq 'check days' '1' ([string]$row.days))
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+T 'fake linux scope honors a scoped XDG_CONFIG_HOME for the legacy path' {
+  $h = NewHome
+  try {
+    $xdg = PathJoin $h 'xdg'
+    $r = InvokePmsec $h @{ XDG_CONFIG_HOME = $xdg } @('--tool','mise')
+    if ($r.Code -ne 0) { $script:LastFail = "enable exit $($r.Code)`n$($r.Err)"; return $false }
+    if (-not (Test-Path -LiteralPath (PathJoin $xdg 'mise' 'config.toml'))) {
+      $script:LastFail = "XDG override ignored`n$($r.Out)"
+      return $false
+    }
+    if (Test-Path -LiteralPath (PathJoin $h '.config' 'mise' 'config.toml')) {
+      $script:LastFail = 'enable also wrote ~/.config/mise for an XDG scope'
+      return $false
+    }
+    return (AssertEq 'enable line' ('enable  mise [' + (PathJoin $xdg 'mise' 'config.toml') + ']') ([string]$r.Out).Trim())
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+T 'empty scoped MISE_GLOBAL_CONFIG_FILE and XDG_CONFIG_HOME mean unset' {
+  $h = NewHome
+  try {
+    $r = InvokePmsec $h @{ MISE_GLOBAL_CONFIG_FILE = ''; XDG_CONFIG_HOME = '' } @('--tool','mise')
+    if ($r.Code -ne 0) { $script:LastFail = "enable exit $($r.Code)`n$($r.Err)"; return $false }
+    $default = PathJoin $h '.config' 'mise' 'config.toml'
+    if (-not (Test-Path -LiteralPath $default)) { $script:LastFail = "expected the default path $default`n$($r.Out)"; return $false }
+    return (AssertEq 'enable line' ('enable  mise [' + $default + ']') ([string]$r.Out).Trim())
+  } finally { Remove-Item -Recurse -Force -LiteralPath $h }
+}
+
+# ---------- mise layering: new path family ----------
+
+T 'new path family: MISE_CONFIG_DIR beats XDG beats ~/.config/mise on every platform' {
+  $linux = NewTestScope 'linux' '/home/user' 'linux'
+  $ok = $true
+
+  $p = Resolve-MiseNewPaths $linux @{ MISE_CONFIG_DIR = '/mise'; XDG_CONFIG_HOME = '/xdg' } ''
+  $ok = $ok -and (AssertEq 'config-dir wins' '/mise' $p['MiseDir'])
+  $ok = $ok -and (AssertEq 'config-dir base' '/mise/config.toml' $p['BaseConfig'])
+  $ok = $ok -and (AssertEq 'config-dir pmsec' '/mise/config.pmsec.toml' $p['PmsecConfig'])
+  $ok = $ok -and (AssertEq 'config-dir local miserc' '/mise/miserc.local.toml' $p['LocalMiserc'])
+  $ok = $ok -and (AssertEq 'config-dir shared miserc' '/mise/miserc.toml' $p['SharedMiserc'])
+  $ok = $ok -and (AssertEq 'config-dir no error' '' $p['Error'])
+  if (-not $ok) { return $false }
+
+  $p = Resolve-MiseNewPaths $linux @{ XDG_CONFIG_HOME = '/xdg' } ''
+  $ok = (AssertEq 'xdg mise dir' '/xdg/mise' $p['MiseDir'])
+  $ok = $ok -and (AssertEq 'xdg pmsec config' '/xdg/mise/config.pmsec.toml' $p['PmsecConfig'])
+  $ok = $ok -and (AssertEq 'xdg shared miserc' '/xdg/mise/miserc.toml' $p['SharedMiserc'])
+  if (-not $ok) { return $false }
+
+  $p = Resolve-MiseNewPaths $linux @{ MISE_CONFIG_DIR = ''; XDG_CONFIG_HOME = '' } ''
+  $ok = AssertEq 'empty overrides fall through' '/home/user/.config/mise' $p['MiseDir']
+  if (-not $ok) { return $false }
+
+  # win32: the new directory is ~/.config/mise, never %LOCALAPPDATA%.
+  $win = NewTestScope 'windows' 'C:\Users\user' 'win32'
+  $p = Resolve-MiseNewPaths $win @{ LOCALAPPDATA = 'C:\Users\user\AppData\Local' } 'D:\'
+  $ok = (AssertEq 'win32 mise dir' 'C:\Users\user\.config\mise' $p['MiseDir'])
+  $ok = $ok -and (AssertEq 'win32 base config' 'C:\Users\user\.config\mise\config.toml' $p['BaseConfig'])
+  $ok = $ok -and (AssertEq 'win32 local miserc' 'C:\Users\user\.config\mise\miserc.local.toml' $p['LocalMiserc'])
+  if ($p['MiseDir'] -match 'AppData') { $script:LastFail = 'LOCALAPPDATA leaked into the new mise dir'; return $false }
+  if (-not $ok) { return $false }
+
+  $p = Resolve-MiseNewPaths $win @{ MISE_CONFIG_DIR = 'C:\mise'; XDG_CONFIG_HOME = 'C:\xdg' } 'D:\'
+  $ok = (AssertEq 'win32 config dir wins' 'C:\mise' $p['MiseDir'])
+  $ok = $ok -and (AssertEq 'win32 config dir pmsec' 'C:\mise\config.pmsec.toml' $p['PmsecConfig'])
+  return $ok
+}
+
+T 'new path family: system miserc override, defaults and the injected drive root' {
+  $linux = NewTestScope 'linux' '/home/user' 'linux'
+  $win = NewTestScope 'windows' 'C:\Users\user' 'win32'
+  $ok = $true
+
+  $p = Resolve-MiseNewPaths $linux @{ MISE_SYSTEM_CONFIG_DIR = '/opt/mise' } ''
+  $ok = $ok -and (AssertEq 'linux system override' '/opt/mise/miserc.toml' $p['SystemMiserc'])
+  $p = Resolve-MiseNewPaths $linux @{ MISE_SYSTEM_CONFIG_DIR = '' } ''
+  $ok = $ok -and (AssertEq 'empty system dir falls through' '/etc/mise/miserc.toml' $p['SystemMiserc'])
+  if (-not $ok) { return $false }
+
+  $p = Resolve-MiseNewPaths $win @{} 'D:\'
+  $ok = AssertEq 'win32 drive root' 'D:\etc\mise\miserc.toml' $p['SystemMiserc']
+  $p = Resolve-MiseNewPaths $win @{} 'C:\'
+  $ok = $ok -and (AssertEq 'win32 other drive root' 'C:\etc\mise\miserc.toml' $p['SystemMiserc'])
+  $p = Resolve-MiseNewPaths $win @{} ''
+  $ok = $ok -and (AssertEq 'win32 drive-less root' '\etc\mise\miserc.toml' $p['SystemMiserc'])
+  $p = Resolve-MiseNewPaths $win @{ MISE_SYSTEM_CONFIG_DIR = 'C:\ProgramData\mise' } 'D:\'
+  $ok = $ok -and (AssertEq 'win32 system override beats drive root' 'C:\ProgramData\mise\miserc.toml' $p['SystemMiserc'])
+  # The system location never derives from the user profile or SystemDrive.
+  $p = Resolve-MiseNewPaths $win @{ USERPROFILE = 'C:\Users\user'; SystemDrive = 'E:' } 'D:\'
+  $ok = $ok -and (AssertEq 'win32 system ignores profile/SystemDrive' 'D:\etc\mise\miserc.toml' $p['SystemMiserc'])
+  return $ok
+}
+
+T 'new path family: real WSL scopes map every path through \\wsl$\<distro>' {
+  $wsl = NewWslTestScope 'wsl-Ubuntu' 'Ubuntu'
+  $ok = $true
+
+  $p = Resolve-MiseNewPaths $wsl @{} ''
+  $ok = $ok -and (AssertEq 'wsl mise dir' '\\wsl$\Ubuntu\home\user\.config\mise' $p['MiseDir'])
+  $ok = $ok -and (AssertEq 'wsl base config' '\\wsl$\Ubuntu\home\user\.config\mise\config.toml' $p['BaseConfig'])
+  $ok = $ok -and (AssertEq 'wsl pmsec config' '\\wsl$\Ubuntu\home\user\.config\mise\config.pmsec.toml' $p['PmsecConfig'])
+  $ok = $ok -and (AssertEq 'wsl local miserc' '\\wsl$\Ubuntu\home\user\.config\mise\miserc.local.toml' $p['LocalMiserc'])
+  $ok = $ok -and (AssertEq 'wsl shared miserc' '\\wsl$\Ubuntu\home\user\.config\mise\miserc.toml' $p['SharedMiserc'])
+  $ok = $ok -and (AssertEq 'wsl system miserc' '\\wsl$\Ubuntu\etc\mise\miserc.toml' $p['SystemMiserc'])
+  $ok = $ok -and (AssertEq 'wsl no error' '' $p['Error'])
+  if (-not $ok) { return $false }
+
+  $p = Resolve-MiseNewPaths $wsl @{ MISE_CONFIG_DIR = '/opt/mise'; MISE_SYSTEM_CONFIG_DIR = '/opt/sys' } ''
+  $ok = (AssertEq 'wsl config dir override' '\\wsl$\Ubuntu\opt\mise' $p['MiseDir'])
+  $ok = $ok -and (AssertEq 'wsl system override' '\\wsl$\Ubuntu\opt\sys\miserc.toml' $p['SystemMiserc'])
+  if (-not $ok) { return $false }
+
+  $p = Resolve-MiseNewPaths $wsl @{ XDG_CONFIG_HOME = '/xdg' } ''
+  return (AssertEq 'wsl xdg' '\\wsl$\Ubuntu\xdg\mise' $p['MiseDir'])
+}
+
+T 'WSL legacy path resolves from the distro environment as UNC' {
+  $cached = @{ Values = @{ MISE_GLOBAL_CONFIG_FILE = '/custom/mise.toml' }; Error = $null }
+  $wsl = NewWslTestScope 'wsl-Ubuntu' 'Ubuntu'
+  $wsl['Environment'] = $cached
+  $ctx = Get-MiseScopeContext $wsl
+  $ok = AssertEq 'wsl legacy override' '\\wsl$\Ubuntu\custom\mise.toml' $ctx['Paths']['LegacyConfig']
+  # A pinned legacy file rules out the layered layout, exactly like on Windows.
+  $ok = $ok -and (AssertEq 'wsl override forces legacy mode' 'False' ([string]$ctx['SupportsNewMode']))
+  if (-not $ok) { return $false }
+
+  $wsl = NewWslTestScope 'wsl-Ubuntu' 'Ubuntu'
+  $wsl['Environment'] = @{ Values = @{ XDG_CONFIG_HOME = '/xdg' }; Error = $null }
+  $ctx = Get-MiseScopeContext $wsl
+  return (AssertEq 'wsl legacy xdg' '\\wsl$\Ubuntu\xdg\mise\config.toml' $ctx['Paths']['LegacyConfig'])
+}
+
+T 'Convert-WslPosixPath rejects anything that is not a plain absolute POSIX path' {
+  $wsl = NewWslTestScope 'wsl-Ubuntu' 'Ubuntu'
+  $fake = NewTestScope 'test' '/home/user' 'linux'
+  $nul = [string][char]0
+  $ok = AssertEq 'accepts a config dir' '\\wsl$\Ubuntu\home\user\.config\mise' (Convert-WslPosixPath $wsl '/home/user/.config/mise')
+  $ok = $ok -and (AssertEq 'accepts the distro root' '\\wsl$\Ubuntu' (Convert-WslPosixPath $wsl '/'))
+  $ok = $ok -and (AssertEq 'collapses duplicate slashes' '\\wsl$\Ubuntu\a\b' (Convert-WslPosixPath $wsl '/a//b'))
+  if (-not $ok) { return $false }
+
+  # Built as variables: `+` next to a comma-separated list would coerce the
+  # rest of the array into one string (PowerShell gives ',' higher precedence).
+  $newlinePath = '/a/' + "`n" + 'b'
+  $nulPath = '/a/' + $nul + 'b'
+  $rejected = @(
+    'relative/path',
+    'rel.txt',
+    'C:\Users\user',
+    'C:/Users/user',
+    '\\server\share',
+    '//server/share',
+    '/a/../b',
+    '/a/./b',
+    '/../etc/passwd',
+    $newlinePath,
+    $nulPath,
+    'back\slash',
+    ''
+  )
+  foreach ($raw in $rejected) {
+    $label = $raw -replace '[\x00-\x1F]', '<ctl>'
+    $mapped = Convert-WslPosixPath $wsl $raw
+    if ($null -ne $mapped) {
+      $script:LastFail = "accepted an unsafe WSL path ($label) as $mapped"
+      return $false
+    }
+  }
+  # Fake scopes never get UNC translation: their paths stay host paths.
+  if ($null -ne (Convert-WslPosixPath $fake '/home/user/.config/mise')) {
+    $script:LastFail = 'fake scopes must not be translated to UNC paths'
+    return $false
+  }
+  # A root that is not \\wsl$\<distro> is unusable.
+  $bad = NewWslTestScope 'wsl-bad' 'Ubuntu'
+  $bad.WslRoot = '\\wsl$\Bad\deep'
+  return (AssertEq 'malformed wsl root rejected' '' (Convert-WslPosixPath $bad '/etc/mise'))
+}
+
+T 'unusable scoped paths fail safe instead of throwing' {
+  # An override that cannot be addressed on this host.
+  $wsl = NewWslTestScope 'wsl-Ubuntu' 'Ubuntu'
+  $wsl['Environment'] = @{ Values = @{ MISE_CONFIG_DIR = 'relative/dir' }; Error = $null }
+  $ctx = Get-MiseScopeContext $wsl
+  if ([string]::IsNullOrEmpty($ctx['Error'])) { $script:LastFail = 'expected an error for an unusable MISE_CONFIG_DIR'; return $false }
+  $ok = AssertEq 'falls back to the default dir' '\\wsl$\Ubuntu\home\user\.config\mise' $ctx['Paths']['MiseDir']
+  $ok = $ok -and (AssertEq 'unusable path stays legacy' 'False' ([string]$ctx['SupportsNewMode']))
+  if (-not $ok) { return $false }
+
+  # A failed distro probe (no such distro on this host) degrades to legacy too.
+  $probe = NewWslTestScope 'wsl-PmsecNoSuchDistro' 'PmsecNoSuchDistro'
+  $ctx = Get-MiseScopeContext $probe
+  if ([string]::IsNullOrEmpty($ctx['Error'])) { $script:LastFail = 'expected an error for a failed WSL probe'; return $false }
+  $ok = AssertEq 'failed probe stays legacy' 'False' ([string]$ctx['SupportsNewMode'])
+  $ok = $ok -and (AssertEq 'failed probe keeps an empty environment' '0' ([string]$ctx['Environment'].Count))
+  return $ok
+}
+
+# ---------- mise layering: mode gate ----------
+
+T 'mode matrix: only mise >= 2026.11.0 without MISE_GLOBAL_CONFIG_FILE enables the new mode' {
+  $matrix = @(
+    @{ Version = '2026.11.0';  Override = 'absent'; Expect = $true  },
+    @{ Version = '2026.11.0';  Override = '';       Expect = $true  },
+    @{ Version = '2026.11.0';  Override = 'pinned'; Expect = $false },
+    @{ Version = '2026.12.0';  Override = 'absent'; Expect = $true  },
+    @{ Version = '2026.10.25'; Override = 'absent'; Expect = $false },
+    @{ Version = '2026.10.25'; Override = '';       Expect = $false },
+    @{ Version = '2026.4.21';  Override = 'absent'; Expect = $false },
+    @{ Version = 'none';       Override = 'absent'; Expect = $false },
+    @{ Version = '2026.11';    Override = 'absent'; Expect = $false },
+    @{ Version = 'garbage';    Override = 'absent'; Expect = $false }
+  )
+  foreach ($case in $matrix) {
+    $scopeEnv = $null
+    if ($case.Override -ne 'absent') {
+      $value = ''
+      if ($case.Override -eq 'pinned') { $value = '/pinned/mise.toml' }
+      $scopeEnv = @{ 'MISE_GLOBAL_CONFIG_FILE' = $value }
+    }
+    $envMap = NewMiseEnvScrub
+    $envMap['PMSEC_FAKE_SCOPES'] = 'mode|/home/user|linux'
+    $envMap['PMSEC_FAKE_SCOPE_DATA'] = (NewFakeScopeData 'mode' $case.Version $scopeEnv)
+    $got = InvokeWithEnv $envMap {
+      $scopes = Get-PmsecScopes $true
+      (Get-MiseScopeContext ($scopes[0]))['SupportsNewMode']
+    }
+    if ([bool]$got -ne [bool]$case.Expect) {
+      $script:LastFail = ("version=$($case.Version) override=$($case.Override): expected $($case.Expect), got $got")
+      return $false
+    }
+  }
+  return $true
+}
+
+T 'the WSL environment probe parser fails safe on corrupted output' {
+  $b = [string][char]1 + 'B'
+  $e = [string][char]1 + 'E'
+  $sep = [string][char]2
+  # Field order is MISE_GLOBAL_CONFIG_FILE, MISE_CONFIG_DIR, XDG_CONFIG_HOME,
+  # MISE_SYSTEM_CONFIG_DIR, MISE_ENV; printenv prints nothing for unset vars.
+  $good = $b + $sep + "/custom/mise.toml`n" + $sep + "`n" + $sep + "/xdg`n" + $sep + "`n" + $sep + "work`n" + $e
+  $values = ConvertFrom-WslEnvProbe $good
+  if ($null -eq $values) { $script:LastFail = 'rejected a well-formed probe'; return $false }
+  $ok = AssertEq 'global config' '/custom/mise.toml' $values['MISE_GLOBAL_CONFIG_FILE']
+  $ok = $ok -and (AssertEq 'xdg' '/xdg' $values['XDG_CONFIG_HOME'])
+  $ok = $ok -and (AssertEq 'mise env' 'work' $values['MISE_ENV'])
+  $ok = $ok -and (AssertEq 'unset field stays out' '' ([string]$values['MISE_CONFIG_DIR']))
+  if (-not $ok) { return $false }
+
+  $newlineInsideValue = $b + $sep + "/a`nb`n" + $sep + "`n" + $sep + "`n" + $sep + "`n" + $sep + "`n" + $e
+  $noSentinels = "/custom/mise.toml`n" + $sep + "`n" + $sep + "`n" + $sep + "`n" + $sep + "`n"
+  $tooFewFields = $b + $sep + "only-one-field`n" + $e
+  $corrupted = @($newlineInsideValue, $noSentinels, $tooFewFields, '')
+  foreach ($text in $corrupted) {
+    if ($null -ne (ConvertFrom-WslEnvProbe $text)) {
+      $script:LastFail = 'accepted a corrupted WSL environment probe'
+      return $false
+    }
+  }
+  return $true
+}
+
+T 'malformed PMSEC_FAKE_SCOPE_DATA is ignored instead of throwing' {
+  $broken = @(
+    '{"mode": {"Env": {"MISE_CONFIG_DIR": "x"}',                  # truncated JSON
+    '{"mode": {"Env": {"MISE_CONFIG_DIR": 42, "MISE_ENV": 0}}}',  # non-string values
+    '{"mode": {"Version": 2026}}',                                # non-string version
+    'not json at all'
+  )
+  foreach ($payload in $broken) {
+    $envMap = NewMiseEnvScrub
+    $envMap['PMSEC_FAKE_SCOPES'] = 'mode|/home/user|linux'
+    $envMap['PMSEC_FAKE_SCOPE_DATA'] = $payload
+    $facts = InvokeWithEnv $envMap {
+      $scopes = Get-PmsecScopes $true
+      $ctx = Get-MiseScopeContext ($scopes[0])
+      @{
+        Supports = [string]$ctx['SupportsNewMode']
+        EnvKeys = (($ctx['Environment'].Keys | Sort-Object) -join ',')
+        Dir = $ctx['Paths']['MiseDir']
+        Error = [string]$ctx['Error']
+      }
+    }
+    if (-not (AssertEq "stays legacy ($payload)" 'False' $facts['Supports'])) { return $false }
+    if (-not (AssertEq "no injected env ($payload)" '' $facts['EnvKeys'])) { return $false }
+    if (-not (AssertEq "default mise dir ($payload)" '/home/user/.config/mise' $facts['Dir'])) { return $false }
+    if (-not (AssertEq "no probe error ($payload)" '' $facts['Error'])) { return $false }
+  }
+  return $true
+}
+
+T 'mixed scopes keep version and environment per scope, with no leakage' {
+  $h = NewHome
+  try {
+    $local = PathJoin $h 'localappdata'
+    $data = @{}
+    $data['windows'] = @{ Version = '2026.11.0' }
+    $data['wsl-Ubuntu'] = @{ Version = '2026.10.25' }
+    $data['wsl-Debian'] = @{ Version = '2026.11.0'; Env = @{ MISE_GLOBAL_CONFIG_FILE = '/custom/debian.toml'; MISE_ENV = 'work' } }
+    $scopes = "windows|$h|win32;wsl-Ubuntu|\\wsl`$\Ubuntu\home\u|linux;wsl-Debian|\\wsl`$\Debian\home\u|linux;wsl-Unknown|\\wsl`$\Unknown\home\u|linux"
+    $envMap = NewMiseEnvScrub
+    $envMap['LOCALAPPDATA'] = $local
+    $envMap['PMSEC_FAKE_SCOPES'] = $scopes
+    $envMap['PMSEC_FAKE_SCOPE_DATA'] = ($data | ConvertTo-Json -Compress -Depth 6)
+    $facts = InvokeWithEnv $envMap {
+      $result = @{}
+      foreach ($scope in (Get-PmsecScopes $true)) {
+        $ctx = Get-MiseScopeContext $scope
+        $again = Get-MiseScopeContext $scope
+        $raw = ''
+        if ($null -ne $ctx['Version']) { $raw = [string]$ctx['Version']['Raw'] }
+        $global = ''
+        $globalValue = $ctx['Environment']['MISE_GLOBAL_CONFIG_FILE']
+        if ($null -ne $globalValue) { $global = [string]$globalValue }
+        $miseEnv = ''
+        $miseEnvValue = $ctx['Environment']['MISE_ENV']
+        if ($null -ne $miseEnvValue) { $miseEnv = [string]$miseEnvValue }
+        $result[$scope.Label] = @{
+          Supports = [string]$ctx['SupportsNewMode']
+          Version = $raw
+          Global = $global
+          MiseEnv = $miseEnv
+          Cached = [string][object]::ReferenceEquals($ctx, $again)
+        }
+      }
+      $result
+    }
+    $ok = AssertEq 'windows uses the new mode' 'True' $facts['windows']['Supports']
+    $ok = $ok -and (AssertEq 'windows sees no global override' '' $facts['windows']['Global'])
+    $ok = $ok -and (AssertEq 'windows version' '2026.11.0' $facts['windows']['Version'])
+    $ok = $ok -and (AssertEq 'ubuntu stays legacy' 'False' $facts['wsl-Ubuntu']['Supports'])
+    $ok = $ok -and (AssertEq 'ubuntu version' '2026.10.25' $facts['wsl-Ubuntu']['Version'])
+    $ok = $ok -and (AssertEq 'ubuntu sees no global override' '' $facts['wsl-Ubuntu']['Global'])
+    $ok = $ok -and (AssertEq 'debian override keeps legacy' 'False' $facts['wsl-Debian']['Supports'])
+    $ok = $ok -and (AssertEq 'debian version' '2026.11.0' $facts['wsl-Debian']['Version'])
+    $ok = $ok -and (AssertEq 'debian global override' '/custom/debian.toml' $facts['wsl-Debian']['Global'])
+    $ok = $ok -and (AssertEq 'debian MISE_ENV' 'work' $facts['wsl-Debian']['MiseEnv'])
+    $ok = $ok -and (AssertEq 'debian env did not leak to ubuntu' '' $facts['wsl-Ubuntu']['MiseEnv'])
+    $ok = $ok -and (AssertEq 'debian env did not leak to windows' '' $facts['windows']['MiseEnv'])
+    $ok = $ok -and (AssertEq 'unknown version stays legacy' 'False' $facts['wsl-Unknown']['Supports'])
+    $ok = $ok -and (AssertEq 'unknown version is unknown' '' $facts['wsl-Unknown']['Version'])
+    $ok = $ok -and (AssertEq 'windows context cached' 'True' $facts['windows']['Cached'])
+    $ok = $ok -and (AssertEq 'debian context cached' 'True' $facts['wsl-Debian']['Cached'])
+    return $ok
+  } finally {
+    Remove-Item -Recurse -Force -LiteralPath $h
+  }
+}
+
+# ---------- mise layering: CLI smoke ----------
+
+T 'legacy CLI smoke: enable and check on the default fake scope are unchanged' {
+  $h = NewHome
+  try {
+    $misePath = PathJoin $h '.config' 'mise' 'config.toml'
+    $r = InvokePmsec $h $null @('--tool','mise')
+    if ($r.Code -ne 0) { $script:LastFail = "enable exit $($r.Code)`n$($r.Err)"; return $false }
+    if (-not (AssertEq 'enable line' ('enable  mise [' + $misePath + ']') ([string]$r.Out).Trim())) { return $false }
+    $c = InvokePmsec $h $null @('--check','--json','--tool','mise')
+    if ($c.Code -ne 0) { $script:LastFail = "check exit $($c.Code)`n$($c.Out)"; return $false }
+    $row = ($c.Out | ConvertFrom-Json).rows[0]
+    if ((AssertEq 'check path' $misePath ([string]$row.path)) -eq $false) { return $false }
+    if ((AssertEq 'check key' 'minimum_release_age' ([string]$row.key)) -eq $false) { return $false }
+    if ((AssertEq 'check days' '1' ([string]$row.days)) -eq $false) { return $false }
+    $t = InvokePmsec $h $null @('--check','--tool','mise')
+    if ($t.Code -ne 0) { $script:LastFail = "human check exit $($t.Code)`n$($t.Out)"; return $false }
+    return (AssertMatch 'human check line' 'OK\s+mise +minimum_release_age = "1d"\s+\[' ([string]$t.Out))
+  } finally {
+    Remove-Item -Recurse -Force -LiteralPath $h
+  }
 }
 
 # ---------- summary ----------
