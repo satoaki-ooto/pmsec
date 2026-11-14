@@ -46,17 +46,29 @@ def env_for(impl: str, home: Path) -> dict[str, str]:
         # Composer uses Application Support on macOS instead of XDG. Pin its
         # home so one case exercises the same path on every runner.
         "COMPOSER_HOME": str(home / ".config" / "composer"),
+        # mise also reads a system-level config; pointing it inside the case
+        # home keeps the host's /etc/mise/miserc.toml out of system-selector
+        # cases.
+        "MISE_SYSTEM_CONFIG_DIR": str(home / "etc-mise"),
     }
     # Hide every host-installed package manager so version-aware preflight
     # warnings are deterministic (otherwise CI runners that ship npm/yarn/etc
     # leak a tool-specific 'warn' string into the JSON, breaking the cases).
-    for tool in ("NPM", "PNPM", "YARN", "BUN", "CARGO", "MISE", "AUBE", "UV", "COMPOSER"):
+    for tool in ("NPM", "PNPM", "YARN", "BUN", "CARGO", "MISE", "AUBE", "UV", "BUNDLER", "COMPOSER"):
         env[f"PMSEC_{tool}_VERSION"] = "none"
     if impl == "python":
         env["PYTHONPATH"] = str(REPO / "python" / "src")
     if impl == "powershell":
         env["PMSEC_FAKE_SCOPES"] = f"test|{home}|linux"
     return env
+
+
+def case_env(impl: str, home: Path, overrides: dict[str, str]) -> dict[str, str]:
+    """env_for merged with the case's `env` overrides; the literal <HOME> in
+    values expands to the case temp dir (applies to `pre` and the run)."""
+    env = env_for(impl, home)
+    env.update(overrides)
+    return {k: v.replace("<HOME>", str(home)) for k, v in env.items()}
 
 
 def normalize(obj, home: Path):
@@ -82,19 +94,45 @@ def normalize(obj, home: Path):
     return obj
 
 
+def run_pre(impl: str, steps: list[list[str]], env: dict[str, str]) -> str | None:
+    """Every `pre` step must exit 0; returns an error message for the first
+    failure (step index, args, exit code, captured output) or None."""
+    for i, step in enumerate(steps):
+        proc = subprocess.run(
+            build_cmd(impl, step), env=env, cwd=REPO, check=False,
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            return (
+                f"pre step {i} failed with exit {proc.returncode}: {' '.join(step)}\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+    return None
+
+
+def check_files(home: Path, expected: dict[str, str | None]) -> str | None:
+    """Each expected_files value is the exact file body; null asserts the
+    file must not exist."""
+    for rel, body in expected.items():
+        got = (home / rel).read_bytes().decode("utf-8") if (home / rel).exists() else None
+        if got != body:
+            return f"file mismatch: {rel}\n  expected: {body!r}\n  actual:   {got!r}"
+    return None
+
+
 def run_case(impl: str, case_path: Path) -> tuple[bool, str]:
     case = json.loads(case_path.read_text())
     home = Path(tempfile.mkdtemp(prefix="pmsec-conf-"))
     try:
-        env = env_for(impl, home)
-        env.update(case.get("env", {}))
+        env = case_env(impl, home, case.get("env", {}))
         for rel, body in case.get("setup", {}).items():
             target = home / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             # Bytes, not text mode: newline translation would hide CRLF handling.
             target.write_bytes(body.encode("utf-8"))
-        for step in case.get("pre", []):
-            subprocess.run(build_cmd(impl, step), env=env, cwd=REPO, check=False, capture_output=True)
+        err = run_pre(impl, case.get("pre", []), env)
+        if err:
+            return False, err
         proc = subprocess.run(
             build_cmd(impl, case["args"]),
             env=env, cwd=REPO, capture_output=True, text=True,
@@ -115,10 +153,9 @@ def run_case(impl: str, case_path: Path) -> tuple[bool, str]:
         expected = case["expected_json"]
         if actual_norm != expected:
             return False, "JSON mismatch:\n  expected: " + json.dumps(expected, sort_keys=True) + "\n  actual:   " + json.dumps(actual_norm, sort_keys=True)
-        for rel, body in case.get("expected_files", {}).items():
-            got = (home / rel).read_bytes().decode("utf-8") if (home / rel).exists() else None
-            if got != body:
-                return False, f"file mismatch: {rel}\n  expected: {body!r}\n  actual:   {got!r}"
+        err = check_files(home, case.get("expected_files") or {})
+        if err:
+            return False, err
         return True, ""
     finally:
         shutil.rmtree(home, ignore_errors=True)
