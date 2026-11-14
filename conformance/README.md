@@ -23,8 +23,23 @@ Case shape:
 ```
 
 Optional `env` entries override the runner defaults for both `pre` and the
-asserted invocation. `<HOME>` in `expected_json` is replaced with the case
-temp dir.
+asserted invocation; the literal `<HOME>` in env values expands to the case
+temp dir. `<HOME>` in `expected_json` is likewise replaced with the temp dir
+when comparing output.
+
+Each `pre` step must exit 0 — a nonzero exit fails the case, and the report
+carries the step's exit code, stdout, and stderr. In `expected_files`, a
+`null` value asserts the file does not exist; any other value is the exact
+expected file body.
+
+Every case runs against a pinned environment: `HOME`, `XDG_CONFIG_HOME`, and
+`MISE_SYSTEM_CONFIG_DIR` (`<HOME>/etc-mise`, which keeps a host
+`/etc/mise/miserc.toml` out of system-selector cases) point inside the temp
+dir, and every `PMSEC_<TOOL>_VERSION` defaults to `none`. A case can pin
+mise's reported version via `PMSEC_MISE_VERSION` in `env`: `2026.11.0`
+selects the new config mode, `2026.10.25` the legacy one, and `none` — the
+runner default — means mise is undetectable and ports take the legacy path.
+Existing mise cases rely on `none`.
 
 ## Run
 
@@ -42,3 +57,6 @@ Use `--case <stem>` for one case.
 1. Add `cases/<name>.json`.
 2. Run every implementation.
 3. Fix the port, not the assertion, when behavior disagrees.
+
+There are no pending or skipped cases: a fixture is added only together
+with the implementation on all four ports.
