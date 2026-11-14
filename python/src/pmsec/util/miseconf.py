@@ -315,12 +315,16 @@ def _parse_assignment(text: str, key_offset: int, source: str) -> _EnvAssignment
         raise _error(source, REASON_MALFORMED)
     index = _skip_space_and_comments(text, index + 1)
     if index >= length:
-        raise _error(source, REASON_NOT_ARRAY)
+        # Nothing at all follows the `=`: the assignment is cut short, which is
+        # a different failure from a value of the wrong shape.
+        raise _error(source, REASON_UNTERMINATED)
     if text[index] != "[":
         if text[index] in "\"'":
-            # Distinguish `env = "work"` (a scalar) from `env = "work` (a string
-            # that never closes) before reporting the shape problem.
-            _skip_string(text, index, source)
+            # Any scalar is the wrong shape, but a string is still scanned first
+            # so a multiline, unterminated or escaped one reports its own cause.
+            # `_read_element` is the same scanner the array uses, so the two
+            # paths cannot drift apart.
+            _read_element(text, index, source)
         raise _error(source, REASON_NOT_ARRAY)
     values, tokens, close = _read_array(text, index, source)
     end = close + 1
@@ -382,30 +386,6 @@ def _read_element(text: str, index: int, source: str) -> tuple[str, str, int]:
         if ch == quote:
             token = text[index : cursor + 1]
             return token[1:-1], token, cursor + 1
-        if ch == "\n":
-            break
-        cursor += 1
-    raise _error(source, REASON_UNTERMINATED)
-
-
-def _skip_string(text: str, index: int, source: str) -> int:
-    """Skip a standalone (non-element) string; return the index after it."""
-    length = len(text)
-    for delimiter in _MULTILINE_DELIMITERS:
-        if text.startswith(delimiter, index):
-            close = text.find(delimiter, index + 3)
-            if close < 0:
-                raise _error(source, REASON_UNTERMINATED)
-            return close + 3
-    quote = text[index]
-    cursor = index + 1
-    while cursor < length:
-        ch = text[cursor]
-        if quote == '"' and ch == "\\":
-            cursor += 2
-            continue
-        if ch == quote:
-            return cursor + 1
         if ch == "\n":
             break
         cursor += 1

@@ -137,6 +137,15 @@ REJECTS = [
     ("env = 3\n", NOT_ARRAY),
     ("env = true\n", NOT_ARRAY),
     ("env = {a = 1}\n", NOT_ARRAY),
+    # A value offset at EOF is a truncated assignment, not a wrong-shaped one:
+    # `env =` and `env = # nothing` both report the cut, as the other ports do.
+    ("env =", UNTERMINATED),
+    ("env = # nothing\n", UNTERMINATED),
+    # A scalar is still scanned first, so an unsupported or broken string
+    # reports its own cause instead of the shape error.
+    ('env = """a"""', MULTILINE),
+    ("env = '''a'''", MULTILINE),
+    ('env = "a\\tb"\n', ESCAPE),
     ('env = ["a', UNTERMINATED),
     ('env = "work\n', UNTERMINATED),
     ("env = [work]\n", ELEMENT),
