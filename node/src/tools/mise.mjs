@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -81,24 +81,29 @@ async function hasNewArtifacts(ctx, p) {
   // forever on a file the cleanup intentionally keeps. An artifact is an
   // active selector (MISE_ENV or the effective miserc) or managed keys in the
   // file. Only the first miserc that defines env counts: a pmsec name in a
-  // lower-precedence miserc is shadowed and never selects the layer.
-  if (envListFrom(ctx.env.MISE_ENV).includes("pmsec")) return true;
-  for (const file of [p.local, p.shared, p.system]) {
-    if (!existsSync(file)) continue;
-    // A read error propagates: an unreadable selector may still activate pmsec.
-    const text = await readSafe(file);
-    let parsed;
-    try { parsed = parseEnv(text); } catch { continue; /* surfaced by the selector paths */ }
-    if (!parsed.defined) continue;
-    if (parsed.values.includes("pmsec")) return true;
-    break;
+  // lower-precedence miserc is shadowed and never selects the layer. A
+  // nonempty MISE_ENV replaces the miserc list entirely, so the miserc files
+  // are not scanned when the variable names any environment.
+  const envList = envListFrom(ctx.env.MISE_ENV);
+  if (envList.includes("pmsec")) return true;
+  if (envList.length === 0) {
+    for (const file of [p.local, p.shared, p.system]) {
+      if (!existsSync(file)) continue;
+      // A read error propagates: an unreadable selector may still activate pmsec.
+      const text = await readSafe(file);
+      let parsed;
+      try { parsed = parseEnv(text); } catch { continue; /* surfaced by the selector paths */ }
+      if (!parsed.defined) continue;
+      if (parsed.values.includes("pmsec")) return true;
+      break;
+    }
   }
   // An aliased pmsec file is the legacy destination itself, not a leftover.
-  if (pathsAliased(p)) return false;
-  try {
-    const r = readOne(await readSafe(p.pmsec));
-    if (r.configured !== null || r.extras.some(e => e.configured !== null)) return true;
-  } catch { /* surfaced by the read path */ }
+  if (aliasState(p) === "aliased") return false;
+  // An unreadable pmsec file may hold managed keys: propagate the error so a
+  // legacy check cannot report OK from a file it could not inspect.
+  const r = readOne(await readSafe(p.pmsec));
+  if (r.configured !== null || r.extras.some(e => e.configured !== null)) return true;
   return false;
 }
 
@@ -112,25 +117,54 @@ function canonicalPath(file) {
   try { return join(realpathSync(dirname(abs)), basename(abs)); } catch { return abs; }
 }
 
+// ENOENT is only proof of absence when the nearest existing ancestor is a
+// real directory; a dangling symlink ancestor leaves the outcome unknown.
+function provablyMissing(file) {
+  let dir = dirname(resolve(file));
+  for (;;) {
+    let st;
+    try { st = lstatSync(dir, { bigint: true }); }
+    catch (e) {
+      if (e?.code === "ENOENT" || e?.code === "ENOTDIR") { dir = dirname(dir); continue; }
+      return false;
+    }
+    return st.isDirectory();
+  }
+}
+
 // "missing", null when the identity cannot be determined, else dev:ino.
 function fileId(file) {
   try {
     const s = statSync(file, { bigint: true });
     return s.ino === 0n ? null : `${s.dev}:${s.ino}`;
   } catch (e) {
-    return e?.code === "ENOENT" || e?.code === "ENOTDIR" ? "missing" : null;
+    if (e?.code !== "ENOENT" && e?.code !== "ENOTDIR") return null;
+    return provablyMissing(file) ? "missing" : null;
   }
 }
 
 // File identity catches spellings a path comparison cannot: case variants on
-// case-insensitive filesystems, junctions, 8.3 short names, hard links. An
-// identity that cannot be determined counts as aliased: skipping cleanup
-// never loses settings.
-function pathsAliased(p) {
-  if (canonicalPath(p.legacy) === canonicalPath(p.pmsec)) return true;
+// case-insensitive filesystems, junctions, 8.3 short names, hard links.
+// "aliased" / "distinct" / "unknown": unknown must not hide artifacts or
+// report a skipped destructive cleanup as success, so callers treat it as
+// fail-closed (inspect the pmsec file, refuse to delete it).
+function aliasState(p) {
+  if (canonicalPath(p.legacy) === canonicalPath(p.pmsec)) return "aliased";
   const a = fileId(p.legacy), b = fileId(p.pmsec);
-  if (a === "missing" || b === "missing") return false;
-  return a === null || b === null || a === b;
+  if (a === "missing" || b === "missing") return "distinct";
+  if (a === null || b === null) return "unknown";
+  return a === b ? "aliased" : "distinct";
+}
+
+// Destructive cleanup requires provable distinctness. When the identity is
+// unknown but the pmsec file still holds managed keys, the row must fail
+// rather than claim convergence while the settings may still be selected.
+function requireDistinctForCleanup(p) {
+  const state = aliasState(p);
+  if (state === "unknown" && hasManagedKeys(p.pmsec)) {
+    throw new Error(`cannot verify ${p.pmsec} is distinct from ${p.legacy}; left untouched`);
+  }
+  return state === "distinct";
 }
 
 function readOne(raw) {
@@ -238,12 +272,24 @@ async function applySettings(text, days, ctx) {
 
 async function removeSelector(p) {
   const before = await readSafe(p.local);
-  if (before === "") return false;
-  const r = removeEnvValue(before, "pmsec");
-  if (!r.removed) return false;
-  if (r.empty) await deleteQuietly(p.local);
-  else await writeAtomic(p.local, r.text);
-  return true;
+  if (before !== "") {
+    const r = removeEnvValue(before, "pmsec");
+    if (r.removed) {
+      if (r.empty) await deleteQuietly(p.local);
+      else await writeAtomic(p.local, r.text);
+      return true;
+    }
+  }
+  // The local miserc holds no pmsec name. When the effective selector lives
+  // in shared/system, materialize the cleaned list into the local file so
+  // legacy checks converge: the foreign file (often root-owned) stays
+  // untouched, mirroring how forward migration materializes inherited names.
+  const inherited = await firstEnv(p);
+  if (inherited.path && inherited.path !== p.local && inherited.values.includes("pmsec")) {
+    await writeAtomic(p.local, setEnvValues(before, inherited.values.filter(v => v !== "pmsec")));
+    return true;
+  }
+  return false;
 }
 
 function buildSelectorText(text, values) {
@@ -262,9 +308,10 @@ export async function read(ctx) {
       // write keeps ahead of pmsec in the persistent selector.
       const envs = new Set([...envListFrom(ctx.env.MISE_ENV), ...(await firstEnv(p)).values]);
       for (const name of envs) {
-        // Names that cannot map to a config.<env>.toml path are skipped, as
-        // in the bash/powershell ports; write still keeps them in the selector.
-        if (name === "pmsec" || !/^[A-Za-z0-9_-]+$/.test(name)) continue;
+        if (name === "pmsec") continue;
+        // A name that cannot map to a config.<env>.toml path must fail the
+        // enable rather than be skipped: silently dropping an active layer
+        // lets a stricter cooldown be lowered without --force.
         files.push(miseEnvConfigPath(name, ctx.env, ctx.home));
       }
     }
@@ -319,8 +366,11 @@ export async function write(days, ctx) {
   if (artifacts || await hasNewArtifacts(ctx, p)) {
     // Reverse migration writes the destination first, then removes the new
     // generation so an interrupted cleanup cannot leave no configuration.
-    if (!pathsAliased(p)) await removeManagedConfig(p.pmsec);
-    await removeSelector(p);
+    if (requireDistinctForCleanup(p)) await removeManagedConfig(p.pmsec);
+    // A nonempty MISE_ENV hides the persistent selector from this shell; a
+    // shell that cannot see it must not delete it. The selector artifact
+    // reappears on the next clean-shell check and converges there.
+    if (envListFrom(ctx.env.MISE_ENV).length === 0) await removeSelector(p);
   }
   return { path: p.legacy, warn: null };
 }
@@ -329,7 +379,7 @@ export async function unset(ctx) {
   const p = paths(ctx);
   const newMode = supportsNewMode(ctx);
   const legacyRemoved = await removeManagedFrom(p.legacy);
-  const pmsecRemoved = pathsAliased(p) ? false : await removeManagedConfig(p.pmsec);
+  const pmsecRemoved = requireDistinctForCleanup(p) ? await removeManagedConfig(p.pmsec) : false;
   const selectorRemoved = await removeSelector(p);
   return {
     path: newMode ? p.pmsec : p.legacy,

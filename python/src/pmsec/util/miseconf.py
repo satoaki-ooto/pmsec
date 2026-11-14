@@ -10,7 +10,9 @@ from .lines import scan_view
 
 # TOML treats "env", 'env', and env as the same key; recognize all three so
 # migration replaces the existing assignment instead of adding a duplicate.
-_ENV_KEY = re.compile(r'^\s*(?:"env"|\'env\'|env)\s*=\s*(.*)$')
+# A basic-quoted key may carry escapes ("e\u006ev" decodes to env), so the
+# double-quoted spelling is captured and decoded before the comparison.
+_ENV_KEY = re.compile(r'^\s*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|(env))\s*=\s*(.*)$')
 _SECTION = re.compile(r"^\s*\[")
 
 
@@ -128,6 +130,16 @@ def parse_env(text: str) -> dict:
         m = _ENV_KEY.match(line)
         if not m:
             continue
+        # Group 1 is a double-quoted key (escapes decoded), group 2 a literal
+        # single-quoted key (never decoded), group 3 the bare spelling.
+        if m.group(1) is not None:
+            key = _decode_basic(m.group(1))
+        elif m.group(2) is not None:
+            key = m.group(2)
+        else:
+            key = m.group(3)
+        if key != "env":
+            continue
         start_col = line.index("=") + 1
         values, end = _parse_array(lines, i, start_col)
         return {"defined": True, "values": values, "start": i, "end": end}
@@ -154,8 +166,17 @@ def _join_lines(lines: list[str], trailing: bool, eol: str) -> str:
 
 
 def _env_line(values: list[str]) -> str:
-    rendered = ", ".join('"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"' for v in values)
-    return f"env = [{rendered}]"
+    # Escape backslash and quote first, then every control character TOML
+    # forbids in a basic string (C0 except tab is written as its short escape,
+    # the rest and DEL as \uXXXX). C1 and non-ASCII stay raw, like node.
+    def quote(v: str) -> str:
+        out = v.replace("\\", "\\\\").replace('"', '\\"')
+        for ch, esc in (("\b", "\\b"), ("\t", "\\t"), ("\n", "\\n"), ("\f", "\\f"), ("\r", "\\r")):
+            out = out.replace(ch, esc)
+        out = re.sub(r"[\x00-\x08\x0b\x0e-\x1f\x7f]", lambda m: f"\\u{ord(m.group(0)):04x}", out)
+        return f'"{out}"'
+
+    return f"env = [{', '.join(quote(v) for v in values)}]"
 
 
 def _top_level_insert_index(lines: list[str]) -> int:

@@ -371,9 +371,10 @@ def main(
     if args.check:
         try:
             return _check(args, targets, ctx, out, err)
-        except ValueError as exc:
-            # A malformed miserc cannot be judged; report it instead of
-            # emitting a check result that could read as OK.
+        except (OSError, ValueError) as exc:
+            # A malformed or unreadable miserc cannot be judged; report it
+            # instead of emitting a check result that could read as OK (or a
+            # traceback).
             err.write(f"pmsec: {exc}\n")
             return 1
     if env.get("PMSEC_HOME"):

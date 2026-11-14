@@ -34,5 +34,8 @@
   },
   "expected_files": {
     ".config/mise/miserc.local.toml": "env = [\"pmsec\" \"work\"]\n"
-  }
+  },
+  "expected_missing": [
+    ".config/mise/config.pmsec.toml"
+  ]
 }

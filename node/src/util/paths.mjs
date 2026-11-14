@@ -98,9 +98,10 @@ export function misePmsecConfigPath(env = process.env, home = homedir()) {
 // mise loads config.<environment>.toml for every selected environment next to
 // the global config; enable must consider those layers when preserving
 // stricter cooldowns. The name comes from the selector, so only safe
-// spellings resolve inside the dir.
+// spellings resolve inside the dir. Dots are safe in a single component
+// (`config.work.dev.toml` is a real mise layer); separators are not.
 export function miseEnvConfigPath(name, env = process.env, home = homedir()) {
-  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error(`unsafe mise environment name: ${name}`);
+  if (!/^[A-Za-z0-9_.-]+$/.test(name)) throw new Error(`unsafe mise environment name: ${name}`);
   return join(miseConfigDir(env, home), `config.${name}.toml`);
 }
 

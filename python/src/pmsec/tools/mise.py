@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from pathlib import Path
 
 from pmsec.util.context import Context
@@ -114,30 +115,33 @@ def _has_new_artifacts(ctx: Context, p: dict[str, Path]) -> bool:
     forever on a file the cleanup intentionally keeps. An artifact is an
     active selector (MISE_ENV or the effective miserc) or managed keys in the
     file. Only the first miserc that defines env counts: a pmsec name in a
-    lower-precedence miserc is shadowed and never selects the layer."""
-    if "pmsec" in env_list_from(ctx.env.get("MISE_ENV")):
+    lower-precedence miserc is shadowed and never selects the layer. A
+    nonempty MISE_ENV replaces the miserc list entirely, so the miserc files
+    are not scanned when the variable names any environment."""
+    env_list = env_list_from(ctx.env.get("MISE_ENV"))
+    if "pmsec" in env_list:
         return True
-    for f in (p["local"], p["shared"], p["system"]):
-        if not f.exists():
-            continue
-        try:
-            parsed = parse_env(_read(f))
-        except ValueError:
-            continue
-        if not parsed["defined"]:
-            continue
-        if "pmsec" in parsed["values"]:
-            return True
-        break
+    if not env_list:
+        for f in (p["local"], p["shared"], p["system"]):
+            if not f.exists():
+                continue
+            try:
+                parsed = parse_env(_read(f))
+            except ValueError:
+                continue
+            if not parsed["defined"]:
+                continue
+            if "pmsec" in parsed["values"]:
+                return True
+            break
     # An aliased pmsec file is the legacy destination itself, not a leftover.
-    if _paths_aliased(p):
+    if _alias_state(p) == "aliased":
         return False
-    try:
-        r = _read_one(_read(p["pmsec"]))
-        if r["configured"] is not None or any(e["configured"] is not None for e in r["extras"]):
-            return True
-    except Exception:
-        pass
+    # An unreadable pmsec file may hold managed keys: propagate the error so a
+    # legacy check cannot report OK from a file it could not inspect.
+    r = _read_one(_read(p["pmsec"]))
+    if r["configured"] is not None or any(e["configured"] is not None for e in r["extras"]):
+        return True
     return False
 
 
@@ -261,43 +265,84 @@ def _apply_settings(text: str, days: int, ctx: Context) -> str:
 
 def _remove_selector(p: dict[str, Path]) -> bool:
     before = _read(p["local"])
-    if before == "":
-        return False
-    r = remove_env_value(before, "pmsec")
-    if not r["removed"]:
-        return False
-    if r["empty"]:
-        _unlink_quietly(p["local"])
-    else:
-        write_atomic(p["local"], r["text"])
-    return True
-
-
-def _paths_aliased(p: dict[str, Path]) -> bool:
-    """MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
-    then the legacy destination IS the new generation and the reverse-migration
-    cleanup must not remove what it just wrote (or delete the global config)."""
-    if _canonical_path(p["legacy"]) == _canonical_path(p["pmsec"]):
+    if before != "":
+        r = remove_env_value(before, "pmsec")
+        if r["removed"]:
+            if r["empty"]:
+                _unlink_quietly(p["local"])
+            else:
+                write_atomic(p["local"], r["text"])
+            return True
+    # The local miserc holds no pmsec name. When the effective selector lives
+    # in shared/system, materialize the cleaned list into the local file so
+    # legacy checks converge: the foreign file (often root-owned) stays
+    # untouched, mirroring how forward migration materializes inherited names.
+    inherited = _first_env(p)
+    if inherited["path"] and inherited["path"] != p["local"] and "pmsec" in inherited["values"]:
+        write_atomic(p["local"], set_env_values(before, [v for v in inherited["values"] if v != "pmsec"]))
         return True
-    # File identity catches spellings a path comparison cannot: case variants
-    # on case-insensitive filesystems, junctions, 8.3 short names, hard links.
-    # An identity that cannot be determined counts as aliased: skipping
-    # cleanup never loses settings.
-    a, b = _file_id(p["legacy"]), _file_id(p["pmsec"])
-    if a == "missing" or b == "missing":
-        return False
-    return a is None or b is None or a == b
+    return False
+
+
+def _provably_missing(file: Path) -> bool:
+    """ENOENT is only proof of absence when the nearest existing ancestor is a
+    real directory; a dangling symlink ancestor leaves the outcome unknown."""
+    head = os.path.dirname(os.path.abspath(str(file)))
+    while True:
+        try:
+            st = os.lstat(head)
+        except (FileNotFoundError, NotADirectoryError):
+            parent = os.path.dirname(head)
+            if parent == head:
+                return True
+            head = parent
+            continue
+        except OSError:
+            return False
+        return stat.S_ISDIR(st.st_mode)
 
 
 def _file_id(file: Path):
-    """"missing", None when the identity cannot be determined, else (dev, ino)."""
+    """'missing', None when the identity cannot be determined, else (dev, ino)."""
     try:
         st = os.stat(file)
     except (FileNotFoundError, NotADirectoryError):
-        return "missing"
+        return "missing" if _provably_missing(file) else None
     except OSError:
         return None
     return None if st.st_ino == 0 else (st.st_dev, st.st_ino)
+
+
+def _alias_state(p: dict[str, Path]) -> str:
+    """MISE_GLOBAL_CONFIG_FILE can point at <MISE_CONFIG_DIR>/config.pmsec.toml;
+    then the legacy destination IS the new generation and the reverse-migration
+    cleanup must not remove what it just wrote (or delete the global config).
+
+    File identity catches spellings a path comparison cannot: case variants
+    on case-insensitive filesystems, junctions, 8.3 short names, hard links.
+    "aliased" / "distinct" / "unknown": unknown must not hide artifacts or
+    report a skipped destructive cleanup as success, so callers treat it as
+    fail-closed (inspect the pmsec file, refuse to delete it)."""
+    if _canonical_path(p["legacy"]) == _canonical_path(p["pmsec"]):
+        return "aliased"
+    a, b = _file_id(p["legacy"]), _file_id(p["pmsec"])
+    if a == "missing" or b == "missing":
+        return "distinct"
+    if a is None or b is None:
+        return "unknown"
+    return "aliased" if a == b else "distinct"
+
+
+def _require_distinct_for_cleanup(p: dict[str, Path]) -> bool:
+    """Destructive cleanup requires provable distinctness. When the identity is
+    unknown but the pmsec file still holds managed keys, the row must fail
+    rather than claim convergence while the settings may still be selected."""
+    state = _alias_state(p)
+    if state == "unknown" and _has_managed_keys(p["pmsec"]):
+        raise ValueError(
+            f"cannot verify {p['pmsec']} is distinct from {p['legacy']}; left untouched"
+        )
+    return state == "distinct"
 
 
 def _canonical_path(file: Path) -> str:
@@ -320,10 +365,12 @@ def read(ctx: Context) -> dict:
             # layers that write keeps ahead of pmsec in the persistent selector.
             envs = dict.fromkeys(env_list_from(ctx.env.get("MISE_ENV")) + _first_env(p)["values"])
             for name in envs:
-                # Names that cannot map to a config.<env>.toml path are skipped,
-                # as in the bash/powershell ports; write keeps them in the selector.
-                if name == "pmsec" or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                if name == "pmsec":
                     continue
+                # A name that cannot map to a config.<env>.toml path must fail
+                # the enable rather than be skipped: silently dropping an
+                # active layer lets a stricter cooldown be lowered without
+                # --force.
                 files.append(mise_env_config_path(name, ctx.env, ctx.home))
         merged = _merge_reads(_read_files(files))
         selector = _selector_state(ctx, p)
@@ -372,9 +419,13 @@ def write(days: int, ctx: Context) -> dict:
     if artifacts or _has_new_artifacts(ctx, p):
         # Write the destination before cleaning the new generation so an
         # interrupted cleanup cannot create a no-config gap.
-        if not _paths_aliased(p):
+        if _require_distinct_for_cleanup(p):
             _remove_managed_config(p["pmsec"])
-        _remove_selector(p)
+        # A nonempty MISE_ENV hides the persistent selector from this shell; a
+        # shell that cannot see it must not delete it. The selector artifact
+        # reappears on the next clean-shell check and converges there.
+        if not env_list_from(ctx.env.get("MISE_ENV")):
+            _remove_selector(p)
     return {"path": str(p["legacy"]), "warn": None}
 
 
@@ -382,7 +433,7 @@ def unset(ctx: Context) -> dict:
     p = paths(ctx)
     new_mode = _supports_new_mode(ctx)
     legacy_removed = _remove_managed_from(p["legacy"])
-    pmsec_removed = False if _paths_aliased(p) else _remove_managed_config(p["pmsec"])
+    pmsec_removed = _remove_managed_config(p["pmsec"]) if _require_distinct_for_cleanup(p) else False
     selector_removed = _remove_selector(p)
     return {
         "path": str(p["pmsec"] if new_mode else p["legacy"]),

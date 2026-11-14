@@ -105,6 +105,13 @@ migration warning instead of reporting OK from either file, because the
 active configuration is ambiguous. A residual pmsec file with neither
 managed keys nor a selector is inert (mise loads the layer only when it
 is selected), so legacy mode converges on it instead of failing forever.
+The inert-file guarantee has one exception: when `MISE_GLOBAL_CONFIG_FILE`
+points at `config.pmsec.toml` itself — through any spelling the filesystem
+identifies as the same file (case variant, junction, hard link) — that
+file is the active legacy destination, not a leftover. Reverse migration
+writes the cooldown there and leaves the file in place, and when pmsec
+cannot even prove the two paths are distinct files it refuses the
+destructive cleanup instead of reporting a skipped deletion as success.
 
 `enable` writes the destination generation
 before removing the other one; an interrupted cleanup can leave extra files

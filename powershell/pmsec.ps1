@@ -143,10 +143,34 @@ function Get-MiseScopeEnv([string]$Name) {
   foreach ($entry in (([string]$env:WSLENV) -split ':')) {
     $parts = $entry -split '/', 2
     if ($parts[0] -ine $Name) { continue }
-    if ($parts.Count -gt 1 -and $parts[1] -match 'w') { continue }
+    if ($parts.Count -gt 1 -and $parts[1] -cmatch 'w') { continue }
+    if ($parts.Count -gt 1 -and $parts[1] -cmatch 'p' -and -not $value.StartsWith('/')) {
+      # A /p value reaches the distro translated (WSL maps `C:\x` to
+      # `/mnt/c/x`); pmsec must see the same POSIX path the distro's mise
+      # sees, or its writes and the distro's reads diverge.
+      return (ConvertFrom-MiseScopePath $value)
+    }
     return $value
   }
   return $null
+}
+# Translate a Win32 path to the POSIX path the distro sees (the /p half of
+# ConvertTo-MiseScopePath). Drive letters map under WSL's default automount
+# root (`/mnt/<drive>`); a path inside this distro's own UNC root maps back
+# to its POSIX path. Anything else returns the input unchanged.
+function ConvertFrom-MiseScopePath([string]$WinPath) {
+  $m = [regex]::Match($WinPath, '^([A-Za-z]):[\\/](.*)$')
+  if ($m.Success) {
+    return '/mnt/' + $m.Groups[1].Value.ToLower() + '/' + ($m.Groups[2].Value -replace '\\', '/')
+  }
+  $root = Get-MiseWslRoot
+  if ($root) {
+    $prefix = $root + '\'
+    if ($WinPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+      return ($WinPath.Substring($prefix.Length) -replace '\\', '/')
+    }
+  }
+  return $WinPath
 }
 # Map a POSIX path inside the distro to the path this process can open.
 function ConvertTo-MiseScopePath([string]$PosixPath) {
@@ -156,9 +180,9 @@ function ConvertTo-MiseScopePath([string]$PosixPath) {
 }
 function Get-MisePath {
   # Windows-side mise env vars describe the host's mise; a WSL distro's mise
-  # reads its own environment and cannot resolve a drive-lettered path. On a
-  # non-win32 scope honor an override only when it reaches the distro and is
-  # POSIX-rooted (the same convention Get-BunPath uses).
+  # reads its own environment. On a non-win32 scope honor an override only
+  # when it reaches the distro and is POSIX-rooted — a /p-forwarded value is
+  # translated by Get-MiseScopeEnv before it gets here.
   if ((Get-PmsecPlatform) -eq 'win32') {
     if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
     if ($env:MISE_CONFIG_DIR) { return (PathJoin $env:MISE_CONFIG_DIR 'config.toml') }
@@ -189,6 +213,15 @@ function Get-MiseDir {
 }
 function Get-MiseBasePath { return (PathJoin (Get-MiseDir) 'config.toml') }
 function Get-MisePmsecPath { return (PathJoin (Get-MiseDir) 'config.pmsec.toml') }
+# mise loads config.<environment>.toml for every selected environment next to
+# the global config; enable must consider those layers when preserving
+# stricter cooldowns. The name comes from the selector, so only safe
+# spellings resolve inside the dir. Dots are safe in a single component
+# (`config.work.dev.toml` is a real mise layer); separators are not.
+function Get-MiseEnvConfigPath([string]$Name) {
+  if ($Name -cnotmatch '^[A-Za-z0-9_.\-]+$') { throw "unsafe mise environment name: $Name" }
+  return (PathJoin (Get-MiseDir) "config.$Name.toml")
+}
 function Get-MiseLocalMiserc { return (PathJoin (Get-MiseDir) 'miserc.local.toml') }
 function Get-MiseSharedMiserc { return (PathJoin (Get-MiseDir) 'miserc.toml') }
 function Get-MiseSystemMiserc {
@@ -198,8 +231,9 @@ function Get-MiseSystemMiserc {
     if (-not $root) { $root = 'C:\' }
     return (PathJoin $root 'etc' 'mise' 'miserc.toml')
   }
-  # A Windows-rooted override cannot name a path inside the distro; a
-  # forwarded POSIX-rooted one can and keeps working on every scope.
+  # A forwarded override is translated to a POSIX path by Get-MiseScopeEnv,
+  # so even a Windows-rooted MISE_SYSTEM_CONFIG_DIR/p resolves inside the
+  # distro; an unforwarded Windows-rooted one cannot and stays ignored.
   $systemDir = Get-MiseScopeEnv 'MISE_SYSTEM_CONFIG_DIR'
   if ($systemDir -and $systemDir.StartsWith('/')) { return (PathJoin (ConvertTo-MiseScopePath $systemDir) 'miserc.toml') }
   return (ConvertTo-MiseScopePath '/etc/mise/miserc.toml')
@@ -369,14 +403,41 @@ function LinesEntryValue([string]$Line, [string]$Sep) {
 
 # LinesScan mirrors LinesBuf with the body of TOML multi-line strings blanked,
 # so text inside them is never taken for a header or key. Indices stay aligned.
+# Context-aware: delimiters inside comments or single-line strings are not
+# structural, so `# uses """` or `note = "it's '''"` cannot hide a real key.
 $script:LinesScan = [System.Collections.ArrayList]::new()
 function LinesScanView {
   $script:LinesScan = [System.Collections.ArrayList]::new()
   $open = $null
   foreach ($line in $script:LinesBuf) {
     $inside = $null -ne $open
-    foreach ($m in [regex]::Matches($line, '"""|''''''')) {
-      if ($null -eq $open) { $open = $m.Value } elseif ($open -eq $m.Value) { $open = $null }
+    $i = 0
+    while ($i -lt $line.Length) {
+      if ($null -ne $open) {
+        if ($i + 3 -le $line.Length -and $line.Substring($i, 3) -ceq $open) { $open = $null; $i += 3 }
+        else { $i++ }
+        continue
+      }
+      $ch = $line[$i]
+      if ($ch -ceq '#') { break }
+      if ($ch -ceq '"' -or $ch -ceq "'") {
+        if ($i + 3 -le $line.Length) {
+          $tok = $line.Substring($i, 3)
+          if ($tok -ceq '"""' -or $tok -ceq "'''") { $open = $tok; $i += 3; continue }
+        }
+        # Single-line string: `\"` cannot close a basic string, so a `'''`
+        # inside never opens a multi-line string. Unterminated strings end
+        # with the line, so invalid TOML cannot poison later lines.
+        $q = $ch; $i++
+        while ($i -lt $line.Length) {
+          $c = $line[$i]
+          if ($q -ceq '"' -and $c -ceq '\') { $i += 2; continue }
+          if ($c -ceq $q) { $i++; break }
+          $i++
+        }
+        continue
+      }
+      $i++
     }
     [void]$script:LinesScan.Add($(if ($inside) { '' } else { $line }))
   }
@@ -1169,6 +1230,28 @@ function MisercParseArray {
   return @{ Values = $values.ToArray() }
 }
 
+# Decode a complete TOML basic-string body (no surrounding quotes), so an
+# escaped quoted key ("e\u006ev") compares equal to the bare env key.
+function MisercDecodeBasic([string]$S) {
+  return [regex]::Replace($S, '\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)', {
+    param($m)
+    $esc = $m.Groups[1].Value
+    if ($esc[0] -ceq 'u' -or $esc[0] -ceq 'U') {
+      $code = [Convert]::ToInt32($esc.Substring(1), 16)
+      if ($code -ge 0 -and $code -le 0x10FFFF) {
+        try { return [char]::ConvertFromUtf32($code) } catch { return '' }
+      }
+      return ''
+    }
+    if ($esc -ceq 'b') { return [string][char]8 }
+    if ($esc -ceq 't') { return "`t" }
+    if ($esc -ceq 'n') { return "`n" }
+    if ($esc -ceq 'f') { return [string][char]12 }
+    if ($esc -ceq 'r') { return "`r" }
+    return $esc
+  })
+}
+
 # Parse the top-level `env = [...]` assignment in the loaded buffer.
 # "Top-level" also excludes TOML multi-line strings: text inside a `"""`
 # body is never taken for the selector. Scan against LinesScan, parse the
@@ -1178,11 +1261,20 @@ function MisercParseEnv {
   LinesScanView
   # TOML treats "env", 'env', and env as the same key; recognize all three so
   # migration replaces the existing assignment instead of adding a duplicate.
+  # A basic-quoted key may carry escapes ("e\u006ev" decodes to env), so the
+  # double-quoted spelling is captured and decoded before the comparison.
   for ($i = 0; $i -lt $script:LinesBuf.Count; $i++) {
     if (LinesIsSection $script:LinesScan[$i]) { break }
-    # -cnotmatch, not -notmatch: TOML keys are case-sensitive and -match folds
-    # case, so an `ENV = [...]` line must never be taken for the selector.
-    if ("$($script:LinesScan[$i])" -cnotmatch '^\s*(''env''|"env"|env)\s*=') { continue }
+    # -cnotmatch / -ceq, not -notmatch: TOML keys are case-sensitive and
+    # -match folds case, so an `ENV = [...]` line must never be taken for
+    # the selector. Group 1 is a double-quoted key (escapes decoded), group 2
+    # a literal single-quoted key (never decoded), group 3 the bare spelling.
+    $m = [regex]::Match("$($script:LinesScan[$i])", '^\s*(?:"((?:[^"\\]|\\.)*)"|''([^'']*)''|(env))\s*=')
+    if (-not $m.Success) { continue }
+    if ($m.Groups[1].Success) { $key = MisercDecodeBasic $m.Groups[1].Value }
+    elseif ($m.Groups[2].Success) { $key = $m.Groups[2].Value }
+    else { $key = $m.Groups[3].Value }
+    if ($key -cne 'env') { continue }
     $line = [string]$script:LinesBuf[$i]
     $prefixLen = $line.IndexOf('=')
     $script:MsJ = $i
@@ -1194,8 +1286,26 @@ function MisercParseEnv {
   return @{ Defined = $false; Values = @(); Start = -1; End = -1 }
 }
 
+# Quote a value for a TOML basic string: escape backslash and quote, then
+# every control character TOML forbids (C0 short escapes where TOML defines
+# them, the rest and DEL as \uXXXX). Non-ASCII stays raw.
 function MisercQuote([string]$S) {
-  return '"' + ($S -replace '\\', '\\\\' -replace '"', '\"') + '"'
+  $out = [System.Text.StringBuilder]::new()
+  foreach ($ch in $S.ToCharArray()) {
+    if ($ch -ceq '\') { [void]$out.Append('\\'); continue }
+    if ($ch -ceq '"') { [void]$out.Append('\"'); continue }
+    $code = [int]$ch
+    if ($code -eq 8) { [void]$out.Append('\b'); continue }
+    if ($code -eq 9) { [void]$out.Append('\t'); continue }
+    if ($code -eq 10) { [void]$out.Append('\n'); continue }
+    if ($code -eq 12) { [void]$out.Append('\f'); continue }
+    if ($code -eq 13) { [void]$out.Append('\r'); continue }
+    if (($code -ge 0 -and $code -lt 32) -or $code -eq 127) {
+      [void]$out.Append(('\u{0:x4}' -f $code)); continue
+    }
+    [void]$out.Append($ch)
+  }
+  return '"' + $out.ToString() + '"'
 }
 
 # Replace/insert the top-level env assignment in the loaded buffer.
@@ -1241,14 +1351,19 @@ function MisercBufEmpty {
 
 # Load the first miserc file (local -> shared -> system) that defines env.
 # Throws on an invalid env array so callers can fail before writing anything.
+# MiseBaseEnvPath records which file owned the list so selector cleanup can
+# tell a local assignment from an inherited one.
+$script:MiseBaseEnvPath = $null
 function MiseInheritedEnv {
   $script:MiseBaseEnv = @()
+  $script:MiseBaseEnvPath = $null
   foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
     LinesLoad $p
     $parsed = MisercParseEnv
     if (-not $parsed.Defined) { continue }
     $script:MiseBaseEnv = @($parsed.Values)
+    $script:MiseBaseEnvPath = $p
     return
   }
 }
@@ -1273,22 +1388,27 @@ function MiseHasNewArtifacts {
   # forever on a file the cleanup intentionally keeps. An artifact is an
   # active selector (MISE_ENV or the effective miserc) or managed keys in the
   # file. Only the first miserc that defines env counts: a pmsec name in a
-  # lower-precedence miserc is shadowed and never selects the layer.
-  foreach ($e in (MiseEnvList (Get-MiseScopeEnv 'MISE_ENV'))) {
-    if ($e -ceq 'pmsec') { return $true }
-  }
-  foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
-    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
-    LinesLoad $p
-    try { $parsed = MisercParseEnv } catch { continue }
-    if (-not $parsed.Defined) { continue }
-    if (@($parsed.Values) -ccontains 'pmsec') { return $true }
-    break
+  # lower-precedence miserc is shadowed and never selects the layer. A
+  # nonempty MISE_ENV replaces the miserc list entirely, so the miserc files
+  # are not scanned when the variable names any environment.
+  $envList = @(MiseEnvList (Get-MiseScopeEnv 'MISE_ENV'))
+  if (@($envList) -ccontains 'pmsec') { return $true }
+  if ($envList.Count -eq 0) {
+    foreach ($p in @((Get-MiseLocalMiserc), (Get-MiseSharedMiserc), (Get-MiseSystemMiserc))) {
+      if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
+      LinesLoad $p
+      try { $parsed = MisercParseEnv } catch { continue }
+      if (-not $parsed.Defined) { continue }
+      if (@($parsed.Values) -ccontains 'pmsec') { return $true }
+      break
+    }
   }
   $pmsec = Get-MisePmsecPath
   if (-not (Test-Path -LiteralPath $pmsec -PathType Leaf)) { return $false }
   # An aliased pmsec file is the legacy destination itself, not a leftover.
-  if (MisePathsAliased (Get-MisePath) $pmsec) { return $false }
+  if ((MiseAliasState (Get-MisePath) $pmsec) -ceq 'aliased') { return $false }
+  # An unreadable pmsec file may hold managed keys: LinesLoad throws, so a
+  # legacy check cannot report OK from a file it could not inspect.
   LinesLoad $pmsec
   if ($null -ne (LinesReadKey 'minimum_release_age' '=' 'settings')) { return $true }
   foreach ($e in (ToolExtras 'mise')) {
@@ -1510,14 +1630,28 @@ function MiseRemoveManagedConfig([string]$Path) {
 }
 
 # Remove the pmsec selector from miserc.local.toml. Other names/keys survive.
+# When the local file holds no pmsec name but the effective selector lives in
+# a shared/system miserc, materialize the cleaned list into the local file so
+# legacy checks converge: the foreign file (often root-owned) stays
+# untouched, mirroring how forward migration materializes inherited names.
 function MiseRemoveSelector([string]$Path) {
-  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   LinesLoad $Path
   $parsed = MisercParseEnv
-  if (-not (MisercRemoveEnvValue 'pmsec' $parsed)) { return $false }
-  if (MisercBufEmpty) { Remove-Item -LiteralPath $Path -Force }
-  else { WriteAtomic $Path (LinesDump) }
-  return $true
+  if (MisercRemoveEnvValue 'pmsec' $parsed) {
+    if (MisercBufEmpty) { Remove-Item -LiteralPath $Path -Force }
+    else { WriteAtomic $Path (LinesDump) }
+    return $true
+  }
+  MiseInheritedEnv
+  if ($null -ne $script:MiseBaseEnvPath -and $script:MiseBaseEnvPath -ne $Path -and
+      @($script:MiseBaseEnv) -ccontains 'pmsec') {
+    LinesLoad $Path
+    $parsed = MisercParseEnv
+    MisercSetEnvValues @($script:MiseBaseEnv | Where-Object { $_ -cne 'pmsec' }) $parsed
+    WriteAtomic $Path (LinesDump)
+    return $true
+  }
+  return $false
 }
 
 function ToolReadMise {
@@ -1538,8 +1672,11 @@ function ToolReadMise {
       $envs = @(MiseEnvList (Get-MiseScopeEnv 'MISE_ENV'))
       try { MiseInheritedEnv; $envs += @($script:MiseBaseEnv) } catch { }
       foreach ($name in $envs) {
-        if ($name -ceq 'pmsec' -or $name -notmatch '^[A-Za-z0-9_-]+$') { continue }
-        $files += (PathJoin (Get-MiseDir) "config.$name.toml")
+        if ($name -ceq 'pmsec') { continue }
+        # A name that cannot map to a config.<env>.toml path must fail the
+        # enable rather than be skipped: silently dropping an active layer
+        # lets a stricter cooldown be lowered without --force.
+        $files += (Get-MiseEnvConfigPath $name)
       }
     }
     $r = MiseReadFiles $files
@@ -1609,11 +1746,34 @@ public static class PmsecFileId {
 }
 '@
 
+# ENOENT is only proof of absence when the nearest existing ancestor is a
+# real directory; a dangling symlink ancestor leaves the outcome unknown.
+function MiseProvablyMissing([string]$Path) {
+  $dir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
+  while ($true) {
+    $parent = [IO.Path]::GetDirectoryName($dir)
+    if ($parent -eq $dir -or -not $parent) {
+      # Walked to the filesystem root; an existing root is a real directory.
+      try { $null = Get-Item -LiteralPath $dir -Force; return $true } catch { return $false }
+    }
+    try { $item = Get-Item -LiteralPath $dir -Force } catch {
+      if ($_.Exception -is [IO.FileNotFoundException] -or
+          $_.Exception -is [IO.DirectoryNotFoundException] -or
+          $_.Exception -is [Management.Automation.ItemNotFoundException]) { $dir = $parent; continue }
+      return $false
+    }
+    return ($item.PSIsContainer -and -not $item.LinkType)
+  }
+}
+
 # 'missing', $null when the identity cannot be determined, else a volume:id
 # string for the file the path resolves to.
 function MiseFileId([string]$Path) {
   try { [void][IO.File]::GetAttributes($Path) }
-  catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return 'missing' }
+  catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
+    if (MiseProvablyMissing $Path) { return 'missing' }
+    return $null
+  }
   catch { return $null }
   try {
     if ($PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows) {
@@ -1635,15 +1795,29 @@ function MiseFileId([string]$Path) {
 
 # MISE_GLOBAL_CONFIG_FILE can point at config.pmsec.toml itself through any
 # spelling the filesystem accepts (case variant, junction, 8.3 short name);
-# cleanup must then leave the destination alone. An identity that cannot be
-# determined counts as aliased: skipping cleanup never loses settings.
-function MisePathsAliased([string]$A, [string]$B) {
-  if ([IO.Path]::GetFullPath($A).Equals([IO.Path]::GetFullPath($B), [StringComparison]::Ordinal)) { return $true }
+# cleanup must then leave the destination alone. Returns "aliased",
+# "distinct", or "unknown": unknown must not hide artifacts or report a
+# skipped destructive cleanup as success, so callers treat it as fail-closed
+# (inspect the pmsec file, refuse to delete it).
+function MiseAliasState([string]$A, [string]$B) {
+  if ([IO.Path]::GetFullPath($A).Equals([IO.Path]::GetFullPath($B), [StringComparison]::Ordinal)) { return 'aliased' }
   $ia = MiseFileId $A
   $ib = MiseFileId $B
-  if ($ia -ceq 'missing' -or $ib -ceq 'missing') { return $false }
-  if ($null -eq $ia -or $null -eq $ib) { return $true }
-  return ($ia -ceq $ib)
+  if ($ia -ceq 'missing' -or $ib -ceq 'missing') { return 'distinct' }
+  if ($null -eq $ia -or $null -eq $ib) { return 'unknown' }
+  if ($ia -ceq $ib) { return 'aliased' }
+  return 'distinct'
+}
+
+# Destructive cleanup requires provable distinctness. When the identity is
+# unknown but the pmsec file still holds managed keys, the row must fail
+# rather than claim convergence while the settings may still be selected.
+function MiseRequireDistinctForCleanup([string]$Legacy, [string]$Pmsec) {
+  $state = MiseAliasState $Legacy $Pmsec
+  if ($state -ceq 'unknown' -and (MiseHasManagedKeys $Pmsec)) {
+    throw "cannot verify $Pmsec is distinct from $Legacy; left untouched"
+  }
+  return ($state -ceq 'distinct')
 }
 
 function ToolWriteMise([int]$Days) {
@@ -1682,10 +1856,15 @@ function ToolWriteMise([int]$Days) {
     # interrupted cleanup cannot create a no-config gap. MISE_GLOBAL_CONFIG_FILE
     # can point at config.pmsec.toml itself; the destination then IS the new
     # generation and cleanup would delete it.
-    if (-not (MisePathsAliased $legacy $pmsec)) {
+    if (MiseRequireDistinctForCleanup $legacy $pmsec) {
       [void](MiseRemoveManagedConfig $pmsec)
     }
-    [void](MiseRemoveSelector $localp)
+    # A nonempty MISE_ENV hides the persistent selector from this shell; a
+    # shell that cannot see it must not delete it. The selector artifact
+    # reappears on the next clean-shell check and converges there.
+    if ((MiseEnvList (Get-MiseScopeEnv 'MISE_ENV')).Count -eq 0) {
+      [void](MiseRemoveSelector $localp)
+    }
   }
   return @{ Path = $legacy; Warn = $null }
 }
@@ -1698,10 +1877,10 @@ function ToolUnsetMise {
   if (MiseSupportsNewMode) { $path = $pmsec }
   $removed = $false
   if (MiseRemoveManagedFrom $legacy) { $removed = $true }
-  # An aliased destination (MISE_GLOBAL_CONFIG_FILE at config.pmsec.toml) is
-  # handled by the MiseRemoveManagedFrom pass above; a second pass could delete
-  # the global config itself.
-  if (-not (MisePathsAliased $legacy $pmsec)) {
+  # Cleanup of config.pmsec.toml is destructive only when the file is
+  # distinct from the legacy destination; an unknown identity with managed
+  # keys must fail rather than report a skipped cleanup as success.
+  if (MiseRequireDistinctForCleanup $legacy $pmsec) {
     if (MiseRemoveManagedConfig $pmsec) { $removed = $true }
   }
   if (MiseRemoveSelector $localp) { $removed = $true }

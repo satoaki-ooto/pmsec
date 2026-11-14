@@ -1,0 +1,139 @@
+{
+  "setup": {
+    ".config/mise/config.pmsec.toml": "[settings]\nminimum_release_age = \"3d\"\n"
+  },
+  "env": {
+    "PMSEC_MISE_VERSION": "2026.10.25",
+    "MISE_ENV": "pmsec"
+  },
+  "args": [
+    "--tool",
+    "mise",
+    "--days",
+    "1",
+    "--check",
+    "--json"
+  ],
+  "expected_exit": 1,
+  "expected_json": {
+    "bundleDays": 1,
+    "rows": [
+      {
+        "tool": "mise",
+        "key": "minimum_release_age",
+        "path": "<HOME>/.config/mise/config.toml",
+        "configured": null,
+        "days": null,
+        "extras": [
+          {
+            "key": "paranoid",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "gpg_verify",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "github_attestations",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "slsa",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "locked_verify_provenance",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "ruby.github_attestations",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "python.github_attestations",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "provenance_api_failures_fatal",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "aqua.github_attestations",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "aqua.cosign",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "aqua.minisign",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "aqua.slsa",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "github.github_attestations",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "github.slsa",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "node.gpg_verify",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "swift.gpg_verify",
+            "configured": null,
+            "expected": "true",
+            "ok": false
+          },
+          {
+            "key": "not_found_system_fallback",
+            "configured": null,
+            "expected": "false",
+            "ok": false
+          }
+        ],
+        "warn": "a previous new-style mise configuration exists (config.pmsec.toml or the pmsec miserc selector); run `pmsec` to consolidate it"
+      }
+    ],
+    "ok": false
+  },
+  "expected_files": {
+    ".config/mise/config.pmsec.toml": "[settings]\nminimum_release_age = \"3d\"\n"
+  }
+}

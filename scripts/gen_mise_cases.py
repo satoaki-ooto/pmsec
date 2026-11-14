@@ -271,6 +271,7 @@ CASES = [
         None,
         NEW_MODE,
         ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml"]},
     ),
     (
         "enable_mise_selector_leading_comma",
@@ -278,6 +279,7 @@ CASES = [
         None,
         NEW_MODE,
         ["--tool", "mise", "--days", "1", "--json"],
+        {"missing": [".config/mise/config.pmsec.toml"]},
     ),
     (
         "enable_mise_new_mode_env_layer_preservation",
@@ -388,6 +390,112 @@ CASES = [
         ["--tool", "mise", "--days", "1", "--check", "--json"],
         {"pre": [["--tool", "mise", "--days", "1", "--json"]],
          "missing": [".config/mise/config.pmsec.toml", ".config/mise/miserc.local.toml"]},
+    ),
+    # A nonempty MISE_ENV replaces the miserc list entirely: a pmsec name in
+    # the variable is an active artifact even when every miserc is clean, and
+    # a foreign name hides the persistent selector from legacy artifact
+    # detection (and from cleanup, which must not delete what this shell
+    # cannot see).
+    (
+        "check_mise_legacy_mise_env_selects_pmsec",
+        {".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n'},
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_ENV": "pmsec"},
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+    ),
+    (
+        "enable_mise_legacy_mise_env_keeps_selector",
+        {
+            ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',
+            ".config/mise/miserc.local.toml": 'env = ["pmsec"]\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25", "MISE_ENV": "work"},
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    # The effective selector may live in a shared/system miserc the cleanup
+    # must not rewrite: the cleaned list is materialized into the local file
+    # so the next check converges without touching the foreign file.
+    (
+        "enable_mise_legacy_shared_selector_materialized",
+        {
+            ".config/mise/miserc.toml": 'env = ["work", "pmsec"]\nkept = true\n',
+            ".config/mise/config.pmsec.toml": '[settings]\nminimum_release_age = "3d"\n',
+        },
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "check_mise_legacy_shared_selector_converged",
+        {},
+        "enable_mise_legacy_shared_selector_materialized",
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--days", "1", "--check", "--json"],
+    ),
+    # Delimiters inside a comment or a single-line string are not structural:
+    # neither may open a multi-line string that hides the real selector or the
+    # sections after it.
+    (
+        "enable_mise_new_mode_comment_triple_quote",
+        {".config/mise/miserc.local.toml": '# uses """\nenv = ["work"]\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_trailing_comment_triple_quote",
+        {".config/mise/miserc.local.toml": 'env = ["work"] # uses """\n[settings]\nminimum_release_age = "7d"\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_string_delim_triple_quote",
+        {".config/mise/miserc.local.toml": "note = \"it's '''\"\nenv = [\"work\"]\nother = 1\n"},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    # A double-quoted key carrying escapes decodes to the bare spelling, so
+    # migration replaces the existing assignment instead of adding a duplicate
+    # env key.
+    (
+        "enable_mise_new_mode_escaped_env_key",
+        {".config/mise/miserc.local.toml": '"e\\u006ev" = ["work"]\nother = 1\n'},
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    # Serializer round-trip: a control character that slipped into an env name
+    # (hand-edited file) must come back escaped, not as a raw byte that makes
+    # the whole miserc unparseable.
+    (
+        "disable_mise_env_control_char_roundtrip",
+        {".config/mise/miserc.local.toml": "env = [\"a\u0007x\", \"pmsec\"]\nother = 1\n"},
+        None,
+        {"PMSEC_MISE_VERSION": "2026.10.25"},
+        ["--tool", "mise", "--disable", "--json"],
+    ),
+    # Dots are safe in one path component: config.work.dev.toml is a real
+    # mise layer, so its stricter cooldown must be preserved, while a name
+    # with a path separator must fail the enable instead of being skipped.
+    (
+        "enable_mise_new_mode_dotted_env_layer_preservation",
+        {
+            ".config/mise/miserc.local.toml": 'env = ["work.dev"]\n',
+            ".config/mise/config.work.dev.toml": '[settings]\nminimum_release_age = "30d"\n',
+        },
+        None,
+        NEW_MODE,
+        ["--tool", "mise", "--days", "1", "--json"],
+    ),
+    (
+        "enable_mise_new_mode_separator_env_name_fails",
+        {".config/mise/miserc.local.toml": 'env = ["work"]\n'},
+        None,
+        {**NEW_MODE, "MISE_ENV": "work/prod"},
+        ["--tool", "mise", "--days", "1", "--json"],
     ),
 ]
 

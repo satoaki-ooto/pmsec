@@ -10,7 +10,6 @@ _KEY = r"(\"[^\"]*\"|'[^']*'|[A-Za-z0-9_.\-]+)"
 _INDENT = {"=": r"^\s*", ":": r"^"}
 _ENTRY = {sep: re.compile(rf"{_INDENT[sep]}{_KEY}\s*{sep}") for sep in ("=", ":")}
 _FULL = {sep: re.compile(rf"{_INDENT[sep]}{_KEY}\s*{sep}\s*(.*?)\s*$") for sep in ("=", ":")}
-_MULTILINE = re.compile(r'"""|\'\'\'')
 _CLOSE = {'"': '"', "'": "'", "{": "}"}
 
 
@@ -46,16 +45,52 @@ def scan_view(lines: list[str]) -> list[str]:
     """Copy of `lines` with the body of TOML multi-line strings blanked.
 
     Text inside them is then never taken for a header or key. Indices stay aligned.
+    Context-aware: a triple-quote run inside a comment or inside a single-line
+    string is ordinary text, so it cannot hide a real key from the scan.
     """
     out: list[str] = []
     open_: str | None = None
     for line in lines:
         inside = open_ is not None
-        for m in _MULTILINE.finditer(line):
-            if open_ is None:
-                open_ = m.group(0)
-            elif open_ == m.group(0):
-                open_ = None
+        i = 0
+        n = len(line)
+        while i < n:
+            if open_ is not None:
+                if line.startswith(open_, i):
+                    open_ = None
+                    i += 3
+                else:
+                    i += 1
+                continue
+            ch = line[i]
+            if ch == "#":
+                break
+            tok = line[i:i + 3]
+            if tok == '"""' or tok == "'''":
+                open_ = tok
+                i += 3
+                continue
+            if ch == '"':
+                # Single-line basic string: `\"` cannot close it, so a `'''`
+                # inside never opens a multi-line string.
+                i += 1
+                while i < n:
+                    if line[i] == "\\":
+                        i += 2
+                        continue
+                    if line[i] == '"':
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == "'":
+                # Single-line literal string: no escapes, closes at the next `'`.
+                i += 1
+                while i < n and line[i] != "'":
+                    i += 1
+                i += 1
+                continue
+            i += 1
         out.append("" if inside else line)
     return out
 

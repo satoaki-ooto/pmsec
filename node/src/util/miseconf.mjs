@@ -6,14 +6,18 @@ import { scanView } from "./lines.mjs";
 
 // TOML treats "env", 'env', and env as the same key; recognize all three so
 // migration replaces the existing assignment instead of adding a duplicate.
-const ENV_KEY = /^\s*(?:"env"|'env'|env)\s*=\s*(.*)$/;
+// A basic-quoted key may carry escapes ("e\u006ev" decodes to env), so the
+// double-quoted spelling is captured and decoded before the comparison.
+const ENV_KEY = /^\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|(env))\s*=\s*(.*)$/;
 const SECTION = /^\s*\[/;
 
 function decodeBasicString(s) {
   return s.replace(/\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)/g, (_m, esc) => {
     if (esc[0] === "u" || esc[0] === "U") {
       const code = parseInt(esc.slice(1), 16);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+      // Out-of-range codepoints are invalid TOML; contribute nothing like the
+      // other ports instead of letting fromCodePoint throw.
+      return Number.isFinite(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "";
     }
     switch (esc) {
       case "b": return "\b";
@@ -108,6 +112,10 @@ export function parseEnv(text) {
     if (SECTION.test(scan[i])) break;
     const m = scan[i].match(ENV_KEY);
     if (!m) continue;
+    // Group 1 is a double-quoted key (escapes decoded), group 2 a literal
+    // single-quoted key (never decoded), group 3 the bare spelling.
+    const key = m[1] !== undefined ? decodeBasicString(m[1]) : (m[2] !== undefined ? m[2] : m[3]);
+    if (key !== "env") continue;
     const startCol = scan[i].indexOf("=") + 1;
     const parsed = parseArray(lines, i, startCol);
     return { defined: true, values: parsed.values, start: i, end: parsed.endLine };
@@ -128,7 +136,9 @@ function joinLines(lines, trailing, eol) {
 }
 
 function envLine(values) {
-  return `env = [${values.map(v => JSON.stringify(v)).join(", ")}]`;
+  // JSON.stringify already escapes backslash, quote, and every C0 control;
+  // DEL (U+007F) is the one TOML-forbidden char JSON leaves raw.
+  return `env = [${values.map(v => JSON.stringify(v).replace(/\u007f/g, "\\u007f")).join(", ")}]`;
 }
 
 function topLevelInsertIndex(lines) {

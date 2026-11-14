@@ -35,13 +35,42 @@ function entryValue(line, sep) {
 
 // Copy of `lines` with the body of TOML multi-line strings blanked, so text
 // inside them is never taken for a header or key. Indices stay aligned.
+// Context-aware: delimiters inside comments or single-line strings are not
+// structural, so `# uses """` or `note = "it's '''"` cannot hide a real key.
 export function scanView(lines) {
   let open = null;
   return lines.map(line => {
     const inside = open !== null;
-    for (const m of line.matchAll(/"""|'''/g)) {
-      if (open === null) open = m[0];
-      else if (open === m[0]) open = null;
+    let i = 0;
+    while (i < line.length) {
+      if (open !== null) {
+        if (line.startsWith(open, i)) { open = null; i += 3; }
+        else i++;
+        continue;
+      }
+      const ch = line[i];
+      if (ch === "#") break;
+      const tok = line.slice(i, i + 3);
+      if (tok === '"""' || tok === "'''") { open = tok; i += 3; continue; }
+      if (ch === '"') {
+        // Single-line basic string: `\"` cannot close it, so a `'''` inside
+        // never opens a multi-line string.
+        i++;
+        while (i < line.length) {
+          if (line[i] === "\\") { i += 2; continue; }
+          if (line[i] === '"') { i++; break; }
+          i++;
+        }
+        continue;
+      }
+      if (ch === "'") {
+        // Single-line literal string: no escapes, closes at the next `'`.
+        i++;
+        while (i < line.length && line[i] !== "'") i++;
+        i++;
+        continue;
+      }
+      i++;
     }
     return inside ? "" : line;
   });

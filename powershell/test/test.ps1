@@ -550,6 +550,10 @@ T 'Windows scope ignores XDG_CONFIG_HOME for uv' {
 }
 
 T 'WSL scope resolves mise from the distro env, not the Windows env' {
+  # The POSIX-rooted override below is spelled with the host path convention,
+  # so the end-to-end assertion only holds on non-Windows hosts; the resolver
+  # probe test covers the same rules on every host.
+  if ($IsWindows) { return $true }
   $h = NewHome
   try {
     $wslHome = PathJoin $h 'wsl-home'
@@ -1088,7 +1092,7 @@ T 'real WSL scope reads only forwarded POSIX mise env and maps it to the UNC hom
   # load the resolver functions from pmsec.ps1 and drive them directly.
   $tokens = $null; $parseErrors = $null
   $ast = [System.Management.Automation.Language.Parser]::ParseFile($Pmsec, [ref]$tokens, [ref]$parseErrors)
-  $names = @('Get-PmsecPlatform','Get-PmsecHome','Get-MiseWslRoot','Get-MiseScopeEnv','ConvertTo-MiseScopePath','Get-MiseDir','Get-MisePath','Get-MiseSystemMiserc')
+  $names = @('Get-PmsecPlatform','Get-PmsecHome','Get-MiseWslRoot','Get-MiseScopeEnv','ConvertFrom-MiseScopePath','ConvertTo-MiseScopePath','Get-MiseDir','Get-MisePath','Get-MiseSystemMiserc')
   $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name }, $false) | ForEach-Object { $_.Extent.Text }
   $probe = [scriptblock]::Create(($defs -join "`n") + @'
 
@@ -1106,23 +1110,75 @@ $script:Scope = @{ Platform = 'linux'; Home = '\\wsl$\Ubuntu\home\alice' }
   $saved = @{}
   foreach ($k in $keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $null) }
   try {
+    # Runs the probe and compares every named field; a mismatch fails fast.
+    function Probe([string]$Label, [hashtable]$Expected) {
+      $r = & $probe
+      foreach ($k in $Expected.Keys) {
+        if ($r[$k] -cne $Expected[$k]) {
+          $script:LastFail = "$Label: $k = $($r[$k]), expected $($Expected[$k])"
+          return $false
+        }
+      }
+      return $true
+    }
     $env:MISE_CONFIG_DIR = '/home/alice/mise'
     $env:MISE_SYSTEM_CONFIG_DIR = '/opt/mise'
     $env:MISE_ENV = 'pmsec'
-    $r = & $probe
-    if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\.config\mise') { $script:LastFail = "unforwarded MISE_CONFIG_DIR applied: $($r.Dir)"; return $false }
-    if ($r.System -ne '\\wsl$\Ubuntu\etc\mise\miserc.toml') { $script:LastFail = "system miserc not on the distro: $($r.System)"; return $false }
-    if ($null -ne $r.MiseEnv) { $script:LastFail = "host MISE_ENV leaked into the WSL scope: $($r.MiseEnv)"; return $false }
+    if (-not (Probe 'unforwarded' @{
+      Dir = '\\wsl$\Ubuntu\home\alice\.config\mise'
+      System = '\\wsl$\Ubuntu\etc\mise\miserc.toml'
+      MiseEnv = $null
+    })) { return $false }
     $env:WSLENV = 'MISE_ENV/w:MISE_CONFIG_DIR/pw'
-    $r = & $probe
-    if ($null -ne $r.MiseEnv) { $script:LastFail = 'WSL->Win32-only MISE_ENV treated as reaching the distro'; return $false }
-    if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\.config\mise') { $script:LastFail = "WSL->Win32-only MISE_CONFIG_DIR applied: $($r.Dir)"; return $false }
+    if (-not (Probe 'wsl-to-win32-only' @{
+      Dir = '\\wsl$\Ubuntu\home\alice\.config\mise'
+      MiseEnv = $null
+    })) { return $false }
     $env:WSLENV = 'FOO:MISE_CONFIG_DIR/up:MISE_SYSTEM_CONFIG_DIR/u:MISE_ENV'
-    $r = & $probe
-    if ($r.Dir -ne '\\wsl$\Ubuntu\home\alice\mise') { $script:LastFail = "forwarded MISE_CONFIG_DIR not mapped to UNC: $($r.Dir)"; return $false }
-    if ($r.Path -ne '\\wsl$\Ubuntu\home\alice\mise\config.toml') { $script:LastFail = "legacy path not mapped to UNC: $($r.Path)"; return $false }
-    if ($r.System -ne '\\wsl$\Ubuntu\opt\mise\miserc.toml') { $script:LastFail = "forwarded system dir not mapped: $($r.System)"; return $false }
-    if ($r.MiseEnv -ne 'pmsec') { $script:LastFail = 'forwarded MISE_ENV ignored'; return $false }
+    if (-not (Probe 'forwarded-posix' @{
+      Dir = '\\wsl$\Ubuntu\home\alice\mise'
+      Path = '\\wsl$\Ubuntu\home\alice\mise\config.toml'
+      System = '\\wsl$\Ubuntu\opt\mise\miserc.toml'
+      MiseEnv = 'pmsec'
+    })) { return $false }
+    # /p: a drive-letter value reaches the distro translated to /mnt/<drive>,
+    # so pmsec must resolve the same path the distro's mise will read.
+    $env:WSLENV = 'MISE_CONFIG_DIR/p'
+    $env:MISE_CONFIG_DIR = 'C:\Users\alice\mise'
+    if (-not (Probe 'p-drive' @{ Dir = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise' })) { return $false }
+    $env:MISE_CONFIG_DIR = 'c:\Users\alice\mise'
+    if (-not (Probe 'p-lowercase-drive' @{ Dir = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise' })) { return $false }
+    $env:MISE_CONFIG_DIR = 'C:/Users/alice/mise'
+    if (-not (Probe 'p-forward-slash-drive' @{ Dir = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise' })) { return $false }
+    # A POSIX value under /p is already what the distro sees: pass verbatim.
+    $env:MISE_CONFIG_DIR = '/home/alice/mise'
+    if (-not (Probe 'p-posix-verbatim' @{ Dir = '\\wsl$\Ubuntu\home\alice\mise' })) { return $false }
+    # A value inside this distro's UNC root maps back to its POSIX path.
+    $env:MISE_CONFIG_DIR = '\\wsl$\Ubuntu\home\alice\mise'
+    if (-not (Probe 'p-same-distro-unc' @{ Dir = '\\wsl$\Ubuntu\home\alice\mise' })) { return $false }
+    # Another distro's UNC root is not this distro's view: leave it alone and
+    # let the non-POSIX value stay ignored.
+    $env:MISE_CONFIG_DIR = '\\wsl$\Debian\home\bob'
+    if (-not (Probe 'p-foreign-distro-unc' @{ Dir = '\\wsl$\Ubuntu\home\alice\.config\mise' })) { return $false }
+    # Flag order and combinations must not change the translation, and every
+    # mise override takes the same route.
+    $env:MISE_CONFIG_DIR = 'C:\Users\alice\mise'
+    $env:MISE_GLOBAL_CONFIG_FILE = 'C:\Users\alice\mise\config.toml'
+    $env:MISE_SYSTEM_CONFIG_DIR = 'C:\ProgramData\mise'
+    $env:WSLENV = 'MISE_GLOBAL_CONFIG_FILE/up:MISE_SYSTEM_CONFIG_DIR/pu:MISE_CONFIG_DIR/p'
+    if (-not (Probe 'p-flag-combos' @{
+      Dir = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise'
+      Path = '\\wsl$\Ubuntu\mnt\c\Users\alice\mise\config.toml'
+      System = '\\wsl$\Ubuntu\mnt\c\ProgramData\mise\miserc.toml'
+    })) { return $false }
+    # /w stays WSL -> Win32 only, so none of these reach the distro.
+    $env:WSLENV = 'MISE_CONFIG_DIR/w:MISE_GLOBAL_CONFIG_FILE/w:MISE_SYSTEM_CONFIG_DIR/w:MISE_ENV/w'
+    if (-not (Probe 'w-invisible' @{
+      Dir = '\\wsl$\Ubuntu\home\alice\.config\mise'
+      Path = '\\wsl$\Ubuntu\home\alice\.config\mise\config.toml'
+      System = '\\wsl$\Ubuntu\etc\mise\miserc.toml'
+      MiseEnv = $null
+    })) { return $false }
     return $true
   } finally {
     foreach ($k in $keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
