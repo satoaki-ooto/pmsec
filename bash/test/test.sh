@@ -20,7 +20,11 @@ setup_home() {
 # (pnpm 11 default enforcement) don't depend on what's installed locally.
 # `PMSEC_BUNDLER_VERSION=none` likewise hides the host bundler so its
 # preflight warning doesn't leak into stderr-sensitive assertions.
-# Test cases that exercise pnpm 11 behavior pass an override in `extra`.
+# `PMSEC_MISE_VERSION=none` hides the host mise so mise mode detection stays
+# host-independent (the mode gate is not wired into the CLI yet, but pinning it
+# here keeps the suite honest when it is).
+# Test cases that exercise pnpm 11 behavior pass an override in `extra`, which
+# lands after the defaults on the `env` command line and therefore wins.
 run_pmsec() {
   local home="$1"; shift
   local extra=()
@@ -30,11 +34,11 @@ run_pmsec() {
   shift
   if [ "${#extra[@]}" -eq 0 ]; then
     env -i PATH="$PATH" HOME="$home" XDG_CONFIG_HOME="$home/.config" \
-      PMSEC_PNPM_VERSION=none PMSEC_BUNDLER_VERSION=none \
+      PMSEC_PNPM_VERSION=none PMSEC_BUNDLER_VERSION=none PMSEC_MISE_VERSION=none \
       bash "$PMSEC" "$@"
   else
     env -i PATH="$PATH" HOME="$home" XDG_CONFIG_HOME="$home/.config" \
-      PMSEC_PNPM_VERSION=none PMSEC_BUNDLER_VERSION=none \
+      PMSEC_PNPM_VERSION=none PMSEC_BUNDLER_VERSION=none PMSEC_MISE_VERSION=none \
       "${extra[@]}" bash "$PMSEC" "$@"
   fi
 }
@@ -586,7 +590,7 @@ t_pmsec_home_redirects() {
   local real fake; real=$(setup_home); fake=$(setup_home)
   # HOME points at $real but PMSEC_HOME redirects everything to $fake.
   env -i PATH="$PATH" HOME="$real" XDG_CONFIG_HOME="$fake/.config" \
-    PMSEC_PNPM_VERSION=none PMSEC_HOME="$fake" \
+    PMSEC_PNPM_VERSION=none PMSEC_MISE_VERSION=none PMSEC_HOME="$fake" \
     bash "$PMSEC" >/dev/null 2>&1
   local rc=$?
   local has_real=0 has_fake=0
@@ -764,6 +768,154 @@ t_composer_preserves_unrelated_keys() {
 }
 
 T "composer preserves unrelated JSON keys" t_composer_preserves_unrelated_keys
+
+# ---------- mise config layer: substrate helpers ----------
+# Phase 2 adds substrate only: the new path family and the mode gate exist but
+# nothing in the CLI calls them yet, so these tests reach the helpers directly.
+# `source bash/pmsec` defines them without running main (see the guard at the
+# bottom of that file).
+# shellcheck source=../pmsec
+. "$PMSEC"
+
+# call_helper [VAR=val ...] -- FN [args ...]
+# Run a sourced pmsec helper in a scrubbed environment (env -i, like
+# run_pmsec) so the host's MISE_*/XDG_*/LOCALAPPDATA can't leak into the
+# expectation. Callers append `2>&1` when "prints nothing" must cover stderr.
+call_helper() {
+  local extra=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+    extra[${#extra[@]}]="$1"; shift
+  done
+  shift
+  local fn="$1"; shift
+  if [ "${#extra[@]}" -eq 0 ]; then
+    env -i PATH="$PATH" bash -c '. "$1"; shift; "$@"' _ "$PMSEC" "$fn" "$@"
+  else
+    env -i PATH="$PATH" "${extra[@]}" bash -c '. "$1"; shift; "$@"' _ "$PMSEC" "$fn" "$@"
+  fi
+}
+
+# Sourcing the port must define the helpers and do nothing else: no output, no
+# writes, no CLI run.
+t_source_guard_defines_without_running_main() {
+  local home out rc wrote=0
+  home=$(setup_home)
+  out=$(env -i PATH="$PATH" HOME="$home" XDG_CONFIG_HOME="$home/.config" \
+    bash -c '. "$1" && declare -F path_mise_dir >/dev/null && declare -F path_mise_system_miserc >/dev/null && declare -F mise_supports_new_mode >/dev/null' \
+    _ "$PMSEC" 2>&1); rc=$?
+  [ -e "$home/.npmrc" ] && wrote=1
+  rm -rf -- "$home"
+  assert_eq "source exits 0" "0" "$rc" || return 1
+  assert_eq "source prints nothing" "" "$out" || return 1
+  assert_eq "source does not run main" "0" "$wrote"
+}
+
+# The legacy resolver keeps its own rules: MISE_CONFIG_DIR and the new-mode
+# default must never move it, and an empty MISE_GLOBAL_CONFIG_FILE is unset.
+t_path_mise_legacy_untouched() {
+  local h=/pmsec-nohome out
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" -- path_mise)
+  assert_eq "legacy: XDG default" "$h/xdg/mise/config.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" MISE_GLOBAL_CONFIG_FILE="$h/global.toml" -- path_mise)
+  assert_eq "legacy: MISE_GLOBAL_CONFIG_FILE wins" "$h/global.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" MISE_GLOBAL_CONFIG_FILE= -- path_mise)
+  assert_eq "legacy: empty MISE_GLOBAL_CONFIG_FILE falls through" "$h/xdg/mise/config.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" MISE_CONFIG_DIR="$h/mise-dir" -- path_mise)
+  assert_eq "legacy: MISE_CONFIG_DIR does not redirect" "$h/xdg/mise/config.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" PMSEC_PLATFORM=win32 LOCALAPPDATA="$h/appdata" -- path_mise)
+  assert_eq "legacy: win32 uses LOCALAPPDATA" "$h/appdata/mise/config.toml" "$out"
+}
+
+t_path_mise_dir_overrides() {
+  local h=/pmsec-nohome out
+  out=$(call_helper HOME="$h" -- path_mise_dir)
+  assert_eq "dir: HOME default" "$h/.config/mise" "$out" || return 1
+  out=$(call_helper HOME="$h" PMSEC_HOME="$h/redirect" -- path_mise_dir)
+  assert_eq "dir: PMSEC_HOME wins over HOME" "$h/redirect/.config/mise" "$out" || return 1
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" -- path_mise_dir)
+  assert_eq "dir: XDG override" "$h/xdg/mise" "$out" || return 1
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" MISE_CONFIG_DIR="$h/mise-dir" -- path_mise_dir)
+  assert_eq "dir: MISE_CONFIG_DIR wins over XDG" "$h/mise-dir" "$out" || return 1
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" MISE_CONFIG_DIR= -- path_mise_dir)
+  assert_eq "dir: empty MISE_CONFIG_DIR falls through" "$h/xdg/mise" "$out" || return 1
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME= -- path_mise_dir)
+  assert_eq "dir: empty XDG falls through" "$h/.config/mise" "$out" || return 1
+  out=$(call_helper HOME="$h" PMSEC_PLATFORM=win32 LOCALAPPDATA="$h/appdata" -- path_mise_dir)
+  assert_eq "dir: win32 default ignores LOCALAPPDATA" "$h/.config/mise" "$out"
+}
+
+t_path_mise_derived_family() {
+  local h=/pmsec-nohome d out
+  d="$h/mise-dir"
+  out=$(call_helper HOME="$h" MISE_CONFIG_DIR="$d" -- path_mise_base_config)
+  assert_eq "derived: base config" "$d/config.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" MISE_CONFIG_DIR="$d" -- path_mise_pmsec_config)
+  assert_eq "derived: pmsec config" "$d/config.pmsec.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" MISE_CONFIG_DIR="$d" -- path_mise_local_miserc)
+  assert_eq "derived: local miserc" "$d/miserc.local.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" MISE_CONFIG_DIR="$d" -- path_mise_shared_miserc)
+  assert_eq "derived: shared miserc" "$d/miserc.toml" "$out" || return 1
+  # The same family must follow the XDG-derived default, not just the override.
+  out=$(call_helper HOME="$h" XDG_CONFIG_HOME="$h/xdg" -- path_mise_pmsec_config)
+  assert_eq "derived: follows XDG" "$h/xdg/mise/config.pmsec.toml" "$out"
+}
+
+t_path_mise_system_miserc() {
+  local h=/pmsec-nohome s out
+  s="$h/sys"
+  out=$(call_helper HOME="$h" MISE_SYSTEM_CONFIG_DIR="$s" -- path_mise_system_miserc)
+  assert_eq "system: override" "$s/miserc.toml" "$out" || return 1
+  out=$(call_helper HOME="$h" -- path_mise_system_miserc)
+  assert_eq "system: POSIX default" "/etc/mise/miserc.toml" "$out" || return 1
+  # win32 default lives on the drive mise runs from, not SYSTEMDRIVE. The drive
+  # root is injected so the case is host-independent.
+  out=$(call_helper HOME="$h" MISE_SYSTEM_CONFIG_DIR= PMSEC_PLATFORM=win32 -- path_mise_system_miserc "D:/")
+  assert_eq "system: empty override falls to drive root" 'D:\etc\mise\miserc.toml' "$out" || return 1
+  out=$(call_helper HOME="$h" PMSEC_PLATFORM=win32 -- path_mise_system_miserc 'D:\')
+  assert_eq "system: backslash drive root normalized" 'D:\etc\mise\miserc.toml' "$out" || return 1
+  out=$(call_helper HOME="$h" MISE_SYSTEM_CONFIG_DIR="$s" PMSEC_PLATFORM=win32 -- path_mise_system_miserc "D:/")
+  assert_eq "system: override beats drive root" "$s/miserc.toml" "$out"
+}
+
+# Only mise >= 2026.11.0 with no legacy override opts into the new mode; an
+# empty MISE_GLOBAL_CONFIG_FILE counts as unset. Versions come from
+# PMSEC_MISE_VERSION, so no host mise binary is consulted.
+t_mise_supports_new_mode_matrix() {
+  local version override out rc expect seq
+  for version in 2026.11.0 2026.10.25 2026.12.0 none; do
+    for override in unset empty set; do
+      case "$override" in
+        unset) out=$(call_helper PMSEC_MISE_VERSION="$version" -- mise_supports_new_mode 2>&1) ;;
+        empty) out=$(call_helper PMSEC_MISE_VERSION="$version" MISE_GLOBAL_CONFIG_FILE= -- mise_supports_new_mode 2>&1) ;;
+        set)   out=$(call_helper PMSEC_MISE_VERSION="$version" MISE_GLOBAL_CONFIG_FILE=/pmsec-nohome/global.toml -- mise_supports_new_mode 2>&1) ;;
+      esac
+      rc=$?
+      expect=1
+      if [ "$override" != "set" ]; then
+        case "$version" in
+          2026.11.0|2026.12.0) expect=0 ;;
+        esac
+      fi
+      assert_eq "mode: mise $version, override $override (exit)" "$expect" "$rc" || return 1
+      assert_eq "mode: mise $version, override $override (silent)" "" "$out" || return 1
+    done
+  done
+  # No caching: a second call in the same shell must see the changed env.
+  seq=$(env -i PATH="$PATH" PMSEC_MISE_VERSION=2026.11.0 bash -c '
+    . "$1"
+    mise_supports_new_mode; printf "first=%s " "$?"
+    MISE_GLOBAL_CONFIG_FILE=/pmsec-nohome/global.toml
+    mise_supports_new_mode; printf "second=%s" "$?"
+  ' _ "$PMSEC" 2>&1)
+  assert_eq "mode: re-detected on every call" "first=0 second=1" "$seq"
+}
+
+T "sourcing bash/pmsec defines helpers without running main" t_source_guard_defines_without_running_main
+T "legacy path_mise resolver is unchanged" t_path_mise_legacy_untouched
+T "path_mise_dir override precedence" t_path_mise_dir_overrides
+T "derived mise config paths follow path_mise_dir" t_path_mise_derived_family
+T "system miserc resolution (override / POSIX / win32 drive root)" t_path_mise_system_miserc
+T "mise_supports_new_mode version x override matrix" t_mise_supports_new_mode_matrix
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

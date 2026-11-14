@@ -103,6 +103,75 @@ path_mise() {
   fi
   printf '%s/mise/config.toml' "${XDG_CONFIG_HOME:-$home/.config}"
 }
+
+# ---------- mise config layer: new-mode path family ----------
+# Substrate for the mise config layer. Nothing here is wired into the CLI yet:
+# `path_mise` / `tool_path` above keep resolving the legacy file, so behavior
+# is unchanged. Every helper below is pure — no filesystem access, exactly one
+# path on stdout, always status 0. An empty override means "unset", matching
+# the phase-1 contract.
+
+# MISE_CONFIG_DIR wins, then XDG_CONFIG_HOME/mise, then ~/.config/mise on every
+# OS. win32 deliberately shares the POSIX default: mise's config dir lives under
+# %USERPROFILE%\.config\mise there too — only the *legacy* resolver above reads
+# LOCALAPPDATA, this family never does.
+path_mise_dir() {
+  local home; home=$(_pmsec_home)
+  if [ -n "${MISE_CONFIG_DIR:-}" ]; then printf '%s' "$MISE_CONFIG_DIR"; return 0; fi
+  if [ -n "${XDG_CONFIG_HOME:-}" ]; then printf '%s/mise' "$XDG_CONFIG_HOME"; return 0; fi
+  printf '%s/.config/mise' "$home"
+}
+
+# Everything mise reads now hangs off path_mise_dir, so these stay one-liners:
+# a change to the directory resolution propagates to all four at once.
+path_mise_base_config() { printf '%s/config.toml' "$(path_mise_dir)"; }
+path_mise_pmsec_config() { printf '%s/config.pmsec.toml' "$(path_mise_dir)"; }
+path_mise_local_miserc() { printf '%s/miserc.local.toml' "$(path_mise_dir)"; }
+path_mise_shared_miserc() { printf '%s/miserc.toml' "$(path_mise_dir)"; }
+
+# Drive root of the current directory on win32 ("C:/work" -> "C:/"). `pwd -W`
+# is an MSYS/Git-Bash builtin; real bash (Linux, macOS) rejects -W, so this
+# stays empty there and the POSIX default wins. UNC paths have no drive root.
+_mise_current_drive_root() {
+  local pwd_w
+  pwd_w=$(pwd -W 2>/dev/null) || pwd_w=""
+  case "$pwd_w" in
+    [[:alpha:]]:/*) printf '%s:/' "${pwd_w%%:*}" ;;
+    *) printf '' ;;
+  esac
+}
+
+# Fold a drive root into the `D:\` form the win32 default is built from, so a
+# test can inject "D:/" or "D:\\" instead of probing a Windows host.
+_mise_drive_root_prefix() {
+  case "$1" in
+    [[:alpha:]]:[\\/]) printf '%s:\\' "${1%%:*}" ;;
+    [[:alpha:]]:)      printf '%s:\\' "${1%%:*}" ;;
+    *[\\/])            printf '%s' "$1" ;;
+    *)                 printf '%s\\' "$1" ;;
+  esac
+}
+
+# MISE_SYSTEM_CONFIG_DIR wins ("/"-joined like the other overrides, on every
+# OS), then on win32 the current drive root (<drive>\etc\mise\miserc.toml),
+# then /etc/mise/miserc.toml. The optional first argument injects the drive
+# root for tests; it overrides detection and is ignored off win32. SYSTEMDRIVE
+# is never consulted: it names the boot volume, not the one mise is running on.
+path_mise_system_miserc() {
+  if [ -n "${MISE_SYSTEM_CONFIG_DIR:-}" ]; then
+    printf '%s/miserc.toml' "$MISE_SYSTEM_CONFIG_DIR"; return 0
+  fi
+  if [ "${PMSEC_PLATFORM:-}" = "win32" ]; then
+    local root="${1-}"
+    [ -n "$root" ] || root=$(_mise_current_drive_root)
+    if [ -n "$root" ]; then
+      printf '%s%s' "$(_mise_drive_root_prefix "$root")" 'etc\mise\miserc.toml'
+      return 0
+    fi
+  fi
+  printf '/etc/mise/miserc.toml'
+}
+
 path_aube() {
   local home; home=$(_pmsec_home)
   if [ -n "${AUBE_CONFIG_FILE:-}" ]; then printf '%s' "$AUBE_CONFIG_FILE"; return; fi
@@ -894,6 +963,32 @@ version_gte() {
   if [ "$1" -ne "$4" ]; then [ "$1" -gt "$4" ]; return; fi
   if [ "$2" -ne "$5" ]; then [ "$2" -gt "$5" ]; return; fi
   [ "$3" -ge "$6" ]
+}
+
+# mise config-layer mode gate: status only, prints nothing, and re-detects on
+# every call (no caching) so a caller that changes MISE_GLOBAL_CONFIG_FILE or
+# the mise on PATH between calls gets a fresh answer.
+#
+# New mode needs mise >= 2026.11.0 *and* no MISE_GLOBAL_CONFIG_FILE override —
+# the override is the legacy escape hatch, and an empty one counts as unset.
+# Undetected ("none"), old, or malformed versions stay in legacy mode. This is
+# a separate seam from the cooldown floor in tool_preflight (2026.4.22), which
+# is deliberately untouched.
+mise_supports_new_mode() {
+  local v major minor patch rest f
+  if [ -n "${MISE_GLOBAL_CONFIG_FILE:-}" ]; then return 1; fi
+  v=$(version_detect mise) || return 1
+  major=${v%% *}
+  rest=${v#* }
+  minor=${rest%% *}
+  rest=${rest#* }
+  patch=${rest%% *}
+  # version_gte compares with `[ -ne ]`, which would leak a diagnostic to
+  # stderr on a non-numeric field; refuse those before getting there.
+  for f in "$major" "$minor" "$patch"; do
+    case "$f" in ''|*[!0-9]*) return 1 ;; esac
+  done
+  version_gte "$major" "$minor" "$patch" 2026 11 0
 }
 
 # ---------- per-tool: metadata ----------
@@ -1953,4 +2048,11 @@ main() {
   esac
 }
 
-main "$@"
+# `source` this file to get the helpers (tests, tooling) without running the
+# CLI. Comparing BASH_SOURCE[0] with $0 keeps `bash pmsec …` and `./pmsec …`
+# byte-identical: both name the same file, main runs, and the `if` inherits
+# main's exit status. An unset BASH_SOURCE[0] is the `bash < pmsec` form, which
+# used to run main as well.
+if [ -z "${BASH_SOURCE[0]-}" ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
