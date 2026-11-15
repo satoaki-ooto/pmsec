@@ -808,11 +808,13 @@ function Get-MiseScopeContext($Scope) {
 #
 # The "root region" is everything from the start of the text (after a leading
 # BOM, which is skipped but preserved) to the first line whose first
-# non-whitespace character is `[` outside a string or a comment. Only a bare,
-# case-sensitive `env` key there is a target. The scanner tracks enough
-# structure (basic/literal strings, `"""`/`'''` blocks, comments) to keep
-# env-like text and table headers inside them from being misparsed; it does not
-# validate TOML in general.
+# non-whitespace character is `[` outside a string, a comment, or an open
+# array/inline table (string- and comment-aware bracket depth). Only a bare,
+# case-sensitive `env` key there is a target; every other character is
+# untouched. The scanner tracks enough structure (basic/literal strings,
+# `"""`/`'''` blocks, comments, value brackets) to keep env-like text and table
+# headers inside them from being misparsed; it does not validate TOML in
+# general.
 #
 # deliberate: Issue-#194 TOML subset only; unsupported forms fail closed. Upgrade path: extend this parser per port behind the same contract.
 #
@@ -888,7 +890,9 @@ function Read-MisercEnv([string]$Text, [string]$Path) {
 # local quoting of names that are already present (leftmost token wins); every
 # other byte - BOM, CRLF, comments, unrelated tables, a missing final newline -
 # is preserved. Without an assignment, one line is inserted at the end of the
-# root region. The result is byte-identical when applied twice.
+# root region: before the first real table header, before a value still open at
+# the end of the text, or at the end of the text. The result is byte-identical
+# when applied twice.
 #   Success: @{ Ok = $true; Text = <string>; Reason = '' }
 #   Failure: @{ Ok = $false; Text = $null; Reason = <reason> }
 function Update-MisercEnvText([string]$Text, [string[]]$Inherited, [string]$Path) {
@@ -931,9 +935,16 @@ function Update-MisercEnvText([string]$Text, [string[]]$Inherited, [string]$Path
       $output = $Text.Substring(0, $start) + $line + $Text.Substring($end)
     } else {
       # Absent assignment: land on the last line of the root region, i.e. just
-      # before the first real table header (or at the end of the file).
+      # before the first real table header. With no header, a value still open
+      # at the end of the text ends the region where it began: the file is broken
+      # TOML either way, but the new key must not become an element of that
+      # value. Everything closed leaves the boundary at the end of the text.
       $at = $Text.Length
-      if ([int]$analysis['RootEnd'] -ge 0) { $at = [int]$analysis['RootEnd'] }
+      if ([int]$analysis['RootEnd'] -ge 0) {
+        $at = [int]$analysis['RootEnd']
+      } elseif ([int]$analysis['OpenValue'] -ge 0) {
+        $at = [int]$analysis['OpenValue']
+      }
       $before = $Text.Substring(0, $at)
       $separator = ''
       if ($before.Length -gt 0 -and -not $before.EndsWith("`n")) { $separator = "`n" }
@@ -971,77 +982,103 @@ function Get-MisercQuoteRun([string]$Text, [int]$Index) {
   return ($j - $Index)
 }
 
-# Header name without brackets, or $null when the line is not a closed header.
-# Keeps quoted segments intact so `["env"]` still yields `"env"` for unquoting.
-function Get-MisercHeaderName([string]$Text, [int]$Index) {
-  $double = ($Index + 1 -lt $Text.Length -and $Text[$Index + 1] -eq '[')
-  $quote = ''
-  $name = New-Object System.Text.StringBuilder
-  $start = $Index + 1
-  if ($double) { $start = $Index + 2 }
-  for ($j = $start; $j -lt $Text.Length; $j++) {
-    $c = $Text[$j]
-    if ($c -eq "`n") { return $null }
-    if ($quote -ne '') {
-      if ([string]$c -eq $quote) { $quote = '' }
-      [void]$name.Append($c)
-      continue
-    }
-    if ($c -eq '"' -or $c -eq "'") { $quote = [string]$c; [void]$name.Append($c); continue }
-    if ($c -eq '#') { return $null }
-    if ($c -eq ']') {
-      if ($double) {
-        if ($j + 1 -ge $Text.Length -or $Text[$j + 1] -ne ']') { return $null }
+# Horizontal whitespace only: a dotted key cannot cross a line, so the forms
+# that are tolerated before `=` stay bare-key decisions instead of dotted ones.
+function Skip-MisercBlanks([string]$Text, [int]$Index, [int]$End) {
+  $i = $Index
+  while ($i -lt $End) {
+    $c = $Text[$i]
+    if ($c -ne ' ' -and $c -ne "`t" -and $c -ne "`r") { break }
+    $i++
+  }
+  return $i
+}
+
+# Decodes the first dot-separated key segment at $Index, the way every port
+# does: a quoted segment loses its quotes but keeps escapes undecoded, a bare
+# one runs to whitespace, `.`, `=`, a comment or a closing bracket. Returns
+# @{ Text; End } - Text is the decoded segment, End the offset just past it - or
+# $null when it is empty or its quote never closes before $End. $End is the line
+# end, so a header cut short can never borrow a segment from the line below it.
+#
+# deliberate: Issue-#194 subset only; quotes are stripped, never decoded, so no
+# escaped spelling can collapse onto the plain name `env`.
+function Get-MisercKeySegment([string]$Text, [int]$Index, [int]$End) {
+  if ($Index -lt 0 -or $Index -ge $End) { return $null }
+  $quote = $Text[$Index]
+  if ($quote -eq '"' -or $quote -eq "'") {
+    $raw = New-Object System.Text.StringBuilder
+    $j = $Index + 1
+    while ($j -lt $End) {
+      if ($Text[$j] -eq $quote) { return @{ Text = $raw.ToString(); End = $j + 1 } }
+      if ($quote -eq '"' -and $Text[$j] -eq '\') {
+        # The pair is copied verbatim and never decoded, so an escaped spelling
+        # cannot match the plain name every port compares against.
+        if ($j + 1 -lt $End) { [void]$raw.Append($Text.Substring($j, 2)) } else { [void]$raw.Append([string]$Text[$j]) }
+        $j = $j + 2
+        continue
       }
-      return $name.ToString().Trim()
+      [void]$raw.Append([string]$Text[$j])
+      $j++
     }
-    [void]$name.Append($c)
+    return $null
   }
-  return $null
+  $j = $Index
+  while ($j -lt $End) {
+    $c = $Text[$j]
+    if ($c -eq ' ' -or $c -eq "`t" -or $c -eq "`r" -or $c -eq '.' -or $c -eq '=' -or $c -eq ']' -or $c -eq '}') { break }
+    $j++
+  }
+  if ($j -eq $Index) { return $null }
+  return @{ Text = $Text.Substring($Index, $j - $Index); End = $j }
 }
 
-function Remove-MisercQuotes([string]$Value) {
-  if ($Value.Length -lt 2) { return $Value }
-  $first = $Value[0]
-  if (($first -eq '"' -or $first -eq "'") -and $Value[$Value.Length - 1] -eq $first) {
-    return $Value.Substring(1, $Value.Length - 2)
-  }
-  return $Value
-}
-
-# `["env"]`, `[ 'env' ]`, `[env]` all name the same table.
-function ConvertTo-MisercHeaderKey([string]$Name) {
-  $parts = $Name.Split('.')
-  for ($k = 0; $k -lt $parts.Count; $k++) { $parts[$k] = Remove-MisercQuotes $parts[$k].Trim() }
-  return ($parts -join '.')
+# A depth-0 line-start `[` opens a table header. It owns the key pmsec writes
+# when its first decoded segment is exactly `env` and that segment is followed
+# by `.` (a deeper table) or `]` (the table itself): `[env]`, `[env.foo]`,
+# `[ "env" ]`, `["env".x]`, and a header cut short (`[env.`, `[env.[`,
+# `[[env.`) all conflict. Termination is irrelevant, because a broken header is
+# a file mise never loads and the key it names still collides with the array.
+# `[x.env]`, `[envsub]`, `["env.foo"]` (one quoted key that spells a dot) and a
+# bare `[env` with nothing after its segment do not conflict. Every comparison
+# is ordinal, so `[ENV]` is a different table.
+function Test-MisercHeaderOwnsEnv([string]$Text, [int]$Index, [int]$End) {
+  $after = $Index + 1
+  if ($after -lt $End -and $Text[$after] -eq '[') { $after++ }
+  $segment = Get-MisercKeySegment $Text (Skip-MisercBlanks $Text $after $End) $End
+  if ($null -eq $segment) { return $false }
+  if ([string]$segment['Text'] -cne 'env') { return $false }
+  $rest = Skip-MisercBlanks $Text ([int]$segment['End']) $End
+  if ($rest -ge $End) { return $false }
+  return ($Text[$rest] -eq '.' -or $Text[$rest] -eq ']')
 }
 
 # Classifies one line-start token. `bare` is the exact token `env` followed by
-# whitespace/`=`/end-of-line; `dotted` is `env.` (a dotted key, never the array);
-# `quoted` is `"env"`/`'env'` used as a key, which is outside the subset. $null
-# means "unrelated", which is the answer for nearly every line.
+# whitespace/`=`/end-of-file; `dotted` is `env` as the first segment of a dotted
+# key (`env.foo`, `env . foo`, `"env".foo`), which defines the env table rather
+# than the array; `quoted` is `"env"`/`'env'` used as a key, which is outside the
+# subset. $null means "unrelated", which is the answer for nearly every line. A
+# bare `env` at end-of-file is still `bare`: the empty sentinel means the
+# assignment is cut short, never that the key is unrelated.
 function Get-MisercKeyKind([string]$Text, [int]$Index, [int]$Len) {
   $c = $Text[$Index]
   if ($c -eq '"' -or $c -eq "'") {
     $quote = [string]$c
     if (Test-MisercAt $Text $Index ($quote + $quote + $quote)) { return $null }
-    $raw = ''
-    $j = $Index + 1
-    while ($j -lt $Len -and $Text[$j] -ne $c) {
-      if ($Text[$j] -eq "`n") { return $null }
-      if ($c -eq '"' -and $Text[$j] -eq '\') {
-        # A quoted key with escapes is out of subset either way; copy the pair
-        # so it can never read as the bare `env` token.
-        if ($j + 1 -lt $Len) { $raw = $raw + $Text.Substring($j, 2) } else { $raw = $raw + [string]$Text[$j] }
-        $j = $j + 2
-        continue
-      }
-      $raw = $raw + [string]$Text[$j]
-      $j++
-    }
-    if ($j -ge $Len -or $raw -ne 'env') { return $null }
-    if ($j + 1 -lt $Len -and $Text[$j + 1] -eq '.') { return $null }
-    $k = $j + 1
+    # The segment is bounded by the line end: a quoted key never spans a line.
+    $end = $Len
+    $nl = $Text.IndexOf("`n", $Index)
+    if ($nl -ge 0 -and $nl -lt $Len) { $end = $nl }
+    $segment = Get-MisercKeySegment $Text $Index $end
+    if ($null -eq $segment) { return $null }
+    # Ordinal: `"ENV" = 1` is an unrelated quoted key, not the env array.
+    if ([string]$segment['Text'] -cne 'env') { return $null }
+    $after = [int]$segment['End']
+    $rest = Skip-MisercBlanks $Text $after $end
+    if ($rest -lt $end -and $Text[$rest] -eq '.') { return 'dotted' }
+    # `env` followed by `=` may carry a comment or a newline before it, so this
+    # trivia skip spans lines while the dotted decision above stays on this one.
+    $k = $after
     while ($k -lt $Len -and (Test-MisercSpace $Text[$k])) { $k++ }
     if ($k -lt $Len -and $Text[$k] -eq '=') { return 'quoted' }
     return $null
@@ -1050,21 +1087,38 @@ function Get-MisercKeyKind([string]$Text, [int]$Index, [int]$Len) {
     # A bare key may end the file; that still counts, so the assignment parser
     # can report the missing `=`.
     if ($Index + 3 -ge $Len) { return 'bare' }
+    # TOML allows whitespace around the dots of a dotted key, so it is "dotted"
+    # whether or not a blank sits between `env` and the dot.
+    $dot = Skip-MisercBlanks $Text ($Index + 3) $Len
+    if ($dot -lt $Len -and $Text[$dot] -eq '.') { return 'dotted' }
     $next = $Text[$Index + 3]
-    if ($next -eq '.') { return 'dotted' }
     if ($script:MisercBareKeyEnd -contains $next) { return 'bare' }
   }
   return $null
 }
 
-# One pass over the whole text. Tracks strings and comments so their contents
-# are never read as structure, and records every offset the callers need:
-#   RootEnd     - line start of the first table header (-1 when there is none)
+# One pass over the whole text. Tracks strings, comments, and value-bracket
+# depth so their contents are never read as structure, and records every offset
+# the callers need:
+#   RootEnd     - line start of the first depth-0 table header (-1 when there is none)
 #   BareEnv     - root-region offsets of bare `env` keys, in text order
 #   QuotedEnv   - first root-region `"env"`/`'env'` key, or -1
-#   DottedEnv   - first `env.` key anywhere, or -1
-#   EnvTable    - first `[env]`/`[[env]]` header anywhere, or -1
+#   DottedEnv   - first `env.` key anywhere, or -1 (fail closed: the subset does
+#                 not model table scoping, so a nested one is rejected too)
+#   EnvTable    - first header whose first segment decodes to `env`, or -1
+#   OpenValue   - line start where an array or inline table still open at the end
+#                 of the text began, or -1
 #   Unterminated- a `"""`/`'''` block that never closes
+#
+# A line start only offers a header or a key at depth 0: inside `key = [` ... `]`
+# or `key = {` ... `}` the line is value data, and reading a nested `[` there as
+# a header would cut the root region short and point the writer's insertion
+# inside the array. Brackets inside strings and comments never move the depth
+# because those characters are consumed in their own states.
+#
+# deliberate: Issue-#194 subset only; the depth is one counter over both bracket
+# kinds. It answers "is a value open", not "does this file nest legally", which
+# is the only question the root region and the insertion point ask.
 function Get-MisercLex([string]$Text) {
   $n = $Text.Length
   $i = 0
@@ -1077,6 +1131,8 @@ function Get-MisercLex([string]$Text) {
   $quotedEnv = -1
   $dottedEnv = -1
   $envTable = -1
+  $depth = 0
+  $openValue = -1
   $bareEnv = New-Object 'System.Collections.Generic.List[int]'
 
   while ($i -lt $n) {
@@ -1087,6 +1143,9 @@ function Get-MisercLex([string]$Text) {
       continue
     }
     if ($state -eq 'ml-basic' -or $state -eq 'ml-literal') {
+      # A basic block processes escapes, so a backslash consumes the character
+      # after it and `\"""` carries no closing delimiter; a literal block has no
+      # escapes at all, so there the first `'''` always closes.
       if ($state -eq 'ml-basic' -and $c -eq '\') { $i = $i + 2; $atLineStart = $false; continue }
       $delim = '"""'
       if ($state -eq 'ml-literal') { $delim = "'''" }
@@ -1126,14 +1185,31 @@ function Get-MisercLex([string]$Text) {
     if ($c -eq '#') { $state = 'comment'; $i++; continue }
     if ($atLineStart) {
       $atLineStart = $false
-      if ($c -eq '[') {
-        $name = Get-MisercHeaderName $Text $i
+      # A line that starts inside a value continues that value: its first token
+      # is array/inline-table data, never a header and never a root key.
+      if ($depth -eq 0 -and $c -eq '[') {
         if ($inRoot) { $inRoot = $false; $rootEnd = $lineStart }
-        if ($envTable -lt 0 -and $null -ne $name -and (ConvertTo-MisercHeaderKey $name) -eq 'env') { $envTable = $i }
-      } else {
+        # Bounded by the line end: a header cut short (`[env.` at the end of the
+        # text, or `[env.[`) still names the env table, but must not borrow a
+        # segment from the line below it.
+        if ($envTable -lt 0) {
+          $lineEnd = $n
+          $nl = $Text.IndexOf("`n", $i)
+          if ($nl -ge 0) { $lineEnd = $nl }
+          if (Test-MisercHeaderOwnsEnv $Text $i $lineEnd) { $envTable = $i }
+        }
+        # The header's own `[` opens no value context: consuming it keeps its
+        # matching `]` from being read as a nested closer.
+        $i++
+        continue
+      }
+      if ($depth -eq 0) {
         $kind = Get-MisercKeyKind $Text $i $n
         if ($null -ne $kind) {
           if ($kind -eq 'dotted') {
+            # Any `env.` dotted key is rejected, not only a root one: the subset
+            # does not model table scoping, so `env.foo` under a header is a
+            # shape pmsec cannot reason about and fails closed instead.
             if ($dottedEnv -lt 0) { $dottedEnv = $i }
           } elseif ($inRoot) {
             if ($kind -eq 'quoted') {
@@ -1144,6 +1220,24 @@ function Get-MisercLex([string]$Text) {
           }
         }
       }
+    }
+    if ($c -eq '[' -or $c -eq '{') {
+      # An array or inline table swallows every following line until its
+      # matching closer; remember where the outermost one began so a value still
+      # open at the end of the text can never become the writer's insertion
+      # point.
+      if ($depth -eq 0) { $openValue = $lineStart }
+      $depth++
+      $i++
+      continue
+    }
+    if ($c -eq ']' -or $c -eq '}') {
+      # Floored: a header's closing `]` arrives here without a matching open,
+      # and a stray closer must not unbalance the lines that follow.
+      if ($depth -gt 0) { $depth-- }
+      if ($depth -eq 0) { $openValue = -1 }
+      $i++
+      continue
     }
     if ($c -eq '"') {
       if (Test-MisercAt $Text $i '"""') { $state = 'ml-basic'; $i = $i + 3 } else { $state = 'basic'; $i++ }
@@ -1162,6 +1256,7 @@ function Get-MisercLex([string]$Text) {
     QuotedEnv = $quotedEnv
     DottedEnv = $dottedEnv
     EnvTable = $envTable
+    OpenValue = $openValue
     Unterminated = ($state -eq 'ml-basic' -or $state -eq 'ml-literal')
   }
 }
@@ -1290,6 +1385,7 @@ function Get-MisercAnalysis([string]$Text) {
     RootEnd = [int]$lex['RootEnd']
     EnvTable = [int]$lex['EnvTable']
     DottedEnv = [int]$lex['DottedEnv']
+    OpenValue = [int]$lex['OpenValue']
   }
 }
 

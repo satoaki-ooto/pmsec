@@ -1760,6 +1760,228 @@ T 'miserc write: competing env tables and dotted keys are refused' {
   return $ok
 }
 
+# A line-start `[` inside an open array or inline table is a value, never a
+# table header, and a line-start `env` inside one is that table's key, never the
+# root assignment: neither the root region nor the assignment may reach into a
+# container that has not closed yet.
+T 'miserc read: nested arrays and inline tables stay opaque' {
+  $ok = AssertMisercNames 'nested array before env' (MisercText @('items = [', '  [1, 2],', ']', (MisercArray @((DqName 'work'))))) 'work'
+  $ok = $ok -and (AssertMisercNames 'nested array after env' (MisercText @((MisercArray @((DqName 'work'))), 'items = [', '  [1, 2],', ']')) 'work')
+  $oneLine = 'a = { ' + (MisercArray @((DqName 'fake'))) + ' }'
+  $ok = $ok -and (AssertMisercNames 'inline table on one line' (MisercText @($oneLine, (MisercArray @((DqName 'real'))))) 'real')
+  $ok = $ok -and (AssertMisercNames 'inline table across lines' (MisercText @('x = {', ('  ' + (MisercArray @((DqName 'fake'))) + ','), '}', (MisercArray @((DqName 'real'))))) 'real')
+  # Brackets and env-like text inside the strings of a nested array are opaque.
+  $strings = MisercText @(
+    ('a = ' + (DqName '[env]')),
+    'b = [',
+    ('  ' + (DqName '[env]') + ','),
+    ('  ' + (DqName ('env = [' + (DqName 'fake') + ']')) + ','),
+    ']',
+    (MisercArray @((DqName 'real')))
+  )
+  $ok = $ok -and (AssertMisercNames 'brackets inside strings' $strings 'real')
+  # A header-shaped line inside an array must not end the root region either:
+  # the `[b]` below is the first real header, so `env` belongs to that table.
+  $headerInArray = MisercText @('a = [', ('  ' + (DqName '[env]') + ','), ']', '[b]', 'x = 1', (MisercArray @((DqName 'scoped'))))
+  $ok = $ok -and (AssertMisercUndefined 'header-shaped array element' $headerInArray)
+  # `[[items]]` is a real header: it ends the root region like `[items]`, so an
+  # `env` key under it is scoped to that table.
+  $ok = $ok -and (AssertMisercUndefined 'array-of-tables header ends the root region' (MisercText @('[[items]]', 'x = 1', (MisercArray @((DqName 'scoped'))))))
+  return ($ok -and (AssertMisercNames 'env before an array-of-tables header' (MisercText @((MisercArray @((DqName 'work'))), '[[items]]', 'x = 1')) 'work'))
+}
+
+# The writer may neither replace bytes inside a value nor insert its new key
+# into one: the nested `[1, 2]` line used to be read as a header, which both cut
+# the root region short and pointed the insertion at the wrong line.
+T 'miserc write: nested values move neither the replaced range nor the insertion point' {
+  $nested = MisercText @('items = [', '  [1, 2],', ']', (MisercArray @((DqName 'work'))))
+  $ok = AssertMisercWrite 'nested array before the assignment' $nested @('work') (MisercText @('items = [', '  [1, 2],', ']', (MisercArray @((DqName 'work'), (DqName 'pmsec')))))
+  $ok = $ok -and (AssertMisercWrite 'insertion stays after the closed array' (MisercText @('items = [', '  [1, 2],', ']')) @('work') (MisercText @('items = [', '  [1, 2],', ']', (MisercArray @((DqName 'work'), (DqName 'pmsec'))))))
+  $ok = $ok -and (AssertMisercWrite 'the header after an array is the insertion point' (MisercText @('items = [', '  [1],', ']', '[tool]', 'x = 1')) @() (MisercText @('items = [', '  [1],', ']', (MisercArray @((DqName 'pmsec'))), '[tool]', 'x = 1')))
+  $ok = $ok -and (AssertMisercWrite 'a closed inline table does not move the insertion point' (MisercText @('x = { a = 1 }', '[t]', 'x = 1')) @() (MisercText @('x = { a = 1 }', (MisercArray @((DqName 'pmsec'))), '[t]', 'x = 1')))
+  $tableFake = MisercText @('x = {', ('  ' + (MisercArray @((DqName 'fake'))) + ','), '}', (MisercArray @((DqName 'real'))))
+  $tableExpected = MisercText @('x = {', ('  ' + (MisercArray @((DqName 'fake'))) + ','), '}', (MisercArray @((DqName 'real'), (DqName 'pmsec'))))
+  return ($ok -and (AssertMisercWrite 'a multiline inline table keeps its own keys' $tableFake @('real') $tableExpected))
+}
+
+# A file that ends inside an array or inline table has no usable end-of-text
+# boundary: the insertion point is the line that opened the outermost open
+# value, so the new assignment lands ABOVE the broken value instead of becoming
+# one more element of it. A header still wins, and a value that closes normally
+# leaves the boundary at the end of the text.
+T 'miserc write: a value still open at the end of the text pins the insertion point' {
+  $ok = AssertMisercWrite 'unclosed array after a key' (MisercText @('name = "x"', 'items = [', '  1,')) @() (MisercText @('name = "x"', (MisercArray @((DqName 'pmsec'))), 'items = [', '  1,'))
+  $ok = $ok -and (AssertMisercWrite 'unclosed array on the first line' (MisercText @('items = [', '  1,')) @() (MisercText @((MisercArray @((DqName 'pmsec'))), 'items = [', '  1,')))
+  $ok = $ok -and (AssertMisercWrite 'unclosed inline table after a key' (MisercText @('name = "x"', 'x = {')) @() (MisercText @('name = "x"', (MisercArray @((DqName 'pmsec'))), 'x = {')))
+  $ok = $ok -and (AssertMisercWrite 'only the outermost opener counts' (MisercText @('name = "x"', 'items = [', '  [1,')) @() (MisercText @('name = "x"', (MisercArray @((DqName 'pmsec'))), 'items = [', '  [1,')))
+  $ok = $ok -and (AssertMisercWrite 'a closed value does not move the boundary' (MisercText @('a = [1]', 'name = "x"', 'items = [')) @() (MisercText @('a = [1]', 'name = "x"', (MisercArray @((DqName 'pmsec'))), 'items = [')))
+  $ok = $ok -and (AssertMisercWrite 'the first header wins over a later open value' (MisercText @('[tool]', 'x = [')) @() (MisercText @((MisercArray @((DqName 'pmsec'))), '[tool]', 'x = [')))
+  $ok = $ok -and (AssertMisercWrite 'a closed array still inserts at the end' (MisercText @('items = [', '  1,', ']')) @() (MisercText @('items = [', '  1,', ']', (MisercArray @((DqName 'pmsec'))))))
+  $ok = $ok -and (AssertMisercWrite 'a closed array still inserts before the header' (MisercText @('items = [', '  1,', ']', '[tool]', 'x = 1')) @() (MisercText @('items = [', '  1,', ']', (MisercArray @((DqName 'pmsec'))), '[tool]', 'x = 1')))
+  return ($ok -and (AssertMisercWrite 'an existing assignment is still replaced' (MisercText @('env = []', 'items = [')) @() (MisercText @((MisercArray @((DqName 'pmsec'))), 'items = ['))))
+}
+
+# Every header spelling whose first decoded segment is `env` names the key the
+# array owns, however it is quoted and however deep the table goes.
+T 'miserc write: every header whose first segment decodes to env conflicts' {
+  $headers = @(
+    '[env]', '[env.foo]', '[ env ]', '["env"]', "['env']", '[ "env" ]', '["env".x]',
+    '[ "env" . "x" ]', '[env."foo"]', '[[env]]', '[[env.foo]]', '  [env]'
+  )
+  $ok = $true
+  for ($i = 0; $i -lt $headers.Count; $i++) {
+    $ok = $ok -and (AssertMisercWriteReject ('header #' + $i) (MisercText @($headers[$i], 'a = 1')) @() 'env table conflicts with the env array')
+  }
+  return $ok
+}
+
+# Termination is irrelevant: every port decides on the first decoded segment
+# plus the byte after it, so a file truncated inside `[env...` must not get an
+# env array inserted beside the broken table.
+T 'miserc write: a header cut short still conflicts once its segment is env' {
+  $cases = @(
+    '[env.',
+    (MisercText @('[env.', 'a = 1')),
+    '[env.[',
+    '[env. # c',
+    '[ env.',
+    '[[env.',
+    '[[ env.',
+    '[[env.]',
+    '[[env]'
+  )
+  $ok = $true
+  for ($i = 0; $i -lt $cases.Count; $i++) {
+    $ok = $ok -and (AssertMisercWriteReject ('cut-short header #' + $i) $cases[$i] @() 'env table conflicts with the env array')
+    $ok = $ok -and (AssertMisercUndefined ('cut-short header #' + $i + ' read') $cases[$i])
+  }
+  return $ok
+}
+
+# `[env` / `["env"` / `[[env` stop before the byte that would name a table key,
+# so the array is inserted beside them exactly like the other ports; a name that
+# merely starts with the letters (or hides them in a later segment) stays a
+# different table.
+T 'miserc write: unrelated and unterminated headers are not conflicts' {
+  $cases = @('[env', ('[env' + $script:NL), '[[env', '["env"', '[ "env"', '[x.env]', '[envsub]', '[tool.env]', '[envs]', "['x.env']", '["env.foo"]')
+  $ok = $true
+  for ($i = 0; $i -lt $cases.Count; $i++) {
+    $text = $cases[$i]
+    if (-not $text.EndsWith($script:NL)) { $text = $text + $script:NL }
+    $expected = (MisercArray @((DqName 'pmsec'))) + $script:NL + $text
+    $ok = $ok -and (AssertMisercWrite ('unrelated header #' + $i) $text @() $expected)
+  }
+  return $ok
+}
+
+# A dotted root key is the same table written inline, in every spelling; a
+# quoted first segment counts once its quotes are stripped, and whitespace
+# around the dots is allowed.
+T 'miserc write: every dotted env key conflicts, spaced or quoted included' {
+  $keys = @(
+    'env.foo = 1', 'env . foo = 1', ("`tenv`t.`tfoo = 1"), 'env."foo" = 1', 'env . "foo" = 1',
+    '"env".foo = 1', "'env' . foo = 1", '"env" . "foo" = 1'
+  )
+  $ok = $true
+  for ($i = 0; $i -lt $keys.Count; $i++) {
+    $text = $keys[$i] + $script:NL
+    $ok = $ok -and (AssertMisercWriteReject ('dotted key #' + $i) $text @() 'env table conflicts with the env array')
+    # The reader classifies the same line the writer rejects: a table defines no
+    # array, so it is "not defined" rather than an error.
+    $ok = $ok -and (AssertMisercUndefined ('dotted key #' + $i + ' read') $text)
+  }
+  return $ok
+}
+
+# The reader classifies the same lines the writer rejects: a table or a dotted
+# key defines no array, so it is "not defined" rather than an error or a
+# malformed `env` key.
+T 'miserc read: dotted keys and env tables are not the env array' {
+  $ok = AssertMisercUndefined 'bare dotted key' ('env.foo = 1' + $script:NL)
+  $ok = $ok -and (AssertMisercUndefined 'spaced dotted key' ('env . foo = 1' + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'tabbed dotted key' ("`tenv`t.`tfoo = 1" + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'quoted dotted key' ('"env".foo = 1' + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'literal quoted dotted key' ("'env' . foo = 1" + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'dotted table' ('[env.foo]' + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'quoted table' ('["env".x]' + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'env suffix key' ('x.env = 1' + $script:NL))
+  return ($ok -and (AssertMisercUndefined 'env prefix key' ('envsub = 1' + $script:NL)))
+}
+
+# PowerShell's `-eq` and `-contains` are case-insensitive, so every decoded
+# key/header comparison here is ordinal: `"ENV" = 1` is an unrelated quoted key
+# (not the rejected `"env"` spelling), and `[ENV]` is a different table.
+T 'miserc read and write: env matching is case-sensitive' {
+  $ok = AssertMisercUndefined 'quoted uppercase key' ('"ENV" = ["a"]' + $script:NL)
+  $ok = $ok -and (AssertMisercUndefined 'mixed-case key' ('Env = ["a"]' + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'uppercase dotted key' ('ENV.foo = 1' + $script:NL))
+  $ok = $ok -and (AssertMisercUndefined 'uppercase header' ('[ENV]' + $script:NL))
+  $pmsecLine = (MisercArray @((DqName 'pmsec'))) + $script:NL
+  $ok = $ok -and (AssertMisercWrite 'quoted uppercase key stays unrelated' ('"ENV" = ["a"]' + $script:NL) @() ('"ENV" = ["a"]' + $script:NL + $pmsecLine))
+  $ok = $ok -and (AssertMisercWrite 'mixed-case key stays unrelated' ('Env = ["a"]' + $script:NL) @() ('Env = ["a"]' + $script:NL + $pmsecLine))
+  $ok = $ok -and (AssertMisercWrite 'uppercase header stays unrelated' ('[ENV]' + $script:NL) @() ($pmsecLine + '[ENV]' + $script:NL))
+  $ok = $ok -and (AssertMisercWrite 'mixed-case header stays unrelated' ('[Env]' + $script:NL) @() ($pmsecLine + '[Env]' + $script:NL))
+  # The exact lowercase spellings keep their frozen reasons.
+  $ok = $ok -and (AssertMisercRejects @(
+    @{ N = 'quoted lowercase key'; T = ((DqName 'env') + ' = ["a"]' + $script:NL); R = 'quoted env key is unsupported' }
+  ))
+  return ($ok -and (AssertMisercWriteReject 'lowercase env table' ('[env]' + $script:NL) @() 'env table conflicts with the env array'))
+}
+
+# A basic (`"""`) block processes escapes, so an escaped triple quote is content
+# and the block keeps going; a literal (`'''`) block has no escape semantics, so
+# there the first closer always wins. A file whose only closer is the escaped
+# one therefore never closed.
+T 'miserc read: escaped triple quotes in a multiline string' {
+  $triple = $script:DQ + $script:DQ + $script:DQ
+  $literalTriple = $script:SQ + $script:SQ + $script:SQ
+  $basic = MisercText @(
+    ('note = ' + $triple),
+    ('\' + $triple),
+    (MisercArray @((DqName 'fake'))),
+    $triple,
+    (MisercArray @((DqName 'real')))
+  )
+  $ok = AssertMisercNames 'escaped closer stays content' $basic 'real'
+  $basicExpected = MisercText @(
+    ('note = ' + $triple),
+    ('\' + $triple),
+    (MisercArray @((DqName 'fake'))),
+    $triple,
+    (MisercArray @((DqName 'real'), (DqName 'pmsec')))
+  )
+  $ok = $ok -and (AssertMisercWrite 'the block itself is untouched' $basic @('real') $basicExpected)
+  $ok = $ok -and (AssertMisercNames 'escaped backslash then a real closer' (MisercText @(('note = ' + $triple), ('\\' + $triple), (MisercArray @((DqName 'real'))))) 'real')
+  $ok = $ok -and (AssertMisercNames 'literal block closes on the first closer' (MisercText @(('note = ' + $literalTriple), ('\' + $literalTriple), (MisercArray @((DqName 'real'))))) 'real')
+  return ($ok -and (AssertMisercRejects @(
+    @{ N = 'an escaped closer never closes the file'; T = (MisercText @(('doc = ' + $triple), ('\' + $triple))); R = 'unterminated string in file' }
+  )))
+}
+
+# Strict TOML rejects `env # c<LF>= [...]`, but mise cannot read such a file
+# either, so accepting it can never activate a value mise disagrees with; the
+# three sibling ports accept it too, and the replaced range covers the trivia.
+T 'miserc read and write: comments and newlines between the env key and = are accepted' {
+  $comment = 'env # c' + $script:NL + '= ["work"]' + $script:NL
+  $newline = 'env' + $script:NL + '= ["work"]' + $script:NL
+  $expected = (MisercArray @((DqName 'work'), (DqName 'pmsec'))) + $script:NL
+  $ok = AssertMisercNames 'comment trivia' $comment 'work'
+  $ok = $ok -and (AssertMisercWrite 'comment trivia' $comment @('work') $expected)
+  $ok = $ok -and (AssertMisercNames 'newline trivia' $newline 'work')
+  return ($ok -and (AssertMisercWrite 'newline trivia' $newline @('work') $expected))
+}
+
+# The empty sentinel after a bare `env` is end-of-key, never evidence of an
+# unrelated token: a file that stops there is a cut assignment, not "no env".
+T 'miserc read: a bare env at the end of the text fails closed' {
+  $ok = AssertMisercRejects @(
+    @{ N = 'bare env'; T = 'env'; R = 'malformed env assignment' },
+    @{ N = 'bare env plus blanks'; T = 'env   '; R = 'malformed env assignment' },
+    @{ N = 'bare env after a comment'; T = ('# note' + $script:NL + 'env'); R = 'malformed env assignment' }
+  )
+  return ($ok -and (AssertMisercWriteReject 'bare env write' 'env' @() 'malformed env assignment'))
+}
+
 T 'miserc write: writing the same inherited list twice is byte-identical' {
   $text = MisercText @('env = [', '  ' + (DqName 'a'), ']', '[tools]', 'x = 1')
   $first = WriteMiserc $text @('a','b')
@@ -2332,6 +2554,35 @@ T 'miserc local writer: a local env = [] becomes [pmsec]' {
     $ok = AssertWriteOk 'empty local array' $facts $layout['Local']
     $ok = $ok -and (AssertSelectorFile 'only pmsec remains' (MisercText @('env = ["pmsec"]')) $layout['Local'])
     return ($ok -and (AssertSelectorFile 'shared unchanged' $sharedText $layout['Shared']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+# The selector and the writer share the scanner, so a nested array in a real
+# file must not hide the effective list nor send the rewrite inside the array.
+T 'miserc selector and local writer: a nested array never hides the env list' {
+  $layout = NewSelectorHome
+  try {
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    WriteSelectorFile $layout['Local'] (MisercText @('items = [', '  [1, 2],', ']', 'env = ["work"]'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'array before the assignment' $facts $layout['Local'] 'work' 'False'
+    if (-not $ok) { return $false }
+    $written = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'array before the assignment: write' $written $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'the array is untouched and the assignment extended' (MisercText @('items = [', '  [1, 2],', ']', 'env = ["work", "pmsec"]')) $layout['Local'])
+    if (-not $ok) { return $false }
+
+    # The same file with the assignment first: the array follows the replaced
+    # range, so every byte of it must survive the rewrite.
+    WriteSelectorFile $layout['Local'] (MisercText @('env = ["work"]', 'items = [', '  [1, 2],', ']'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'array after the assignment' $facts $layout['Local'] 'work' 'False'
+    if (-not $ok) { return $false }
+    $written = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'array after the assignment: write' $written $layout['Local']
+    return ($ok -and (AssertSelectorFile 'the array after the assignment is untouched' (MisercText @('env = ["work", "pmsec"]', 'items = [', '  [1, 2],', ']')) $layout['Local']))
   } finally {
     RemoveSelectorHome $layout
   }
