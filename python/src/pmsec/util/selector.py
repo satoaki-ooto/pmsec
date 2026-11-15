@@ -102,7 +102,11 @@ def write_local_selector(
         [] if definition is None else definition[1],
         local,
     )
-    write_atomic(Path(local), text)
+    # `raw=True`: `text` still carries the line endings `_read_text` did not
+    # translate, so the text-mode default would translate every LF into
+    # os.linesep a second time — CRCRLF on Windows. The raw path writes the
+    # buffer byte for byte; no other caller of `write_atomic` asks for it.
+    write_atomic(Path(local), text, raw=True)
     return local
 
 

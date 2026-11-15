@@ -145,6 +145,88 @@ def test_no_final_newline_is_fine():
     assert read_env('env = ["a"]') == ["a"]
 
 
+# --- read: values that nest another `[` ------------------------------------
+
+
+def test_a_nested_array_does_not_hide_the_env_assignment_after_it():
+    # A `[` at the start of a line inside an open array nests a value; it is not
+    # a table header, so the root region and the env key in it both continue.
+    text = 'items = [\n  [1, 2],\n]\nenv = ["work"]\n'
+    assert read_env(text) == ["work"]
+    assert write_pmsec_env(text, ["work"]) == 'items = [\n  [1, 2],\n]\nenv = ["work", "pmsec"]\n'
+
+
+def test_a_nested_array_after_the_assignment_does_not_move_the_rewrite():
+    text = 'env = ["work"]\nitems = [\n  [1, 2],\n]\n'
+    assert read_env(text) == ["work"]
+    assert write_pmsec_env(text, ["work"]) == 'env = ["work", "pmsec"]\nitems = [\n  [1, 2],\n]\n'
+
+
+def test_key_like_lines_inside_a_multiline_inline_table_are_values():
+    # `env = ...` inside an inline table is that table's key, not the root array.
+    assert read_env('x = {\n  env = ["fake"],\n}\nenv = ["real"]\n') == ["real"]
+
+
+def test_an_unclosed_array_at_end_of_file_never_swallows_the_insertion():
+    # The writer must not append inside a value that is still open: the root
+    # region ends where the array began, so the new line lands above it.
+    text = 'name = "x"\nitems = [\n  1,\n'
+    assert read_env(text) is None
+    assert write_pmsec_env(text, []) == 'name = "x"\nenv = ["pmsec"]\nitems = [\n  1,\n'
+
+
+def test_a_closed_inline_table_returns_the_scan_to_depth_zero():
+    # The depth that `{` opened has to come back down, or the header below would
+    # stop being a header and the array would be inserted into the root anyway.
+    with pytest.raises(MiseEnvError) as excinfo:
+        write_pmsec_env('x = {a = 1}\n[env]\nFOO = "1"\n', [])
+    assert excinfo.value.reason == ENV_TABLE
+
+
+# --- read: dotted keys under a table named env ------------------------------
+
+
+def test_dotted_env_keys_are_not_the_env_array_however_they_are_spelled():
+    # The writer reports these as an env-table conflict; the reader classifies
+    # them the same way instead of calling `env . foo` a malformed `env` key.
+    assert read_env("env.foo = 1\n") is None
+    assert read_env("env . foo = 1\n") is None
+    assert read_env("\tenv\t.\tfoo = 1\n") is None
+    assert read_env('"env".foo = 1\n') is None
+    assert read_env("'env' . foo = 1\n") is None
+    # `x.env` / `envsub` are keys whose name merely contains `env`.
+    assert read_env("x.env = 1\n") is None
+    assert read_env("envsub = 1\n") is None
+
+
+# --- read: escaped triple quotes in a multiline string ---------------------
+
+
+def test_an_escaped_triple_quote_does_not_close_a_basic_multiline_string():
+    # `\"""` in a basic block is an escaped quote plus two content quotes, so the
+    # env line inside the block stays inside it and the block's real closer ends
+    # it: the assignment below is the only one the reader may see.
+    text = 'note = """\n\\"""\nenv = ["fake"]\n"""\nenv = ["real"]\n'
+    assert read_env(text) == ["real"]
+    assert write_pmsec_env(text, ["real"]) == (
+        'note = """\n\\"""\nenv = ["fake"]\n"""\nenv = ["real", "pmsec"]\n'
+    )
+
+
+def test_a_literal_multiline_string_has_no_escape_to_skip():
+    # Literal strings do not process backslashes: the `'''` right after the
+    # backslash still closes the block, so the env line below is code again.
+    assert read_env("note = '''\n\\'''\nenv = [\"real\"]\n") == ["real"]
+
+
+def test_an_escape_cannot_hide_an_unterminated_basic_multiline_string():
+    # The same shape in a basic block never closes, so the file is reported as
+    # unterminated instead of its env-like line being read as an assignment.
+    with pytest.raises(MiseEnvError) as excinfo:
+        read_env('note = """\n\\"""\nenv = ["fake"]\n')
+    assert excinfo.value.reason == UNTERMINATED_FILE_STRING
+
+
 # --- read: rejected shapes -------------------------------------------------
 
 REJECTS = [
@@ -273,6 +355,17 @@ def test_write_inserts_before_the_first_table_header():
     assert write_pmsec_env('[tools]\nnode = "22"\n', []) == 'env = ["pmsec"]\n[tools]\nnode = "22"\n'
 
 
+def test_write_inserts_after_a_root_array_that_holds_a_nested_one():
+    # The nested `[` must not be taken for the first header: the insertion point
+    # is after the whole root array, not in front of its last element.
+    assert write_pmsec_env('items = [\n  ["a"],\n]\n', []) == (
+        'items = [\n  ["a"],\n]\nenv = ["pmsec"]\n'
+    )
+    assert write_pmsec_env('items = [\n  ["a"],\n]\n[tools]\nnode = "22"\n', []) == (
+        'items = [\n  ["a"],\n]\nenv = ["pmsec"]\n[tools]\nnode = "22"\n'
+    )
+
+
 def test_write_appends_a_newline_when_the_input_lacks_one():
     assert write_pmsec_env('name = "x"', []) == 'name = "x"\nenv = ["pmsec"]\n'
     assert write_pmsec_env('name = "x"', ["work"]) == 'name = "x"\nenv = ["work", "pmsec"]\n'
@@ -309,7 +402,22 @@ def test_write_uses_single_quotes_when_the_value_contains_a_backslash():
     assert write_pmsec_env("", ["a\\b"]) == "env = ['a\\b', \"pmsec\"]\n"
 
 
-@pytest.mark.parametrize("name", ['a"\'b', "a\nb", "a\x01b", "a\x7fb", "\t"])
+def test_write_keeps_a_lone_apostrophe_in_the_double_quoted_form():
+    # Only `"` and `\` need the literal form, and that form cannot carry its own
+    # `'`; a name with just an apostrophe has an escape-free double-quoted form.
+    assert write_pmsec_env("", ["a'b"]) == "env = [\"a'b\", \"pmsec\"]\n"
+
+
+def test_write_output_round_trips_through_a_real_toml_parser():
+    # The reason this rule exists: a `'` next to a `\` used to be emitted inside
+    # single quotes, which no TOML parser can read back. Everything writable must
+    # load to exactly the names that were asked for.
+    tomllib = pytest.importorskip("tomllib")
+    for name in ["a'b", 'a"b', "a\\b", "plain", "ノード"]:
+        assert tomllib.loads(write_pmsec_env("", [name])) == {"env": [name, "pmsec"]}
+
+
+@pytest.mark.parametrize("name", ['a"\'b', "a'b\\c", "a'\\b", "a\nb", "a\x01b", "a\x7fb", "\t"])
 def test_write_fails_closed_on_names_that_need_escapes(name: str):
     with pytest.raises(MiseEnvError) as excinfo:
         write_pmsec_env("", [name])
@@ -319,8 +427,24 @@ def test_write_fails_closed_on_names_that_need_escapes(name: str):
 
 # --- write: collisions -----------------------------------------------------
 
+# Every spelling a TOML table named `env` can be opened with: the writer judges
+# the decoded first key segment, so quoting and the spaces around dots cannot
+# hide a collision. `[x.env]`/`[envsub]` are the non-conflicting controls below.
+ENV_TABLE_HEADERS = [
+    '[env]\nFOO = "1"\n',
+    '[[env]]\nFOO = "1"\n',
+    "[ env ]\n",
+    '[ "env" ]\nFOO = "1"\n',
+    '["env"]\nFOO = "1"\n',
+    "['env']\nFOO = \"1\"\n",
+    "[env.foo]\n",
+    '[env."foo"]\n',
+    '["env".x]\n',
+    '[ "env" . x ]\n',
+]
 
-@pytest.mark.parametrize("text", ["[env]\nFOO = \"1\"\n", '[[env]]\nFOO = "1"\n', '["env"]\nFOO = "1"\n'])
+
+@pytest.mark.parametrize("text", ENV_TABLE_HEADERS)
 def test_write_rejects_an_env_table(text: str):
     with pytest.raises(MiseEnvError) as excinfo:
         write_pmsec_env(text, [])
@@ -333,18 +457,45 @@ def test_write_rejects_an_env_table_next_to_an_existing_array():
     assert excinfo.value.reason == ENV_TABLE
 
 
-@pytest.mark.parametrize("text", ["env.foo = 1\n", "env . foo = 1\n", "x = 1\n[tools]\nenv.foo = 1\n"])
+ENV_TABLE_DOTTED = [
+    "env.foo = 1\n",
+    "env . foo = 1\n",
+    'env."foo" = 1\n',
+    '"env".foo = 1\n',
+    "'env'.foo = 1\n",
+    '"env" . foo = 1\n',
+    "x = 1\n[tools]\nenv.foo = 1\n",
+]
+
+
+@pytest.mark.parametrize("text", ENV_TABLE_DOTTED)
 def test_write_rejects_env_dotted_keys(text: str):
     with pytest.raises(MiseEnvError) as excinfo:
         write_pmsec_env(text, [])
     assert excinfo.value.reason == ENV_TABLE
 
 
-def test_write_allows_tables_that_merely_start_with_env():
-    # `[environment]` is a different table: it must neither error nor move.
-    assert (
-        write_pmsec_env('x = 1\n[environment]\nFOO = "1"\n', [])
-        == 'x = 1\nenv = ["pmsec"]\n[environment]\nFOO = "1"\n'
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ('[environment]\nFOO = "1"\n', 'env = ["pmsec"]\n[environment]\nFOO = "1"\n'),
+        ("[envsub]\n", 'env = ["pmsec"]\n[envsub]\n'),
+        ("[x.env]\n", 'env = ["pmsec"]\n[x.env]\n'),
+        ("x.env = 1\n", 'x.env = 1\nenv = ["pmsec"]\n'),
+        ("envsub = 1\n", 'envsub = 1\nenv = ["pmsec"]\n'),
+    ],
+)
+def test_write_allows_keys_that_merely_contain_env(text: str, expected: str):
+    # Only the first decoded segment decides: `environment`, `envsub` and `x`
+    # (with an env key under it) are unrelated tables and must not move.
+    assert write_pmsec_env(text, []) == expected
+
+
+def test_a_header_shaped_value_inside_an_array_is_not_a_table():
+    # At array depth one a `[` nests a value instead of opening a table, so this
+    # file has no env table to conflict with and its root region runs to the end.
+    assert write_pmsec_env("items = [\n  [env],\n]\n", []) == (
+        'items = [\n  [env],\n]\nenv = ["pmsec"]\n'
     )
 
 
@@ -385,3 +536,13 @@ def test_write_labels_the_error_with_its_source():
         write_pmsec_env("[env]\n", [], "miserc.local.toml")
     assert excinfo.value.path == "miserc.local.toml"
     assert str(excinfo.value) == f"invalid env in miserc.local.toml: {ENV_TABLE}"
+
+
+@pytest.mark.parametrize("text", ["env", "env\n", "x = 1\nenv\n", "\nenv"])
+def test_write_rejects_a_bare_env_key_with_no_assignment(text: str):
+    # `env` at end of file is the key without its `=`, not a file without the
+    # assignment: it must fail closed instead of an insert being appended over it.
+    with pytest.raises(MiseEnvError) as excinfo:
+        write_pmsec_env(text, [])
+    assert excinfo.value.reason == MALFORMED
+    assert str(excinfo.value) == f"invalid env in <memory>: {MALFORMED}"

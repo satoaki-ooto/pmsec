@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from pmsec.util.io import write_atomic  # noqa: E402
 from pmsec.util.miseconf import MiseEnvError  # noqa: E402
 from pmsec.util.selector import Selector, read_selector, write_local_selector  # noqa: E402
 
@@ -22,6 +23,7 @@ WIN_HOME = Path("C:\\Users\\user")
 
 CANNOT_READ = "cannot read file"
 NOT_ARRAY = "env must be an array"
+MALFORMED = "malformed env assignment"
 ENV_TABLE = "env table conflicts with the env array"
 
 # chmod 000 only blocks a read for a non-root POSIX user. Same guard the
@@ -157,6 +159,14 @@ def test_local_empty_array_is_a_definition_that_stops_inheritance(tmp_path):
     _write(local, "env = []\n")
     _write(shared, 'env = ["work", "pmsec"]\n')
     assert read_selector(env, tmp_path, "linux") == Selector(str(local), [], False)
+
+
+def test_a_nested_array_before_env_does_not_hide_the_definition(tmp_path):
+    # A line-start `[` inside the open array nests a value and must not end the
+    # root region, or the env below it would read as not defined.
+    _, shared, _, env = _paths(tmp_path)
+    _write(shared, 'items = [\n  [1, 2],\n]\nenv = ["work"]\n')
+    assert read_selector(env, tmp_path, "linux") == Selector(str(shared), ["work"], False)
 
 
 def test_a_file_without_an_env_assignment_does_not_define(tmp_path):
@@ -320,6 +330,47 @@ def test_local_empty_array_is_replaced_with_pmsec(tmp_path):
     assert shared.read_bytes() == b'env = ["work"]\n'
 
 
+def test_a_nested_array_in_the_local_file_survives_the_rewrite(tmp_path):
+    local, _, _, env = _paths(tmp_path)
+    _write(local, 'items = [\n  [1, 2],\n]\nenv = ["work"]\n')
+    write_local_selector(env, tmp_path, "linux")
+    assert local.read_bytes() == b'items = [\n  [1, 2],\n]\nenv = ["work", "pmsec"]\n'
+
+
+def test_a_nested_array_does_not_take_the_insertion_point(tmp_path):
+    # With no local assignment the line goes at the end of the root region, never
+    # between the elements of an array that is open there.
+    local, shared, _, env = _paths(tmp_path)
+    _write(local, 'items = [\n  [1, 2],\n]\n')
+    _write(shared, 'env = ["work"]\n')
+    write_local_selector(env, tmp_path, "linux")
+    assert local.read_bytes() == b'items = [\n  [1, 2],\n]\nenv = ["work", "pmsec"]\n'
+
+
+def test_rewrite_preserves_mixed_crlf_and_lf_bytes(tmp_path):
+    # `_read_text` keeps every line ending as read, so the planned text holds
+    # both CRLF and LF; the raw output path must write them back untouched. A
+    # universal-newline round trip would turn the lone LF line into CRLF here.
+    local, _, _, env = _paths(tmp_path)
+    original = 'name = "x"\r\nenv = ["work"]\r\nlast = 1\n'
+    _write(local, original)
+    write_local_selector(env, tmp_path, "linux")
+    assert local.read_bytes() == b'name = "x"\r\nenv = ["work", "pmsec"]\r\nlast = 1\n'
+
+
+def test_the_raw_atomic_path_writes_the_buffer_byte_for_byte(tmp_path):
+    # Windows text mode turns every LF in the buffer into CRLF again, which is
+    # why the selector writer asks for the raw stream. This pins the bytes that
+    # stream produces, and that the legacy default call still writes a
+    # normalised buffer unchanged (the path every other caller keeps).
+    raw = tmp_path / "raw" / "miserc.local.toml"
+    write_atomic(raw, 'env = ["a"]\r\nx = 1\n', raw=True)
+    assert raw.read_bytes() == b'env = ["a"]\r\nx = 1\n'
+    legacy = tmp_path / "legacy" / "miserc.local.toml"
+    write_atomic(legacy, 'env = ["a"]\n')
+    assert legacy.read_bytes() == b'env = ["a"]\n'
+
+
 def test_rerunning_is_byte_idempotent_and_keeps_the_existing_backup(tmp_path):
     local, _, _, env = _paths(tmp_path)
     _write(local, 'env = ["work", "pmsec"]\n')
@@ -382,6 +433,54 @@ def test_env_table_in_the_target_fails_before_writing(tmp_path):
     assert local.read_bytes() == original.encode("utf-8")
     assert not _bak(local).exists()
     assert _temps(local) == []
+
+
+@pytest.mark.parametrize(
+    "original", ['["env"]\nFOO = "1"\n', "[env.foo]\n", "env . foo = 1\n", '"env".foo = 1\n']
+)
+def test_every_spelling_of_an_env_table_fails_before_writing(tmp_path, original: str):
+    local, _, _, env = _paths(tmp_path)
+    _write(local, original)
+
+    with pytest.raises(MiseEnvError) as excinfo:
+        write_local_selector(env, tmp_path, "linux")
+
+    assert excinfo.value.reason == ENV_TABLE
+    assert excinfo.value.path == str(local)
+    assert local.read_bytes() == original.encode("utf-8")
+    assert not _bak(local).exists()
+    assert _temps(local) == []
+
+
+@pytest.mark.parametrize("reader", [read_selector, write_local_selector])
+def test_a_bare_env_key_with_no_assignment_fails_closed(tmp_path, reader):
+    # `env` at end of file is a malformed assignment, not a file without one:
+    # neither reading nor wiring may treat it as absent.
+    local, _, _, env = _paths(tmp_path)
+    _write(local, "env\n")
+
+    with pytest.raises(MiseEnvError) as excinfo:
+        reader(env, tmp_path, "linux")
+
+    assert excinfo.value.reason == MALFORMED
+    assert excinfo.value.path == str(local)
+    assert local.read_bytes() == b"env\n"
+
+
+@pytest.mark.parametrize("reader", [read_selector, write_local_selector])
+def test_undecodable_bytes_fail_closed_as_cannot_read(tmp_path, reader):
+    local, _, _, env = _paths(tmp_path)
+    local.parent.mkdir(parents=True)
+    original = b'env = ["work"]\n\xff\xfe\n'
+    local.write_bytes(original)
+
+    with pytest.raises(MiseEnvError) as excinfo:
+        reader(env, tmp_path, "linux")
+
+    assert excinfo.value.reason == CANNOT_READ
+    assert excinfo.value.path == str(local)
+    assert excinfo.value.code == "INVALID_MISE_ENV"
+    assert local.read_bytes() == original
 
 
 @NO_PERMISSION_SEMANTICS
