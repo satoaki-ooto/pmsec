@@ -423,6 +423,43 @@ test("write: every header whose first segment decodes to env conflicts", () => {
   }
 });
 
+test("write: a header cut short still conflicts once its segment is env", () => {
+  // Termination is irrelevant: every port decides on the first decoded segment
+  // plus the byte after it, so a file truncated inside `[env...` must not get an
+  // env array inserted beside the broken table.
+  for (const text of [
+    "[env.", // EOF right after the dot
+    "[env.\na = 1\n", // the next line must not be read as part of the key
+    "[env.[", // a nested opener that never closes
+    "[env. # c",
+    "[ env.",
+    "[[env.",
+    "[[ env.",
+    "[[env.]",
+    "[[env]",
+  ]) {
+    assert.equal(
+      reasonOf(() => writePmsecEnv(text, [])),
+      "env table conflicts with the env array",
+      JSON.stringify(text),
+    );
+    // The reader classifies it the same way, but a table still defines no
+    // array, so it reports "not defined" rather than an error.
+    assert.equal(readEnv(text), null, JSON.stringify(text));
+  }
+});
+
+test("write: a bare [env with nothing after the segment does not conflict", () => {
+  // The shared rule needs a `.` or `]` after the segment to name a table key; a
+  // header truncated before either is unreadable to mise anyway, so python and
+  // bash insert beside it rather than calling it a conflict.
+  assert.equal(writePmsecEnv("[env", []), 'env = ["pmsec"]\n[env');
+  assert.equal(writePmsecEnv("[env\n", []), 'env = ["pmsec"]\n[env\n');
+  assert.equal(writePmsecEnv("[[env", []), 'env = ["pmsec"]\n[[env');
+  assert.equal(writePmsecEnv('["env"', []), 'env = ["pmsec"]\n["env"');
+  assert.equal(writePmsecEnv('[ "env"', []), 'env = ["pmsec"]\n[ "env"');
+});
+
 test("write: a header whose first segment is not env does not conflict", () => {
   // `["env.foo"]` is one quoted key that merely spells a dot, not the env table.
   for (const header of ["[x.env]", "[envsub]", "[tool.env]", "[envs]", "['x.env']", '["env.foo"]']) {

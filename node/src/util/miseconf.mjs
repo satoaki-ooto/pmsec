@@ -153,56 +153,59 @@ function quoteRun(text, i) {
   return j - i;
 }
 
-// Header name without brackets, or null when the line is not a closed header.
-function headerName(text, i) {
-  const double = text[i + 1] === "[";
-  let quote = null;
-  let name = "";
-  for (let j = i + (double ? 2 : 1); j < text.length; j++) {
-    const c = text[j];
-    if (c === "\n") return null;
-    if (quote !== null) {
-      if (c === quote) quote = null;
-      name += c;
-      continue;
-    }
-    if (c === '"' || c === "'") {
-      quote = c;
-      name += c;
-      continue;
-    }
-    if (c === "#") return null;
-    if (c === "]") {
-      if (double && text[j + 1] !== "]") return null;
-      return name.trim();
-    }
-    name += c;
-  }
-  return null;
-}
-
-function unquote(s) {
-  return /^(".*"|'.*')$/s.test(s) ? s.slice(1, -1) : s;
-}
-
-// A table header names an absolute key path, so its FIRST segment alone decides
-// whether it owns the key pmsec writes: `[env]`, `[env.foo]`, `[ "env" ]`, and
-// `["env".x]` all define something under the root `env` table, while `[x.env]`
-// and `[envsub]` do not. Segments may be quoted and whitespace may surround the
-// dots, so decode the first segment the way TOML would.
-//
-// deliberate: Issue-#194 subset only; splitting on the first dot is enough
-// because only that segment is compared, and a quoted segment keeps its opening
-// quote, so a dot inside a quoted key (`["env.foo"]`) can never decode to `env`.
-function headerFirstSegment(name) {
-  return unquote(name.split(".")[0].trim());
-}
-
 // Horizontal whitespace only: a dotted key cannot cross a line, so the forms
 // that are tolerated before `=` stay bare-key decisions instead of dotted ones.
 function skipBlanks(text, i, n) {
   while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === "\r")) i++;
   return i;
+}
+
+// Decodes the first dot-separated key segment at `i`, the way every port does:
+// a quoted segment loses its quotes but keeps escapes undecoded, a bare one
+// runs to whitespace, `.`, `=`, a comment or a closing bracket. Returns the
+// decoded text and the offset just past it, or null when it is empty or its
+// quote never closes before `end`. `end` is the line end, so a header cut short
+// can never borrow a segment from the line below it.
+//
+// deliberate: Issue-#194 subset only; quotes are stripped, never decoded, so no
+// escaped spelling can collapse onto the plain name `env`.
+function headerSegment(text, i, end) {
+  if (i >= end) return null;
+  const quote = text[i];
+  if (quote === '"' || quote === "'") {
+    let raw = "";
+    let j = i + 1;
+    while (j < end) {
+      if (text[j] === quote) return { text: raw, end: j + 1 };
+      if (quote === '"' && text[j] === "\\") {
+        raw += text.slice(j, j + 2);
+        j += 2;
+        continue;
+      }
+      raw += text[j];
+      j++;
+    }
+    return null;
+  }
+  let j = i;
+  while (j < end && !" \t\r.=]}".includes(text[j])) j++;
+  return j > i ? { text: text.slice(i, j), end: j } : null;
+}
+
+// A depth-0 line-start `[` opens a table header. It owns the key pmsec writes
+// when its first decoded segment is exactly `env` and that segment is followed
+// by `.` (a deeper table) or `]` (the table itself): `[env]`, `[env.foo]`,
+// `[ "env" ]`, `["env".x]`, and a header cut short (`[env.`, `[env.[`,
+// `[[env.`) all conflict. Termination is irrelevant, because a broken header is
+// a file mise never loads and the key it names still collides with the array.
+// `[x.env]`, `[envsub]`, `["env.foo"]` (one quoted key that spells a dot) and a
+// bare `[env` with nothing after its segment do not conflict.
+function headerOwnsEnv(text, i, end) {
+  const start = skipBlanks(text, i + (text[i + 1] === "[" ? 2 : 1), end);
+  const segment = headerSegment(text, start, end);
+  if (segment === null || segment.text !== "env") return false;
+  const rest = skipBlanks(text, segment.end, end);
+  return rest < end && (text[rest] === "." || text[rest] === "]");
 }
 
 // Classifies one line-start token. `bare` is the exact token `env` followed by
@@ -249,7 +252,7 @@ function classifyKey(text, i, n) {
 //   quotedEnv  - first root-region `"env"`/`'env'` key, or -1
 //   dottedEnv  - first `env.` key anywhere, or -1 (fail closed: the subset
 //                does not model table scoping, so a nested one is rejected too)
-//   envTable   - first `[env...]` header anywhere, or -1
+//   envTable   - first header whose first segment decodes to `env`, or -1
 //   openValue  - line start where an array/inline table still open at EOF began, or -1
 //   unterminated - a `"""`/`'''` block that never closes
 //
@@ -356,12 +359,15 @@ function lex(text) {
       // A line that starts inside a value continues that value: its first token
       // is array/inline-table data, never a header and never a root key.
       if (depth === 0 && c === "[") {
-        const name = headerName(text, i);
         if (inRoot) {
           inRoot = false;
           rootEnd = lineStart;
         }
-        if (envTable < 0 && name !== null && headerFirstSegment(name) === "env") envTable = i;
+        // Bounded by the line end: a header cut short (`[env.` at EOF, or
+        // `[env.[`) still names the env table, but must not borrow a segment
+        // from the line below it.
+        const nl = text.indexOf("\n", i);
+        if (envTable < 0 && headerOwnsEnv(text, i, nl < 0 ? n : nl)) envTable = i;
         // The header's own `[` opens no value context: consuming it keeps its
         // matching `]` from being read as a nested closer.
         i++;
