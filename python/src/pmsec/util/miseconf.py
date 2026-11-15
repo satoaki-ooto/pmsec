@@ -40,6 +40,25 @@ _ENV = "env"
 _PMSEC = "pmsec"
 _MULTILINE_DELIMITERS = ('"""', "'''")
 
+
+def _quote_run(text: str, index: int) -> int:
+    """Length of the run of `text[index]` quotes, folded to five.
+
+    TOML lets a multiline string close with up to five consecutive quotes: the
+    last three are the delimiter and the one or two before it are content
+    (`\"\"\"a\"\"\"\"` is `a"`). A six-or-more run therefore cannot close legally,
+    but the scanner still stops counting at five so an over-long run consumes
+    its first five quotes and leaves the rest as code — the same fold node's
+    `quoteRun` makes, and the reason both ports agree byte for byte on the
+    malformed shapes too.
+    """
+    quote = text[index]
+    run = 0
+    while index + run < len(text) and text[index + run] == quote and run < 5:
+        run += 1
+    return run
+
+
 # A bare key token: the exact word `env` followed by whitespace, `=`, a dotted-key
 # dot, or end of line. `envelope = true` therefore stays an unrelated key.
 _BARE_ENV = re.compile(r"[ \t]*env(?=[ \t\r=.]|$)")
@@ -228,7 +247,13 @@ def _scan_structure(text: str) -> _Structure:
 
         if state in _MULTILINE_DELIMITERS:
             if text.startswith(state, index):
-                index += 3
+                # Consume the whole closing run, not just the three quotes that
+                # spell the delimiter: TOML allows one or two quotes of content
+                # right before the closer (`"""foo""""`), and stopping at three
+                # would leave a quote that opens a one-line string and swallows
+                # the `]` after it. Matching node's `quoteRun` exactly keeps the
+                # ports' read and write answers identical for every run length.
+                index += _quote_run(text, index)
                 state = ""
                 opened_at = -1
                 # The closing delimiter is code again: text later on this same

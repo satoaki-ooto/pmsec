@@ -227,6 +227,94 @@ def test_an_escape_cannot_hide_an_unterminated_basic_multiline_string():
     assert excinfo.value.reason == UNTERMINATED_FILE_STRING
 
 
+# --- read/write: the closing quote run of a multiline string ----------------
+#
+# TOML lets a multiline string close with four or five consecutive quotes: the
+# last three are the delimiter and the one or two before them are content
+# (`"""foo""""` is `foo"`). Consuming only three at the closer leaves a quote
+# behind, which opens a one-line string that swallows the `]` after it, hides
+# the root `env` assignment below, and makes the writer append a second one — a
+# duplicate key. The scanner therefore consumes the whole run, exactly as node's
+# `quoteRun` and PowerShell's `Get-MisercQuoteRun` do; these cases pin the four
+# ports to one answer per run length. A six-or-more run cannot be legal TOML,
+# but the fold at five is deliberate and shared: it decides the malformed result
+# instead of leaving each port to improvise.
+
+QUOTE_RUN_CLOSERS = [
+    # (closer length, read result, rewrite of a real assignment)
+    (4, ["work"], 'items = ["""foo""""]\nenv = ["work", "pmsec"]\n'),
+    (5, ["work"], 'items = ["""foo"""""]\nenv = ["work", "pmsec"]\n'),
+    # Five quotes consumed, the sixth left over: it opens a one-line string that
+    # runs to end of line, so the `]` never closes the array and the root env
+    # line is no longer code. Node reports the same `None` and appends the same
+    # line, so the duplicate here is the shared malformed answer, not a drift.
+    (6, None, 'env = ["work", "pmsec"]\nitems = ["""foo""""""]\nenv = ["work"]\n'),
+    # Seven: the leftover pair closes itself, putting the `]` back in code.
+    (7, ["work"], 'items = ["""foo"""""""]\nenv = ["work", "pmsec"]\n'),
+]
+
+
+@pytest.mark.parametrize("run,expected,rewritten", QUOTE_RUN_CLOSERS)
+def test_a_basic_multiline_string_closes_on_the_whole_quote_run(
+    run: int, expected: list[str] | None, rewritten: str
+):
+    text = f'items = ["""foo{chr(34) * run}]\nenv = ["work"]\n'
+    assert read_env(text) == expected
+    # Byte-exact: a surviving original assignment is extended in place, a hidden
+    # one leaves a canonical line inserted above it — matching node for this run.
+    assert write_pmsec_env(text, ["work"]) == rewritten
+
+
+QUOTE_RUN_LITERAL_CLOSERS = [
+    (4, ["work"], "items = ['''foo'''']\nenv = ['work', \"pmsec\"]\n"),
+    (5, ["work"], "items = ['''foo''''']\nenv = ['work', \"pmsec\"]\n"),
+    (6, None, "env = [\"work\", \"pmsec\"]\nitems = ['''foo'''''']\nenv = ['work']\n"),
+]
+
+
+@pytest.mark.parametrize("run,expected,rewritten", QUOTE_RUN_LITERAL_CLOSERS)
+def test_a_literal_multiline_string_closes_on_the_whole_quote_run(
+    run: int, expected: list[str] | None, rewritten: str
+):
+    # No escape semantics here: the run closes on length alone, and the same
+    # five-quote fold applies (six is malformed in the shared answer).
+    text = f"items = ['''foo{chr(39) * run}]\nenv = ['work']\n"
+    assert read_env(text) == expected
+    assert write_pmsec_env(text, ["work"]) == rewritten
+
+
+def test_a_multiline_string_as_an_env_element_is_still_unsupported():
+    # The array-element parser rejects the delimiter outright, whatever run the
+    # closer uses: the scan fix must not let one through as a name.
+    with pytest.raises(MiseEnvError) as excinfo:
+        read_env('env = ["""foo""""]\n')
+    assert excinfo.value.reason == MULTILINE
+    with pytest.raises(MiseEnvError) as excinfo:
+        read_env('env = ["""foo"""""]\n')
+    assert excinfo.value.reason == MULTILINE
+
+
+def test_a_trailing_quote_run_does_not_rescue_an_unclosed_multiline_string():
+    # Two quotes are content, so the string is still open at end of file. Five
+    # quotes, on the other hand, close it inside the array, which leaves the
+    # array unclosed and hides the root assignment — node's answer for the same
+    # text, and exactly why the run is consumed as one unit.
+    with pytest.raises(MiseEnvError) as excinfo:
+        read_env('note = """foo""\n')
+    assert excinfo.value.reason == UNTERMINATED_FILE_STRING
+    assert read_env('items = ["""foo"""""\n') is None
+
+
+def test_a_quote_run_closer_keeps_escape_handling_intact():
+    # The escape-pair skip runs while searching for the closer, so a backslash
+    # before the closing run still consumes the quote after it: `\o` is one
+    # escaped character and the four quotes then close the string.
+    assert read_env('items = ["""fo\\o""""]\nenv = ["work"]\n') == ["work"]
+    assert write_pmsec_env('items = ["""fo\\o""""]\nenv = ["work"]\n', ["work"]) == (
+        'items = ["""fo\\o""""]\nenv = ["work", "pmsec"]\n'
+    )
+
+
 # --- read: rejected shapes -------------------------------------------------
 
 REJECTS = [

@@ -169,6 +169,16 @@ def test_a_nested_array_before_env_does_not_hide_the_definition(tmp_path):
     assert read_selector(env, tmp_path, "linux") == Selector(str(shared), ["work"], False)
 
 
+def test_a_quote_run_closer_in_a_shared_miserc_still_defines_env(tmp_path):
+    # The reader's scan is fixed, not just its parser: a shared file whose
+    # multiline string closes on four quotes must still offer its env list to
+    # the selector. Before that fix the leftover quote swallowed the array and
+    # this file read as defining nothing.
+    _, shared, _, env = _paths(tmp_path)
+    _write(shared, 'items = ["""foo""""]\nenv = ["work"]\n')
+    assert read_selector(env, tmp_path, "linux") == Selector(str(shared), ["work"], False)
+
+
 def test_a_file_without_an_env_assignment_does_not_define(tmp_path):
     local, shared, system, env = _paths(tmp_path)
     _write(local, '[tools]\nnode = "22"\n')
