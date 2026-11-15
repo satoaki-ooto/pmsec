@@ -675,13 +675,33 @@ _miseconf_skip_ws_comments() {
 # honours `\`, so an escape pair is skipped whole: `\"""` is content, and only an
 # unescaped run of three quotes closes the block. A literal (`'''`) block has no
 # escapes at all, so there the first closer always wins (PR #5, finding A3).
+#
+# The closer is a RUN of quotes, never exactly three: TOML lets the last one or
+# two quotes before the delimiter belong to the content (`"""a""""`), so the
+# whole run is consumed, like node's quoteRun and PowerShell's
+# Get-MisercQuoteRun. Consuming three there would leave a stray quote behind,
+# and that quote would open a one-line string which swallows the rest of the
+# line — hiding the `]` of the array the block sits in (PR #5, Devin follow-up).
+# The run is capped at five quotes because that is what those two ports commit
+# to: a longer run closes after five, and the leftover quotes re-enter the
+# scanner as ordinary quoting. Diverging on runs of six or more would show up as
+# a read/write difference long before it caused a visible problem, so the cap is
+# copied rather than "improved".
 _miseconf_close_on_line() {
-  local tok="$1" seg skip i
+  local tok="$1" seg skip i end q n
   if [ "$tok" = '"""' ]; then
     i=$_ME_POS
     while [ "$i" -lt "$_ME_LEN" ]; do
       if [ "${_ME_LINE:i:1}" = '\' ]; then i=$((i+2)); continue; fi
-      if [ "${_ME_LINE:i:3}" = '"""' ]; then _ME_POS=$((i+3)); return 0; fi
+      if [ "${_ME_LINE:i:3}" = '"""' ]; then
+        end=$i
+        while [ $((end-i)) -lt 5 ] && [ "$end" -lt "$_ME_LEN" ] \
+              && [ "${_ME_LINE:end:1}" = '"' ]; do
+          end=$((end+1))
+        done
+        _ME_POS=$end
+        return 0
+      fi
       i=$((i+1))
     done
     _ME_POS=$_ME_LEN
@@ -691,7 +711,14 @@ _miseconf_close_on_line() {
   case "$seg" in
     *"$tok"*)
       skip="${seg%%"$tok"*}"
-      _ME_POS=$((_ME_POS + ${#skip} + ${#tok}))
+      i=$((_ME_POS + ${#skip}))
+      q="${_ME_LINE:i:1}"
+      end=$i
+      while [ $((end-i)) -lt 5 ] && [ "$end" -lt "$_ME_LEN" ] \
+            && [ "${_ME_LINE:end:1}" = "$q" ]; do
+        end=$((end+1))
+      done
+      _ME_POS=$end
       return 0 ;;
   esac
   _ME_POS=$_ME_LEN

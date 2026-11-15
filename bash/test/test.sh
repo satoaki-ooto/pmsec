@@ -1229,6 +1229,86 @@ env = ['real']" 1 'real' || return 1
 \"""' "unterminated string in file"
 }
 
+# TOML lets the last one or two quotes before a multiline delimiter belong to
+# the content (`"""a""""`), so the closer is a RUN of quotes and the whole run
+# has to be consumed. Consuming exactly three left a stray quote behind, and
+# that quote opened a one-line string which swallowed the `]` of the array the
+# block sat in — hiding the root env assignment entirely (PR #5, Devin
+# follow-up). The expected values below are node's quoteRun and PowerShell's
+# Get-MisercQuoteRun verbatim: the run is capped at five, so six or more quotes
+# close after the first five and the leftovers re-enter the scanner as quoting.
+t_miserc_parse_multiline_quote_run() {
+  # A run inside an array does not close the array when it is read as content.
+  accept_case "four-quote closer keeps the array closed" 'items = ["""foo""""]
+env = ["work"]' 1 'work' || return 1
+  accept_case "five-quote closer keeps the array closed" 'items = ["""foo"""""]
+env = ["work"]' 1 'work' || return 1
+  # Runs of six and seven pins the cap, not just "consume everything": node
+  # reads six as a five-quote closer plus a stray quote (so the `]` is
+  # swallowed and no root env exists), and seven as a five-quote closer plus a
+  # literal `""` (so the array closes). Both must survive here byte for byte.
+  accept_case "six-quote run hides the root env like node" 'items = ["""foo""""""]
+env = ["work"]' 0 '' || return 1
+  accept_case "seven-quote run closes after the five-quote cap" 'items = ["""foo"""""""]
+env = ["work"]' 1 'work' || return 1
+  # Eight quotes leave a `"""` behind, which opens a block that never closes.
+  reject_case misc 'items = ["""foo""""""""]
+env = ["work"]' "unterminated string in file" || return 1
+  # A literal block has no escapes, so its first `'''` is the closer and the
+  # run still consumes the extra quote.
+  accept_case "literal four-quote closer" "items = ['''foo'''']
+env = ['work']" 1 'work' || return 1
+  # Only a run of three or more closes; the run is the closer, so whatever
+  # follows it is code again. Both shapes read the same in node.
+  accept_case "four quotes close before trailing junk" 'a = ["""x"""" y]
+env = ["w"]' 1 'w' || return 1
+  accept_case "four quotes close before a comma" 'a = ["""x"""", 1]
+env = ["w"]' 1 'w' || return 1
+  # An escape pair still wins over the run: two backslashes are one escaped
+  # backslash, so the four quotes after it close; four backslashes leave a `\`
+  # escaping the first quote of the run, and the six-quote cap then behaves
+  # exactly like node's.
+  accept_case "escaped backslash then a four-quote closer" 'a = ["""x\\""""]
+env = ["w"]' 1 'w' || return 1
+  accept_case "two escaped backslashes then a six-quote run" 'a = ["""x\\\\""""""]
+env = ["w"]' 0 '' || return 1
+  # The array-element rejection is a separate path and must not have moved.
+  reject_case misc 'env = ["""foo""""]
+' "multiline strings are unsupported" || return 1
+  # A block that never closes is still the same error, quotes at the end or not.
+  reject_case misc 'items = ["""foo""
+' "unterminated string in file"
+}
+
+# The writer splices around [START, END), so the same run must leave the real
+# assignment byte-exact: replacing it is what keeps the file from growing a
+# second `env` key on every run.
+t_miserc_write_multiline_quote_run() {
+  local out
+  out=$(miserc_write misc 'items = ["""foo""""]
+env = ["work"]' other)
+  assert_eq "write quote-run 4: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "write quote-run 4: replaces the real assignment" \
+    'items = ["""foo""""]<LF>env = ["other", "pmsec"]' "$(field out "$out")" || return 1
+
+  out=$(miserc_write misc 'items = ["""foo"""""]
+env = ["work"]' other)
+  assert_eq "write quote-run 5: replaces the real assignment" \
+    'items = ["""foo"""""]<LF>env = ["other", "pmsec"]' "$(field out "$out")" || return 1
+
+  # Six quotes hide the root env, so the writer inserts instead of replacing:
+  # node does the same, which is why this is pinned rather than "fixed".
+  out=$(miserc_write misc 'items = ["""foo""""""]
+env = ["work"]' other)
+  assert_eq "write quote-run 6: inserts above the broken value" \
+    'env = ["other", "pmsec"]<LF>items = ["""foo""""""]<LF>env = ["work"]' "$(field out "$out")" || return 1
+
+  out=$(miserc_write misc 'items = ["""foo"""""""]
+env = ["work"]' other)
+  assert_eq "write quote-run 7: replaces the real assignment" \
+    'items = ["""foo"""""""]<LF>env = ["other", "pmsec"]' "$(field out "$out")"
+}
+
 # A one-line string that reaches the end of its line ends there: the subset does
 # not validate general TOML, so the rest of the line is string content and
 # scanning resumes on the next line. `unterminated string in file` is reserved
@@ -1880,6 +1960,22 @@ env = ["work", "pmsec"]'
   rm_tree "$h"
 }
 
+# The selector reads through the same scan, so a multiline block that closes
+# with a run of four quotes must not hide the list it shares the file with.
+t_selector_multiline_quote_run() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$d/miserc.toml" 'items = ["""foo""""]
+env = ["work", "pmsec"]'
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "selector quote-run: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "selector quote-run: path" "$d/miserc.toml" "$(field path "$out")" || return 1
+  assert_eq "selector quote-run: names" "work|pmsec" "$(field names "$out")" || return 1
+  assert_eq "selector quote-run: wired" "1" "$(field wired "$out")" || return 1
+  rm_tree "$h"
+}
+
 # `env = []` is a definition: it adopts an empty list and stops the search, so
 # a shared list can never reappear under an explicit local reset.
 t_selector_empty_array_stops_inheritance() {
@@ -2149,6 +2245,7 @@ T "miserc parse: START/END byte offsets splice back exactly" t_miserc_parse_spli
 T "miserc parse: strings and comments stay opaque" t_miserc_parse_ignores_strings_and_comments
 T "miserc parse: nested arrays and inline tables stay opaque" t_miserc_parse_nested_containers
 T "miserc parse: escaped triple quotes in a basic string" t_miserc_parse_multiline_escape_closer
+T "miserc parse: a closing run of four or more quotes" t_miserc_parse_multiline_quote_run
 T "miserc parse: one-line strings end with their line" t_miserc_parse_line_terminated_strings
 T "miserc parse: quoted env key rejected" t_miserc_parse_reject_quoted_key
 T "miserc parse: duplicate top-level env rejected" t_miserc_parse_reject_duplicate
@@ -2166,6 +2263,7 @@ T "miserc error text shape" t_miserc_error_text_shape
 T "miserc write: fresh file and inherited names" t_miserc_write_fresh
 T "miserc write: pmsec last and once" t_miserc_write_pmsec_last_once
 T "miserc write: multiline array collapsed" t_miserc_write_collapses_multiline
+T "miserc write: a closing quote run keeps the assignment replaceable" t_miserc_write_multiline_quote_run
 T "miserc write: surrounding bytes preserved" t_miserc_write_preserves_bytes
 T "miserc write: absent assignment inserted before the first table" t_miserc_write_inserts_before_first_table
 T "miserc write: nested containers never capture the new array" t_miserc_write_nested_containers
@@ -2181,6 +2279,7 @@ T "selector: MISE_ENV branch never touches the filesystem" t_selector_mise_env_n
 T "selector: empty and unset MISE_ENV fall back to files" t_selector_mise_env_empty_falls_back
 T "selector: local / shared / system precedence" t_selector_file_precedence
 T "selector: nested containers do not change the adopted list" t_selector_nested_containers
+T "selector: a closing quote run does not hide the adopted list" t_selector_multiline_quote_run
 T "selector: env = [] stops inheritance" t_selector_empty_array_stops_inheritance
 T "selector: no definition attributes the local path" t_selector_no_definition
 T "selector: parse and read errors fail closed" t_selector_fails_closed
