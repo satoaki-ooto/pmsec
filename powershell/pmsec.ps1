@@ -1307,6 +1307,214 @@ function ConvertTo-MisercEnvToken([string]$Value) {
   return ("'" + $Value + "'")
 }
 
+# ---- mise selector + local writer ----
+
+# What mise 2026.11 would use as the effective top-level `env` list for one
+# scope, and the only place pmsec writes that list.
+#
+# deliberate: Issue-#194 selector subset only; mise semantics outside this contract are not modelled. Upgrade path: extend this region per port behind the same contract rather than growing a second selector elsewhere.
+#
+# node/src/util/selector.mjs, python/src/pmsec/util/selector.py and the bash
+# `mise_selector_*` helpers implement the same contract:
+#   * a non-empty scoped MISE_ENV replaces the files entirely: split on commas,
+#     drop empty elements, trim nothing. That branch opens no miserc file, so
+#     it succeeds even where every layer is unreadable or not a file at all.
+#     MISE_ENV="" is the settled "unset" spelling and falls through to files.
+#   * otherwise local -> shared -> system, and the first file that *defines* a
+#     top-level `env` wins wholesale: no merge across layers, no `env_sets`
+#     expansion, and `env = []` is a definition that stops inheritance. No
+#     lower layer is opened once a higher one defined the list.
+#   * `wired` is exact, case-sensitive `pmsec` membership anywhere in the list:
+#     no last-position rule, no trimming, `Pmsec` is a different env name.
+#   * the writer inherits the file-based list only - MISE_ENV describes one
+#     shell invocation and must never be frozen into a file - and writes the
+#     local miserc only, never the shared or the system file.
+#
+# Both helpers take a scope record and resolve everything through
+# Get-MiseScopeContext, so the Windows host, each WSL distro and each fake
+# scope use their own environment, their own injected values and their own
+# (UNC-translated) paths. mise version detection is deliberately absent: the
+# mode gate is a separate decision and neither helper may spawn a probe.
+#
+# Failures are MiseEnvError-shaped: the message is the frozen
+# `invalid env in <path>: <reason>` envelope, and path/reason ride in
+# Exception.Data so a caller can report the pair without parsing text. Parser
+# reasons come verbatim from Read-MisercEnv / Update-MisercEnvText;
+# `cannot read file` is the only reason this region adds. Nothing is swallowed:
+# an unreadable or malformed higher layer aborts instead of falling through to
+# a lower one.
+
+$script:MiseEnvErrorPathKey = 'pmsec.mise.env.path'
+$script:MiseEnvErrorReasonKey = 'pmsec.mise.env.reason'
+# mise's own precedence order; reading stops at the first file that defines
+# `env`, so nothing later in this list may be opened once a definition exists.
+$script:MiseSelectorSources = @('LocalMiserc', 'SharedMiserc', 'SystemMiserc')
+# UTF-8 with no BOM detection and no silent replacement. File.ReadAllText would
+# strip a leading BOM (StreamReader detects and consumes it), while the writer
+# has to reproduce every byte outside the rewritten assignment; passing the raw
+# bytes through this decoder keeps the BOM and turns undecodable input into the
+# same read failure the python port reports instead of a replacement character.
+$script:MiseUtf8Raw = [System.Text.UTF8Encoding]::new($false, $true)
+
+# Builds the structured failure both helpers throw. An Exception with Data is
+# used instead of a `class` because this script is dot-sourced (twice, by the
+# tests) and a type cannot be defined twice in one session.
+function New-MiseEnvError([string]$Path, [string]$Reason) {
+  $failure = [System.Exception]::new((Get-MisercErrorText -Path $Path -Reason $Reason))
+  $failure.Data[$script:MiseEnvErrorPathKey] = $Path
+  $failure.Data[$script:MiseEnvErrorReasonKey] = $Reason
+  return $failure
+}
+
+# Reads one field of a selector failure, or $null when $ErrorRecord (an
+# ErrorRecord or an exception) did not come from this region.
+function Get-MiseEnvErrorField($ErrorRecord, [string]$Key) {
+  if ($null -eq $ErrorRecord) { return $null }
+  $exception = $null
+  try { $exception = $ErrorRecord.Exception } catch { $exception = $null }
+  if ($null -eq $exception) { $exception = $ErrorRecord }
+  $data = $null
+  try { $data = $exception.Data } catch { return $null }
+  if ($null -eq $data) { return $null }
+  try {
+    if (-not $data.Contains($Key)) { return $null }
+    return [string]$data[$Key]
+  } catch { return $null }
+}
+
+function Get-MiseEnvErrorPath($ErrorRecord) {
+  return (Get-MiseEnvErrorField $ErrorRecord $script:MiseEnvErrorPathKey)
+}
+
+function Get-MiseEnvErrorReason($ErrorRecord) {
+  return (Get-MiseEnvErrorField $ErrorRecord $script:MiseEnvErrorReasonKey)
+}
+
+# Raw text of one miserc file, exactly as stored: a leading BOM stays in the
+# string and CRLF stays CRLF (nothing here normalizes newlines). A missing file
+# answers Exists = $false; every other outcome throws - a directory, a
+# permission problem or undecodable bytes are read failures, never "absent", so
+# a broken higher layer can never masquerade as a missing one. A dangling link
+# counts as missing, matching ENOENT in the other ports.
+function Read-MiseRawMiserc([string]$Path) {
+  if (-not [System.IO.File]::Exists($Path)) {
+    if ([System.IO.Directory]::Exists($Path)) { throw (New-MiseEnvError $Path 'cannot read file') }
+    return @{ Exists = $false; Text = '' }
+  }
+  $bytes = $null
+  try {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+  } catch {
+    throw (New-MiseEnvError $Path 'cannot read file')
+  }
+  if ($null -eq $bytes -or $bytes.Length -eq 0) { return @{ Exists = $true; Text = '' } }
+  try {
+    return @{ Exists = $true; Text = $script:MiseUtf8Raw.GetString($bytes) }
+  } catch {
+    throw (New-MiseEnvError $Path 'cannot read file')
+  }
+}
+
+# mise tokenization of MISE_ENV: commas separate, empty elements vanish, nothing
+# is trimmed (`"a, b"` selects `a` and ` b`, `",,"` selects nothing). Trimming
+# would silently select a different env than mise does.
+function Split-MiseEnvValue([string]$Value) {
+  $names = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($token in $Value.Split([char[]]@(','))) {
+    if ($token -eq '') { continue }
+    $names.Add($token)
+  }
+  return ,$names.ToArray()
+}
+
+# Exact, ordinal `pmsec` membership. `-contains` cannot be used: it is
+# case-insensitive, and `Pmsec` is a distinct mise env name.
+function Test-MiseListWired([string[]]$Names) {
+  foreach ($name in $Names) {
+    if ([string]$name -ceq 'pmsec') { return $true }
+  }
+  return $false
+}
+
+# One shape for both branches: which list is effective, where it came from, and
+# whether pmsec is in it. `Env` stays a string[] (empty, never $null) so callers
+# can count and join it without null checks.
+function New-MiseSelectorResult([string]$Path, [string[]]$Names) {
+  if ($null -eq $Names) { $Names = [string[]]@() }
+  return [pscustomobject]@{ Path = $Path; Env = $Names; Wired = (Test-MiseListWired $Names) }
+}
+
+# The file-based half of the selector, shared by the reader and the writer on
+# purpose: the writer must inherit exactly what mise applies to the local file,
+# and MISE_ENV is an invocation-time override that must never be frozen into a
+# file. Answers @{ Path; Env } for the first layer that defines `env`, or the
+# local path with an empty list when no layer does. The first unreadable or
+# malformed layer throws where it is found.
+function Get-MiseFileSelector($Paths) {
+  $local = [string]$Paths['LocalMiserc']
+  foreach ($source in $script:MiseSelectorSources) {
+    $file = [string]$Paths[$source]
+    # An unresolvable slot is not "absent": inheriting from a lower layer here
+    # would let a broken path family silently change the effective list.
+    if ([string]::IsNullOrEmpty($file)) { throw (New-MiseEnvError $file 'cannot read file') }
+    $raw = Read-MiseRawMiserc $file
+    if (-not $raw['Exists']) { continue }
+    # The parser reports path + reason; promote both to the throw so a malformed
+    # higher layer never degrades into a lower one.
+    $parsed = Read-MisercEnv -Text $raw['Text'] -Path $file
+    if (-not $parsed['Ok']) { throw (New-MiseEnvError $file ([string]$parsed['Reason'])) }
+    # Stop at the first definition, `env = []` included: an empty array is how a
+    # higher layer stops inheritance, and the lower layers are then not part of
+    # the effective selection at all.
+    if ($parsed['Defined']) { return @{ Path = $file; Env = [string[]]$parsed['Env'] } }
+  }
+  # No file defines: the local path is the attribution, because that is the file
+  # the writer would create.
+  return @{ Path = $local; Env = [string[]]@() }
+}
+
+# The effective `env` list for $Scope: { Path; Env; Wired }. `Path` is
+# "MISE_ENV" for a non-empty override, otherwise the miserc file that defines
+# the list - or the scoped local miserc when nothing defines it. Throws the
+# structured selector error when the selection cannot be determined, so a
+# caller never mistakes "unknown" for "empty".
+function Get-MiseSelector($Scope) {
+  $context = Get-MiseScopeContext $Scope
+  $values = $context['Environment']
+  if ($null -eq $values) { $values = @{} }
+  # A non-empty MISE_ENV decides on its own and is answered before any file is
+  # named, so this branch cannot fail because a miserc slot is unusable.
+  $override = $values['MISE_ENV']
+  if ($override -is [string] -and $override -ne '') {
+    return (New-MiseSelectorResult 'MISE_ENV' (Split-MiseEnvValue $override))
+  }
+  # MISE_ENV="" is defined as unset, so it falls through to the files.
+  $adopted = Get-MiseFileSelector $context['Paths']
+  return (New-MiseSelectorResult ([string]$adopted['Path']) ([string[]]$adopted['Env']))
+}
+
+# Wires pmsec into the scoped local miserc and returns that path. The inherited
+# list is file-based even when MISE_ENV is set: the variable is a per-invocation
+# choice, not configuration to persist. Nothing is written, backed up or mkdir'd
+# until every source has been read and parsed and the replacement text is fully
+# planned, so a rejected run leaves the target, its .bak and any scratch file
+# exactly as they were and creates no directory. The single write goes through
+# WriteAtomic, whose labeled `WriteAtomic <step>` failures propagate untouched.
+function Write-MisePmsecEnv($Scope) {
+  $context = Get-MiseScopeContext $Scope
+  $paths = $context['Paths']
+  # Inheritance first: an unreadable or malformed source must abort before a
+  # single byte of the replacement is planned.
+  $inherited = Get-MiseFileSelector $paths
+  $local = [string]$paths['LocalMiserc']
+  # Raw text of the target, BOM and CRLF included.
+  $current = Read-MiseRawMiserc $local
+  $plan = Update-MisercEnvText -Text ([string]$current['Text']) -Inherited ([string[]]$inherited['Env']) -Path $local
+  if (-not $plan['Ok']) { throw (New-MiseEnvError $local ([string]$plan['Reason'])) }
+  WriteAtomic $local ([string]$plan['Text'])
+  return $local
+}
+
 # ---------- line buffer ----------
 # Mirrors node/src/util/lines.mjs. LinesBuf is an ArrayList of strings; the
 # rendered file is buf joined by \n with a trailing \n iff non-empty.

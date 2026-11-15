@@ -1773,6 +1773,668 @@ T 'miserc error text keeps the frozen envelope' {
   return ($ok -and (AssertEq 'windows path' ('invalid env in C:\Users\me\.config\mise\miserc.local.toml: malformed env array separator') (Get-MisercErrorText -Path 'C:\Users\me\.config\mise\miserc.local.toml' -Reason 'malformed env array separator')))
 }
 
+# ---------- mise layering: miserc selector + local writer ----------
+# The selector and the local writer are per-scope, so every case runs in process
+# against fake scopes whose mise variables are injected per scope
+# (PMSEC_FAKE_SCOPE_DATA): the matrix stays host independent and scope isolation
+# is the default instead of something each case has to scrub. Real Windows and
+# real WSL paths are only a scope record away, so Windows is covered by a
+# non-fake win32 record reading the process environment.
+
+$script:SelBom = [string][char]0xFEFF
+$script:SelCrlf = [string][char]13 + [string][char]10
+$script:SelUtf8 = [System.Text.UTF8Encoding]::new($false)
+
+# One sandbox with the two directories a scope's path family touches:
+# <home>/mise holds the local + shared files, <home>/sys the system file.
+function NewSelectorHome {
+  $h = NewHome
+  $d = PathJoin $h 'mise'
+  $s = PathJoin $h 'sys'
+  [void](New-Item -ItemType Directory -Path $d -Force)
+  [void](New-Item -ItemType Directory -Path $s -Force)
+  return @{
+    Home = $h; Dir = $d; Sys = $s
+    Local = (PathJoin $d 'miserc.local.toml')
+    Shared = (PathJoin $d 'miserc.toml')
+    System = (PathJoin $s 'miserc.toml')
+  }
+}
+
+# a chmod 000 fixture must not block the temp tree's own deletion.
+function RemoveSelectorHome($Layout) {
+  try { & chmod -R u+rwx $Layout['Home'] 2>$null } catch { }
+  Remove-Item -Recurse -Force -LiteralPath $Layout['Home'] -ErrorAction Ignore
+}
+
+# chmod 000 only blocks a read for a non-root POSIX user; Windows ignores the
+# mode bits for a normal read and root bypasses them everywhere, so the cases
+# that depend on EACCES are skipped there - the same guard the bash and python
+# suites use.
+function TestSelectorPermissionSemantics {
+  if ($IsWindows) { return $false }
+  try {
+    $uid = (& id -u 2>$null)
+    if ($null -eq $uid) { return $false }
+    return (([string]$uid).Trim() -ne '0')
+  } catch { return $false }
+}
+
+# Writes exactly these characters: no BOM is ever added and no newline is
+# translated, so a fixture can carry a BOM, CRLF or a missing final newline.
+function WriteSelectorFile([string]$Path, [string]$Text) {
+  [System.IO.File]::WriteAllText($Path, $Text, $script:SelUtf8)
+}
+
+# Reads back the raw characters, BOM included (File.ReadAllText would strip it).
+function ReadSelectorFile([string]$Path) {
+  if (-not [System.IO.File]::Exists($Path)) { return $null }
+  return ([System.Text.UTF8Encoding]::new($false, $true)).GetString([System.IO.File]::ReadAllBytes($Path))
+}
+
+# Failure output shows CR/LF/BOM instead of a wall of blank lines.
+function FormatSelectorText($Text) {
+  if ($null -eq $Text) { return '<missing>' }
+  return ((([string]$Text).Replace($script:SelBom, '<BOM>')).Replace([string][char]13, '<CR>')).Replace([string][char]10, '<LF>')
+}
+
+function AssertSelectorFile([string]$Label, [string]$Expected, [string]$Path) {
+  $actual = ReadSelectorFile $Path
+  if ($null -eq $actual) { $script:LastFail = ($Label + ': file missing: ' + $Path); return $false }
+  if ($actual -ceq $Expected) { return $true }
+  $script:LastFail = ($Label + "`n  path:     " + $Path + "`n  expected: " + (FormatSelectorText $Expected) + "`n  actual:   " + (FormatSelectorText $actual))
+  return $false
+}
+
+# Every .bak / *.tmp left behind in one directory.
+function GetSelectorScratch([string]$Dir) {
+  if (-not (Test-Path -LiteralPath $Dir)) { return @() }
+  return @(Get-ChildItem -LiteralPath $Dir -Force | Where-Object { $_.Name.EndsWith('.bak') -or $_.Name.EndsWith('.tmp') })
+}
+
+function AssertSelectorNoScratch([string]$Label, [string]$Dir) {
+  $left = @(GetSelectorScratch $Dir)
+  if ($left.Count -eq 0) { return $true }
+  $script:LastFail = ($Label + ': scratch files left in ' + $Dir + ': ' + (($left | ForEach-Object { $_.Name }) -join ','))
+  return $false
+}
+
+# A slot that fails the moment it is read, on every host: chmod 000 where the
+# platform enforces it, otherwise a directory (a directory is a read error
+# everywhere, root included). Proves "the lower layer was never opened".
+function SetSelectorUnreadable([string]$Path) {
+  Remove-Item -LiteralPath $Path -Force -ErrorAction Ignore
+  if (TestSelectorPermissionSemantics) {
+    WriteSelectorFile $Path (MisercText @('env = ["poison"]'))
+    & chmod 000 $Path 2>$null
+    return
+  }
+  [void](New-Item -ItemType Directory -Path $Path -Force)
+}
+
+# Runs $Action with $Argument (a scope record) while $Values is the process
+# environment. Deliberately a purpose-built window that hands the argument over
+# explicitly: a block that captured an enclosing variable instead would resolve
+# names through the helper's own scope, and a captured $Body would bind to
+# InvokeWithEnv's parameter - the block itself - recursing forever.
+function InvokeSelectorEnv([hashtable]$Values, [scriptblock]$Action, $Argument) {
+  $saved = @{}
+  foreach ($k in @($Values.Keys)) {
+    $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
+    [Environment]::SetEnvironmentVariable($k, $Values[$k], 'Process')
+  }
+  try {
+    return (& $Action $Argument)
+  } finally {
+    foreach ($k in @($Values.Keys)) {
+      [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process')
+    }
+  }
+}
+
+# Runs $Body with one fake scope whose mise variables are injected per scope.
+# The record is built before the window - it reads nothing until the first
+# selector call, which happens inside it - and $Body receives it as $scope.
+function InvokeSelectorScope([string]$Label, [hashtable]$ScopeEnv, [scriptblock]$Body) {
+  $envMap = NewMiseEnvScrub
+  $envMap['PMSEC_FAKE_SCOPES'] = ($Label + '|/home/user|linux')
+  $envMap['PMSEC_FAKE_SCOPE_DATA'] = (NewFakeScopeData $Label $null $ScopeEnv)
+  $scope = NewTestScope $Label '/home/user' 'linux'
+  return (InvokeSelectorEnv $envMap $Body $scope)
+}
+
+# Reader outcome normalized into one hashtable so success and failure cases
+# assert the same fields. A non-selector exception leaves Reason empty, which no
+# case expects, so it can never pass as the expected rejection.
+function GetSelectorFacts($Scope) {
+  try {
+    $selector = Get-MiseSelector $Scope
+    $names = @($selector.Env)
+    return @{
+      Ok = $true; Path = [string]$selector.Path
+      Names = ($names -join '|'); Count = [string]$names.Count
+      Wired = [string]$selector.Wired
+      Reason = ''; ErrPath = ''; Message = ''
+    }
+  } catch {
+    return @{
+      Ok = $false; Path = ''; Names = ''; Count = ''; Wired = ''
+      Reason = [string](Get-MiseEnvErrorReason $_)
+      ErrPath = [string](Get-MiseEnvErrorPath $_)
+      Message = [string]$_.Exception.Message
+    }
+  }
+}
+
+# Writer outcome, same shape (no Names/Count/Wired).
+function GetSelectorWriteFacts($Scope) {
+  try {
+    $written = Write-MisePmsecEnv $Scope
+    return @{ Ok = $true; Path = [string]$written; Reason = ''; ErrPath = ''; Message = '' }
+  } catch {
+    return @{
+      Ok = $false; Path = ''
+      Reason = [string](Get-MiseEnvErrorReason $_)
+      ErrPath = [string](Get-MiseEnvErrorPath $_)
+      Message = [string]$_.Exception.Message
+    }
+  }
+}
+
+function AssertSelectorOk([string]$Label, $Facts, [string]$Path, [string]$Names, [string]$Wired) {
+  if (-not $Facts['Ok']) {
+    $script:LastFail = ($Label + ': expected success, got "' + $Facts['Reason'] + '" for "' + $Facts['ErrPath'] + '" (' + $Facts['Message'] + ')')
+    return $false
+  }
+  $ok = AssertEq ($Label + ': path') $Path $Facts['Path']
+  $ok = $ok -and (AssertEq ($Label + ': names') $Names $Facts['Names'])
+  return ($ok -and (AssertEq ($Label + ': wired') $Wired $Facts['Wired']))
+}
+
+function AssertSelectorFails([string]$Label, $Facts, [string]$Path, [string]$Reason) {
+  if ($Facts['Ok']) {
+    $script:LastFail = ($Label + ': expected a rejection, got path "' + $Facts['Path'] + '" names "' + $Facts['Names'] + '"')
+    return $false
+  }
+  $ok = AssertEq ($Label + ': reason') $Reason $Facts['Reason']
+  return ($ok -and (AssertEq ($Label + ': error path') $Path $Facts['ErrPath']))
+}
+
+function AssertWriteOk([string]$Label, $Facts, [string]$Path) {
+  if (-not $Facts['Ok']) {
+    $script:LastFail = ($Label + ': expected success, got "' + $Facts['Reason'] + '" for "' + $Facts['ErrPath'] + '" (' + $Facts['Message'] + ')')
+    return $false
+  }
+  return (AssertEq ($Label + ': reported path') $Path ([string]$Facts['Path']))
+}
+
+function AssertWriteFails([string]$Label, $Facts, [string]$Path, [string]$Reason) {
+  if ($Facts['Ok']) {
+    $script:LastFail = ($Label + ': expected a rejection, wrote "' + $Facts['Path'] + '"')
+    return $false
+  }
+  $ok = AssertEq ($Label + ': reason') $Reason $Facts['Reason']
+  return ($ok -and (AssertEq ($Label + ': error path') $Path $Facts['ErrPath']))
+}
+
+T 'miserc selector: MISE_ENV tokenization and exact membership' {
+  $cases = @(
+    @{ N = 'duplicates and empty elements'; V = 'a,,pmsec,b'; Names = 'a|pmsec|b'; Wired = 'True' },
+    @{ N = 'trailing comma'; V = 'a,'; Names = 'a'; Wired = 'False' },
+    @{ N = 'only commas'; V = ',,'; Names = ''; Wired = 'False' },
+    @{ N = 'spaces are not trimmed'; V = 'a, b'; Names = 'a| b'; Wired = 'False' },
+    @{ N = 'space keeps pmsec inexact'; V = ' pmsec'; Names = ' pmsec'; Wired = 'False' },
+    @{ N = 'case sensitive'; V = 'Pmsec'; Names = 'Pmsec'; Wired = 'False' },
+    @{ N = 'prefix is not pmsec'; V = 'pmsecx'; Names = 'pmsecx'; Wired = 'False' },
+    @{ N = 'wired in the middle'; V = 'work,pmsec,done'; Names = 'work|pmsec|done'; Wired = 'True' },
+    @{ N = 'wired last'; V = 'work,pmsec'; Names = 'work|pmsec'; Wired = 'True' },
+    @{ N = 'wired first'; V = 'pmsec,work'; Names = 'pmsec|work'; Wired = 'True' },
+    @{ N = 'pmsec alone'; V = 'pmsec'; Names = 'pmsec'; Wired = 'True' }
+  )
+  $ok = $true
+  foreach ($case in $cases) {
+    $facts = InvokeSelectorScope 'sel' @{ 'MISE_ENV' = $case['V'] } { param($scope) GetSelectorFacts $scope }
+    $ok = $ok -and (AssertSelectorOk ('MISE_ENV ' + $case['N']) $facts 'MISE_ENV' $case['Names'] $case['Wired'])
+  }
+  return $ok
+}
+
+T 'miserc selector: the MISE_ENV branch reads no miserc file' {
+  $layout = NewSelectorHome
+  try {
+    # A directory in every slot: the file branch would fail on the first one,
+    # so success here proves the override never opened a file.
+    [void](New-Item -ItemType Directory -Path $layout['Local'] -Force)
+    [void](New-Item -ItemType Directory -Path $layout['Shared'] -Force)
+    [void](New-Item -ItemType Directory -Path $layout['System'] -Force)
+    $scopeEnv = @{ 'MISE_ENV' = 'work'; 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'directories in every slot' $facts 'MISE_ENV' 'work' 'False'
+    if (TestSelectorPermissionSemantics) {
+      Remove-Item -Recurse -Force -LiteralPath $layout['Local']
+      WriteSelectorFile $layout['Local'] (MisercText @('env = ["x"]'))
+      & chmod 000 $layout['Local'] 2>$null
+      $scopeEnv = @{ 'MISE_ENV' = 'pmsec'; 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+      $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+      $ok = $ok -and (AssertSelectorOk 'unreadable local' $facts 'MISE_ENV' 'pmsec' 'True')
+    } else {
+      Write-Host 'SKIP  selector: unreadable local slot under MISE_ENV (POSIX permission semantics only)'
+    }
+    return $ok
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc selector: empty and missing MISE_ENV fall back to the files' {
+  $layout = NewSelectorHome
+  try {
+    WriteSelectorFile $layout['Local'] (MisercText @('env = ["work"]'))
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $missing = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'missing' $missing $layout['Local'] 'work' 'False'
+    # Get-FakeScopeEnvironment turns an injected "" into "unset", so the literal
+    # empty string is driven through the cached scope environment instead.
+    $empty = InvokeWithEnv (NewMiseEnvScrub) {
+      $scope = NewTestScope 'sel' '/home/user' 'linux'
+      $scope['Environment'] = @{
+        Values = @{ 'MISE_ENV' = ''; 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+        Error = $null
+      }
+      GetSelectorFacts $scope
+    }
+    return ($ok -and (AssertSelectorOk 'empty string' $empty $layout['Local'] 'work' 'False'))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc selector: local / shared / system precedence' {
+  $layout = NewSelectorHome
+  try {
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    # local defines: shared and system must never be opened, and reading either
+    # would throw here.
+    WriteSelectorFile $layout['Local'] (MisercText @('env = ["work", "pmsec"]', 'x = 1'))
+    SetSelectorUnreadable $layout['Shared']
+    SetSelectorUnreadable $layout['System']
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'local defines' $facts $layout['Local'] 'work|pmsec' 'True'
+    if (-not $ok) { return $false }
+
+    # local missing, shared defines: system stays unreadable.
+    Remove-Item -LiteralPath $layout['Local'] -Force
+    Remove-Item -Recurse -Force -LiteralPath $layout['Shared']
+    WriteSelectorFile $layout['Shared'] (MisercText @('env = ["shared"]'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'shared defines' $facts $layout['Shared'] 'shared' 'False'
+    if (-not $ok) { return $false }
+
+    # shared missing, system defines.
+    Remove-Item -LiteralPath $layout['Shared'] -Force
+    Remove-Item -Recurse -Force -LiteralPath $layout['System']
+    WriteSelectorFile $layout['System'] (MisercText @('env = ["system"]'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    return (AssertSelectorOk 'system defines' $facts $layout['System'] 'system' 'False')
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc selector: env = [] is a definition that stops inheritance' {
+  $layout = NewSelectorHome
+  try {
+    WriteSelectorFile $layout['Local'] (MisercText @('env = []'))
+    WriteSelectorFile $layout['Shared'] (MisercText @('env = ["shared", "pmsec"]'))
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'empty array' $facts $layout['Local'] '' 'False'
+    return ($ok -and (AssertEq 'empty array: count' '0' $facts['Count']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc selector: no definition attributes the local path' {
+  $layout = NewSelectorHome
+  try {
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorOk 'no files' $facts $layout['Local'] '' 'False'
+    $ok = $ok -and (AssertEq 'no files: count' '0' $facts['Count'])
+    # Files that exist but define no top-level env are not definitions either.
+    WriteSelectorFile $layout['Shared'] (MisercText @('minimum_release_age = "1d"'))
+    WriteSelectorFile $layout['System'] (MisercText @('[tools]', 'x = 1'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    return ($ok -and (AssertSelectorOk 'unrelated content' $facts $layout['Local'] '' 'False'))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc selector: parse and read errors fail closed' {
+  $layout = NewSelectorHome
+  try {
+    WriteSelectorFile $layout['Shared'] (MisercText @('env = ["shared"]'))
+    WriteSelectorFile $layout['Local'] 'env = "work"'
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorFails 'scalar env' $facts $layout['Local'] 'env must be an array'
+    $ok = $ok -and (AssertEq 'scalar env: envelope' ('invalid env in ' + $layout['Local'] + ': env must be an array') $facts['Message'])
+    if (-not $ok) { return $false }
+
+    # A directory in the slot is a read error, not "absent": the shared file
+    # would otherwise be silently adopted.
+    Remove-Item -LiteralPath $layout['Local'] -Force
+    [void](New-Item -ItemType Directory -Path $layout['Local'] -Force)
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    $ok = AssertSelectorFails 'directory in the local slot' $facts $layout['Local'] 'cannot read file'
+    if (-not $ok) { return $false }
+
+    if (-not (TestSelectorPermissionSemantics)) {
+      Write-Host 'SKIP  selector: unreadable local file (POSIX permission semantics only)'
+      return $true
+    }
+    Remove-Item -Recurse -Force -LiteralPath $layout['Local']
+    WriteSelectorFile $layout['Local'] (MisercText @('env = ["work"]'))
+    & chmod 000 $layout['Local'] 2>$null
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorFacts $scope }
+    return (AssertSelectorFails 'unreadable local' $facts $layout['Local'] 'cannot read file')
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc selector: Windows, WSL and fake scopes never share mise values' {
+  $h = NewHome
+  try {
+    $win = PathJoin $h 'win'
+    $a = PathJoin $h 'a'
+    $b = PathJoin $h 'b'
+    $sys = PathJoin $h 'sys'
+    foreach ($dir in @($win, $a, $b, $sys)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+    [void](New-Item -ItemType Directory -Path (PathJoin $a 'miserc.local.toml') -Force)
+    WriteSelectorFile (PathJoin $b 'miserc.local.toml') (MisercText @('env = ["b-file"]'))
+    $data = @{}
+    $data['scope-a'] = @{ Env = @{ 'MISE_ENV' = 'a-env'; 'MISE_CONFIG_DIR' = $a; 'MISE_SYSTEM_CONFIG_DIR' = $sys } }
+    $data['scope-b'] = @{ Env = @{ 'MISE_CONFIG_DIR' = $b; 'MISE_SYSTEM_CONFIG_DIR' = $sys } }
+    $envMap = NewMiseEnvScrub
+    $envMap['MISE_CONFIG_DIR'] = $win
+    $envMap['MISE_SYSTEM_CONFIG_DIR'] = $sys
+    $envMap['PMSEC_FAKE_SCOPES'] = 'scope-a|/home/user|linux;scope-b|/home/user|linux'
+    $envMap['PMSEC_FAKE_SCOPE_DATA'] = ($data | ConvertTo-Json -Compress -Depth 6)
+    $facts = InvokeWithEnv $envMap {
+      $out = @{}
+      # A non-fake win32 record reads the process environment, exactly like the
+      # Windows host: it must not see scope-a's injected MISE_ENV.
+      $out['windows'] = GetSelectorFacts (New-ScopeRecord 'windows' 'C:\Users\user' 'win32' $false)
+      foreach ($scope in (Get-PmsecScopes $true)) { $out[$scope.Label] = GetSelectorFacts $scope }
+      # Real WSL scopes (not fake) read the distro's own environment. wsl.exe is
+      # unavailable off Windows, so the probe result is injected on the record;
+      # their POSIX dir is then translated to \\wsl$\<distro>, never to a host
+      # path, and neither distro sees the other's values.
+      $wsl = NewWslTestScope 'wsl-Ubuntu' 'Ubuntu'
+      $wsl['Environment'] = @{ Values = @{ 'MISE_CONFIG_DIR' = '/pmsec-none/mise'; 'MISE_SYSTEM_CONFIG_DIR' = '/pmsec-none/sys' }; Error = $null }
+      $out['wsl'] = GetSelectorFacts $wsl
+      $wslEnv = NewWslTestScope 'wsl-Debian' 'Debian'
+      $wslEnv['Environment'] = @{ Values = @{ 'MISE_ENV' = 'debian'; 'MISE_CONFIG_DIR' = '/pmsec-none/mise'; 'MISE_SYSTEM_CONFIG_DIR' = '/pmsec-none/sys' }; Error = $null }
+      $out['wsl-env'] = GetSelectorFacts $wslEnv
+      $out
+    }
+    $ok = AssertEq 'windows sees no injected MISE_ENV' 'False' ([string]($facts['windows']['Path'] -eq 'MISE_ENV'))
+    $ok = $ok -and (AssertEq 'windows path stays the win32 local miserc' ($win + '\miserc.local.toml') $facts['windows']['Path'])
+    $ok = $ok -and (AssertEq 'windows names' '' $facts['windows']['Names'])
+    $ok = $ok -and (AssertSelectorOk 'scope-a' $facts['scope-a'] 'MISE_ENV' 'a-env' 'False')
+    $ok = $ok -and (AssertSelectorOk 'scope-b' $facts['scope-b'] (PathJoin $b 'miserc.local.toml') 'b-file' 'False')
+    $ok = $ok -and (AssertSelectorOk 'wsl file fallback' $facts['wsl'] '\\wsl$\Ubuntu\pmsec-none\mise\miserc.local.toml' '' 'False')
+    $ok = $ok -and (AssertSelectorOk 'wsl MISE_ENV' $facts['wsl-env'] 'MISE_ENV' 'debian' 'False')
+    if (-not $ok) { return $false }
+
+    # Writing through scope-b touches only scope-b's file.
+    $written = InvokeWithEnv $envMap {
+      $scope = (Get-PmsecScopes $true) | Where-Object { $_.Label -eq 'scope-b' }
+      GetSelectorWriteFacts $scope
+    }
+    $ok = AssertWriteOk 'scope-b write' $written (PathJoin $b 'miserc.local.toml')
+    $ok = $ok -and (AssertSelectorFile 'scope-b file' (MisercText @('env = ["b-file", "pmsec"]')) (PathJoin $b 'miserc.local.toml'))
+    $ok = $ok -and (AssertEq 'scope-a slot untouched' 'True' ([string](Test-Path -LiteralPath (PathJoin $a 'miserc.local.toml'))))
+    return ($ok -and (AssertEq 'windows slot untouched' 'False' ([string](Test-Path -LiteralPath ($win + '\miserc.local.toml')))))
+  } finally {
+    Remove-Item -Recurse -Force -LiteralPath $h
+  }
+}
+
+T 'miserc local writer: a fresh local file holds the canonical line' {
+  $layout = NewSelectorHome
+  try {
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'fresh write' $facts $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'local bytes' ((MisercArray @((DqName 'pmsec'))) + "`n") $layout['Local'])
+    return ($ok -and (AssertSelectorNoScratch 'no backup for a fresh file' $layout['Dir']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: inherits a shared list and writes the local file only' {
+  $layout = NewSelectorHome
+  try {
+    $sharedText = MisercText @('env = ["work", "pmsec", "y"]')
+    $systemText = MisercText @('env = ["sys"]')
+    WriteSelectorFile $layout['Shared'] $sharedText
+    WriteSelectorFile $layout['System'] $systemText
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'shared inherited' $facts $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'local list' (MisercText @('env = ["work", "y", "pmsec"]')) $layout['Local'])
+    $ok = $ok -and (AssertSelectorFile 'shared unchanged' $sharedText $layout['Shared'])
+    return ($ok -and (AssertSelectorFile 'system unchanged' $systemText $layout['System']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: inherits a system list when nothing higher defines one' {
+  $layout = NewSelectorHome
+  try {
+    $systemText = MisercText @('# system', 'env = ["z"]')
+    WriteSelectorFile $layout['System'] $systemText
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'system inherited' $facts $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'local list' (MisercText @('env = ["z", "pmsec"]')) $layout['Local'])
+    return ($ok -and (AssertSelectorFile 'system unchanged' $systemText $layout['System']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: replaces the assignment and keeps every other byte' {
+  $layout = NewSelectorHome
+  try {
+    $dq = $script:DQ
+    $sq = $script:SQ
+    $original = $script:SelBom + 'a = 1' + $script:SelCrlf + 'env = [' + $sq + 'work' + $sq + ']  # keep' + $script:SelCrlf + '[t]' + $script:SelCrlf + 'k = 1'
+    $expected = $script:SelBom + 'a = 1' + $script:SelCrlf + 'env = [' + $sq + 'work' + $sq + ', ' + $dq + 'pmsec' + $dq + ']  # keep' + $script:SelCrlf + '[t]' + $script:SelCrlf + 'k = 1'
+    WriteSelectorFile $layout['Local'] $original
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'local token reused' $facts $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'BOM, CRLF, comment and tables preserved' $expected $layout['Local'])
+    $ok = $ok -and (AssertSelectorFile 'one-shot backup holds the original' $original ($layout['Local'] + '.bak'))
+    if (-not $ok) { return $false }
+
+    WriteSelectorFile $layout['Local'] (MisercText @('env = ["work"]'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'double-quoted token' $facts $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'double-quoted token stays' (MisercText @('env = ["work", "pmsec"]')) $layout['Local'])
+    if (-not $ok) { return $false }
+
+    WriteSelectorFile $layout['Local'] ('x = 1' + $script:NL + 'env = ["a"]')
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'no final newline' $facts $layout['Local']
+    return ($ok -and (AssertSelectorFile 'no final newline stays missing' ('x = 1' + $script:NL + 'env = ["a", "pmsec"]') $layout['Local']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: re-running with unchanged inputs is byte-identical' {
+  $layout = NewSelectorHome
+  try {
+    $original = MisercText @('note = 1', 'env = ["work"]', '[tool]', 'x = 1')
+    WriteSelectorFile $layout['Local'] $original
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $first = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'first run' $first $layout['Local']
+    $firstText = ReadSelectorFile $layout['Local']
+    $firstBak = ReadSelectorFile ($layout['Local'] + '.bak')
+    $ok = $ok -and (AssertSelectorFile 'first write shape' (MisercText @('note = 1', 'env = ["work", "pmsec"]', '[tool]', 'x = 1')) $layout['Local'])
+    if (-not $ok) { return $false }
+    $second = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'second run' $second $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'bytes unchanged' $firstText $layout['Local'])
+    $ok = $ok -and (AssertSelectorFile 'first backup preserved' $firstBak ($layout['Local'] + '.bak'))
+    return ($ok -and (AssertSelectorFile 'the backup is the original' $original ($layout['Local'] + '.bak')))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: MISE_ENV never feeds inheritance' {
+  $layout = NewSelectorHome
+  try {
+    $scopeEnv = @{ 'MISE_ENV' = 'a,b'; 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'no definition' $facts $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'local ignores MISE_ENV' ((MisercArray @((DqName 'pmsec'))) + "`n") $layout['Local'])
+    if (-not $ok) { return $false }
+    Remove-Item -LiteralPath $layout['Local'] -Force
+    Remove-Item -LiteralPath ($layout['Local'] + '.bak') -Force -ErrorAction Ignore
+    WriteSelectorFile $layout['Shared'] (MisercText @('env = ["y"]'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'shared definition' $facts $layout['Local']
+    return ($ok -and (AssertSelectorFile 'the file list is inherited' (MisercText @('env = ["y", "pmsec"]')) $layout['Local']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: a local env = [] becomes [pmsec]' {
+  $layout = NewSelectorHome
+  try {
+    WriteSelectorFile $layout['Local'] (MisercText @('env = []'))
+    $sharedText = MisercText @('env = ["shared"]')
+    WriteSelectorFile $layout['Shared'] $sharedText
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteOk 'empty local array' $facts $layout['Local']
+    $ok = $ok -and (AssertSelectorFile 'only pmsec remains' (MisercText @('env = ["pmsec"]')) $layout['Local'])
+    return ($ok -and (AssertSelectorFile 'shared unchanged' $sharedText $layout['Shared']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: failures leave the target and its backup untouched' {
+  $layout = NewSelectorHome
+  try {
+    $original = MisercText @('# keep me', 'x = 1')
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+
+    # A malformed shared file aborts before anything is planned.
+    WriteSelectorFile $layout['Local'] $original
+    WriteSelectorFile $layout['Shared'] (MisercText @('env = "work"'))
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteFails 'shared parse error' $facts $layout['Shared'] 'env must be an array'
+    $ok = $ok -and (AssertSelectorFile 'local untouched' $original $layout['Local'])
+    $ok = $ok -and (AssertSelectorNoScratch 'no backup or scratch' $layout['Dir'])
+    if (-not $ok) { return $false }
+
+    # A conflicting shape in the target is rejected by the planner.
+    Remove-Item -LiteralPath $layout['Shared'] -Force
+    $conflict = MisercText @('[env]', 'x = 1')
+    WriteSelectorFile $layout['Local'] $conflict
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteFails 'target collision' $facts $layout['Local'] 'env table conflicts with the env array'
+    $ok = $ok -and (AssertSelectorFile 'collision target untouched' $conflict $layout['Local'])
+    $ok = $ok -and (AssertSelectorNoScratch 'collision: no backup or scratch' $layout['Dir'])
+    if (-not $ok) { return $false }
+
+    # A directory in the shared slot is a read error, not "absent".
+    WriteSelectorFile $layout['Local'] $original
+    [void](New-Item -ItemType Directory -Path $layout['Shared'] -Force)
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteFails 'unreadable shared slot' $facts $layout['Shared'] 'cannot read file'
+    $ok = $ok -and (AssertSelectorFile 'unreadable shared: local untouched' $original $layout['Local'])
+    $ok = $ok -and (AssertSelectorNoScratch 'unreadable shared: no backup or scratch' $layout['Dir'])
+    if (-not $ok) { return $false }
+
+    if (-not (TestSelectorPermissionSemantics)) {
+      Write-Host 'SKIP  local writer: chmod 000 shared file (POSIX permission semantics only)'
+      return $true
+    }
+    Remove-Item -Recurse -Force -LiteralPath $layout['Shared']
+    WriteSelectorFile $layout['Shared'] (MisercText @('env = ["a"]'))
+    & chmod 000 $layout['Shared'] 2>$null
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertWriteFails 'unreadable shared file' $facts $layout['Shared'] 'cannot read file'
+    $ok = $ok -and (AssertSelectorFile 'unreadable shared file: local untouched' $original $layout['Local'])
+    return ($ok -and (AssertSelectorNoScratch 'unreadable shared file: no backup or scratch' $layout['Dir']))
+  } finally {
+    RemoveSelectorHome $layout
+  }
+}
+
+# The writer's own failure is the one case that is not a selector rejection:
+# WriteAtomic already names the failing step, and the contract keeps that label
+# instead of inventing a "cannot write file" reason of its own.
+T 'miserc local writer: a write failure keeps the WriteAtomic label' {
+  if (-not (TestSelectorPermissionSemantics)) {
+    Write-Host 'SKIP  local writer: unwritable directory (POSIX permission semantics only)'
+    return $true
+  }
+  $layout = NewSelectorHome
+  try {
+    $original = MisercText @('env = ["work"]')
+    WriteSelectorFile $layout['Local'] $original
+    & chmod 500 $layout['Dir'] 2>$null
+    $scopeEnv = @{ 'MISE_CONFIG_DIR' = $layout['Dir']; 'MISE_SYSTEM_CONFIG_DIR' = $layout['Sys'] }
+    $facts = InvokeSelectorScope 'sel' $scopeEnv { param($scope) GetSelectorWriteFacts $scope }
+    $ok = AssertEq 'write rejected' 'False' ([string]$facts['Ok'])
+    $ok = $ok -and (AssertMatch 'raw WriteAtomic label' '^WriteAtomic ' $facts['Message'])
+    $ok = $ok -and (AssertEq 'no selector reason invented' '' $facts['Reason'])
+    $ok = $ok -and (AssertSelectorFile 'target untouched' $original $layout['Local'])
+    return ($ok -and (AssertSelectorNoScratch 'no backup or scratch' $layout['Dir']))
+  } finally {
+    & chmod 700 $layout['Dir'] 2>$null
+    RemoveSelectorHome $layout
+  }
+}
+
+T 'miserc local writer: a rejected write creates no directory' {
+  $h = NewHome
+  try {
+    $sys = PathJoin $h 'sys'
+    [void](New-Item -ItemType Directory -Path $sys -Force)
+    $systemText = MisercText @('env = "work"')
+    WriteSelectorFile (PathJoin $sys 'miserc.toml') $systemText
+    $missing = PathJoin $h 'missing' 'deep'
+    $envMap = NewMiseEnvScrub
+    $envMap['PMSEC_FAKE_SCOPES'] = 'sel|/home/user|linux'
+    $envMap['PMSEC_FAKE_SCOPE_DATA'] = (NewFakeScopeData 'sel' $null @{ 'MISE_CONFIG_DIR' = $missing; 'MISE_SYSTEM_CONFIG_DIR' = $sys })
+    $facts = InvokeWithEnv $envMap {
+      $scope = (Get-PmsecScopes $true)[0]
+      GetSelectorWriteFacts $scope
+    }
+    $ok = AssertWriteFails 'missing target directory' $facts (PathJoin $sys 'miserc.toml') 'env must be an array'
+    return ($ok -and (AssertEq 'no directory was created' 'False' ([string](Test-Path -LiteralPath (PathJoin $h 'missing')))))
+  } finally {
+    Remove-Item -Recurse -Force -LiteralPath $h
+  }
+}
+
 # ---------- mise layering: CLI smoke ----------
 
 T 'legacy CLI smoke: enable and check on the default fake scope are unchanged' {
