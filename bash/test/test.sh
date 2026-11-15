@@ -81,12 +81,19 @@ assert_match() {
 
 T() {
   local name="$1"; shift
-  if "$@"; then
+  # A test fails when it returns nonzero *or* recorded an assertion failure.
+  # The second half is what makes cleanup unable to mask anything: a trailing
+  # `rm_tree` (or any other successful command) used to become the function's
+  # status and turn a failed assertion into a pass. LAST_FAIL is the record —
+  # every assertion sets it only when it fails, so a non-empty value after the
+  # call is a failure no matter what the function returned.
+  LAST_FAIL=""
+  if "$@" && [ -z "$LAST_FAIL" ]; then
     PASS=$((PASS+1))
     printf 'PASS  %s\n' "$name"
   else
     FAIL=$((FAIL+1))
-    printf 'FAIL  %s\n%s\n' "$name" "$LAST_FAIL"
+    printf 'FAIL  %s\n%s\n' "$name" "${LAST_FAIL:-(no assertion detail)}"
   fi
 }
 
@@ -1157,6 +1164,71 @@ TXT
   accept_case "env inside a table is not top-level" "$text" 0 ""
 }
 
+# A line-start `[` inside an open array or inline table is a value, never a
+# table header, and a line-start `env` inside one is a table member, never the
+# root key: neither the root region nor the assignment may reach into a
+# container that has not closed yet.
+t_miserc_parse_nested_containers() {
+  accept_case "nested array before env" 'items = [
+  [1, 2],
+]
+env = ["work"]' 1 'work' || return 1
+  accept_case "nested array after env" 'env = ["work"]
+items = [
+  [1, 2],
+]' 1 'work' || return 1
+  accept_case "inline table on one line" 'a = { env = ["fake"] }
+env = ["real"]' 1 'real' || return 1
+  accept_case "inline table across lines" 'a = {
+  env = ["fake"],
+}
+env = ["real"]' 1 'real' || return 1
+  # Brackets and env-like text inside strings of a nested array are opaque too.
+  accept_case "brackets inside strings" 'a = "[env]"
+b = [
+  "[env]",
+  "env = [\"fake\"]",
+]
+env = ["real"]' 1 'real' || return 1
+  # A header-shaped line inside an array must not end the root region either:
+  # the `[b]` below is the first real header, so `env` belongs to that table.
+  accept_case "header-shaped array element" 'a = [
+  "[env]",
+]
+[b]
+x = 1
+env = ["scoped"]' 0 '' || return 1
+  # `[[items]]` is a real header too: it ends the root region like `[items]`,
+  # so an `env` key under it is scoped to that table.
+  accept_case "array-of-tables header ends the root region" '[[items]]
+x = 1
+env = ["scoped"]' 0 '' || return 1
+  accept_case "env before an array-of-tables header" 'env = ["work"]
+[[items]]
+x = 1' 1 'work'
+}
+
+# A basic (`"""`) block honours `\`, so an escaped triple quote is content and
+# the block keeps going; a literal (`'''`) block has no escape semantics, so
+# there the first closer always wins.
+t_miserc_parse_multiline_escape_closer() {
+  accept_case "escaped triple quote in a basic block" 'note = """
+\"""
+env = ["fake"]
+"""
+env = ["real"]' 1 'real' || return 1
+  # `\\` is an escaped backslash, so the triple quote right after it closes.
+  accept_case "escaped backslash then a closer" 'note = """
+\\"""
+env = ["real"]' 1 'real' || return 1
+  accept_case "literal block closes on the first closer" "note = '''
+\\'''
+env = ['real']" 1 'real' || return 1
+  # The escaped closer really is content: a block that stops there never closes.
+  reject_case misc 'doc = """
+\"""' "unterminated string in file"
+}
+
 # A one-line string that reaches the end of its line ends there: the subset does
 # not validate general TOML, so the rest of the line is string content and
 # scanning resumes on the next line. `unterminated string in file` is reserved
@@ -1241,6 +1313,44 @@ t_miserc_parse_reject_malformed_key() {
   reject_case misc 'env = ["a"]
 
 env ["b"]' "duplicate top-level env assignment"
+}
+
+# Decision (PR #5, finding A4): comments and newlines between the key and `=`
+# are accepted, matching the other three ports. Strict TOML rejects the shape,
+# but a file mise cannot read is never made authoritative by accepting it, so
+# parity costs nothing here.
+t_miserc_parse_trivia_before_equals() {
+  local out
+  accept_case "comment between key and =" 'env # c
+= ["work"]' 1 'work' || return 1
+  accept_case "newline between key and =" 'env
+= ["work"]' 1 'work' || return 1
+  accept_case "comment line between key and =" 'env
+# c
+= ["work"]' 1 'work' || return 1
+  accept_case "tab before the comment" $'env\t# c\n= ["a", "b"]' 1 'a|b' || return 1
+  # The trivia sits inside [START, END): the rewrite consumes it with the key
+  # and the value instead of leaving a stray comment behind.
+  out=$(miserc_write misc 'env # c
+= ["work"]' work)
+  assert_eq "write: comment between key and = is replaced too" 'env = ["work", "pmsec"]' \
+    "$(field out "$out")" || return 1
+  # Skipping trivia never invents an `=`: a bare `env` stays malformed.
+  reject_case misc 'env # c
+x = 1' "malformed env assignment"
+}
+
+# A bare `env` with nothing after it is a half-written assignment, not "not
+# defined": reporting "not defined" would let the writer append a second env
+# array next to the broken one.
+t_miserc_parse_bare_env_at_eof() {
+  reject_case misc 'env' "malformed env assignment" || return 1
+  reject_case misc 'env
+' "malformed env assignment" || return 1
+  reject_case misc 'env   ' "malformed env assignment" || return 1
+  reject_case misc 'env # no value' "malformed env assignment" || return 1
+  reject_case misc 'env
+# only a comment' "malformed env assignment"
 }
 
 t_miserc_parse_reject_separators() {
@@ -1346,6 +1456,124 @@ x = 1' work)
     'doc = """<LF>[tool]<LF>"""<LF>env = ["work", "pmsec"]<LF>[real]' "$(field out "$out")"
 }
 
+# Neither the replaced range nor the insertion point may land inside an open
+# array or inline table: a nested `[\n[1, 2],\n]` looks like a header at line
+# start, and a writer that believed it would splice the new array into it.
+t_miserc_write_nested_containers() {
+  local out
+  out=$(miserc_write misc 'items = [
+  [1, 2],
+]
+env = ["work"]' work)
+  assert_eq "write nested: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "write nested: replaces the real assignment only" \
+    'items = [<LF>  [1, 2],<LF>]<LF>env = ["work", "pmsec"]' "$(field out "$out")" || return 1
+
+  out=$(miserc_write misc 'items = [
+  [1, 2],
+]' work)
+  assert_eq "write nested: inserted after the closed array" \
+    'items = [<LF>  [1, 2],<LF>]<LF>env = ["work", "pmsec"]<LF>' "$(field out "$out")" || return 1
+
+  out=$(miserc_write misc 'items = [
+  [1],
+]
+[tool]
+x = 1' work)
+  assert_eq "write nested: insertion point is the real header" \
+    'items = [<LF>  [1],<LF>]<LF>env = ["work", "pmsec"]<LF>[tool]<LF>x = 1' "$(field out "$out")"
+}
+
+# A truncated file that ends inside an array or inline table has no usable EOF
+# boundary: the insertion point is the line that opened the outermost still-open
+# value, so the new assignment lands ABOVE the broken value instead of becoming
+# one more element of it. A header still wins, and a value that closes normally
+# leaves the boundary at EOF exactly as before.
+t_miserc_write_open_value_at_eof() {
+  local out
+  out=$(miserc_write misc 'name = "x"
+items = [
+  1,
+')
+  assert_eq "write open value: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "write open value: unclosed array after a key" \
+    'name = "x"<LF>env = ["pmsec"]<LF>items = [<LF>  1,<LF>' "$(field out "$out")" || return 1
+
+  # Same shape without a preceding key: the file's first line is the boundary,
+  # so the assignment goes above it with no blank line invented in front.
+  out=$(miserc_write misc 'items = [
+  1,
+')
+  assert_eq "write open value: unclosed array on the first line" \
+    'env = ["pmsec"]<LF>items = [<LF>  1,<LF>' "$(field out "$out")" || return 1
+
+  # Inline tables leave the depth open in exactly the same way.
+  out=$(miserc_write misc 'name = "x"
+x = {
+')
+  assert_eq "write open value: unclosed inline table after a key" \
+    'name = "x"<LF>env = ["pmsec"]<LF>x = {<LF>' "$(field out "$out")" || return 1
+  out=$(miserc_write misc 'x = {
+')
+  assert_eq "write open value: unclosed inline table on the first line" \
+    'env = ["pmsec"]<LF>x = {<LF>' "$(field out "$out")" || return 1
+
+  # Only the OUTERMOST opener matters: a nested array still belongs to the line
+  # the outer `[` sits on.
+  out=$(miserc_write misc 'name = "x"
+items = [
+  [1,
+')
+  assert_eq "write open value: nested unclosed array uses the outer line" \
+    'name = "x"<LF>env = ["pmsec"]<LF>items = [<LF>  [1,<LF>' "$(field out "$out")" || return 1
+
+  # A closed value earlier in the file must not pin the boundary: the record
+  # tracks the value that is still open at EOF.
+  out=$(miserc_write misc 'a = [1]
+name = "x"
+items = [
+')
+  assert_eq "write open value: a closed value does not move the boundary" \
+    'a = [1]<LF>name = "x"<LF>env = ["pmsec"]<LF>items = [<LF>' "$(field out "$out")" || return 1
+
+  # A depth-0 header already ends the root region above any later open value.
+  out=$(miserc_write misc '[tool]
+x = [
+')
+  assert_eq "write open value: the first header wins over a later open value" \
+    'env = ["pmsec"]<LF>[tool]<LF>x = [<LF>' "$(field out "$out")" || return 1
+
+  # Controls: a value that closes leaves the boundary at EOF, or at the header.
+  out=$(miserc_write misc 'items = [
+  1,
+]')
+  assert_eq "write open value: closed array still inserts at EOF" \
+    'items = [<LF>  1,<LF>]<LF>env = ["pmsec"]<LF>' "$(field out "$out")" || return 1
+  out=$(miserc_write misc 'items = [
+  1,
+]
+[tool]
+x = 1')
+  assert_eq "write open value: closed array still inserts before the header" \
+    'items = [<LF>  1,<LF>]<LF>env = ["pmsec"]<LF>[tool]<LF>x = 1' "$(field out "$out")" || return 1
+
+  # An existing assignment is replaced in place whatever follows it, so a broken
+  # value later in the file never moves the spliced range.
+  out=$(miserc_write misc 'env = []
+items = [
+')
+  assert_eq "write open value: the existing assignment is still replaced" \
+    'env = ["pmsec"]<LF>items = [<LF>' "$(field out "$out")" || return 1
+
+  # Inherited names land in the same spot, byte for byte.
+  out=$(miserc_write misc 'name = "x"
+items = [
+  1,
+' work)
+  assert_eq "write open value: inherited names use the same boundary" \
+    'name = "x"<LF>env = ["work", "pmsec"]<LF>items = [<LF>  1,<LF>' "$(field out "$out")"
+}
+
 t_miserc_write_reuses_local_tokens() {
   local out
   out=$(miserc_write misc "env = ['work']" work)
@@ -1389,7 +1617,7 @@ t_miserc_write_rejects_unrepresentable() {
 # The env key already being a table anywhere in the file means the array and the
 # table would collide, so the write fails instead of producing invalid TOML.
 t_miserc_write_rejects_conflicts() {
-  local out
+  local out text
   out=$(miserc_write misc '[env]
 x = 1')
   assert_eq "write: [env] table (rc)" "1" "$(field rc "$out")" || return 1
@@ -1402,7 +1630,36 @@ x = 1')
   assert_eq "write: dotted env key (reason)" "env table conflicts with the env array" "$(field reason "$out")" || return 1
   out=$(miserc_write misc '[tool]
 env.foo = 1')
-  assert_eq "write: scoped dotted env key (reason)" "env table conflicts with the env array" "$(field reason "$out")"
+  assert_eq "write: scoped dotted env key (reason)" "env table conflicts with the env array" "$(field reason "$out")" || return 1
+
+  # Every header spelling whose FIRST decoded segment is `env` names the key the
+  # array owns, however it is quoted and however deep the table goes.
+  for text in '[ env ]' '["env"]' "['env']" '[ "env" ]' '[env.foo]' '["env".x]' '[env."foo"]'; do
+    out=$(miserc_write misc "$text
+a = 1")
+    assert_eq "write: header $text (rc)" "1" "$(field rc "$out")" || return 1
+    assert_eq "write: header $text (reason)" "env table conflicts with the env array" \
+      "$(field reason "$out")" || return 1
+    assert_eq "write: header $text (no output)" "" "$(field set "$out")" || return 1
+  done
+  # A dotted root key is the same table written inline, in every spelling.
+  for text in 'env.foo = 1' 'env . foo = 1' 'env."foo" = 1' '"env".foo = 1' "'env'.foo = 1"; do
+    out=$(miserc_write misc "$text")
+    assert_eq "write: key $text (reason)" "env table conflicts with the env array" \
+      "$(field reason "$out")" || return 1
+  done
+  # Not the env key: a deeper table, a longer first segment and an unrelated
+  # env-like key all leave the write possible, and the new array goes in front
+  # of the first real header.
+  out=$(miserc_write misc '[x.env]
+a = 1
+[envsub]
+b = 2
+envelope = 1' work)
+  assert_eq "write: unrelated env-like keys (rc)" "0" "$(field rc "$out")" || return 1
+  assert_eq "write: unrelated env-like keys (insertion)" \
+    'env = ["work", "pmsec"]<LF>[x.env]<LF>a = 1<LF>[envsub]<LF>b = 2<LF>envelope = 1' \
+    "$(field out "$out")"
 }
 
 t_miserc_write_idempotent() {
@@ -1524,7 +1781,7 @@ t_selector_mise_env_branch() {
   out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="work,pmsec")
   assert_eq "selector[MISE_ENV path]: MISE_ENV" "MISE_ENV" "$(field path "$out")" || return 1
   assert_eq "selector[MISE_ENV path]: wired last" "1" "$(field wired "$out")" || return 1
-  assert_eq "selector[MISE_ENV path]: no error path" "" "$(field errpath "$out")"
+  assert_eq "selector[MISE_ENV path]: no error path" "" "$(field errpath "$out")" || return 1
   rm_tree "$h"
 }
 
@@ -1547,7 +1804,7 @@ t_selector_mise_env_no_filesystem() {
   chmod 000 "$d/miserc.local.toml"
   out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="pmsec")
   assert_eq "MISE_ENV fs: rc over an unreadable file" "0" "$(field rc "$out")" || return 1
-  assert_eq "MISE_ENV fs: wired over an unreadable file" "1" "$(field wired "$out")"
+  assert_eq "MISE_ENV fs: wired over an unreadable file" "1" "$(field wired "$out")" || return 1
   rm_tree "$h"
 }
 
@@ -1562,7 +1819,7 @@ t_selector_mise_env_empty_falls_back() {
   assert_eq "empty MISE_ENV: names" "work" "$(field names "$out")" || return 1
   out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
   assert_eq "unset MISE_ENV: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
-  assert_eq "unset MISE_ENV: names" "work" "$(field names "$out")"
+  assert_eq "unset MISE_ENV: names" "work" "$(field names "$out")" || return 1
   rm_tree "$h"
 }
 
@@ -1585,7 +1842,7 @@ t_selector_file_precedence() {
   assert_eq "local defines: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
   assert_eq "local defines: names" "work|pmsec" "$(field names "$out")" || return 1
   assert_eq "local defines: wired" "1" "$(field wired "$out")" || return 1
-  assert_eq "local defines: no error" "" "$(field errreason "$out")"
+  assert_eq "local defines: no error" "" "$(field errreason "$out")" || return 1
 
   rm -f "$d/miserc.local.toml"
   chmod 644 "$d/miserc.toml"
@@ -1594,14 +1851,32 @@ t_selector_file_precedence() {
   assert_eq "shared defines: path" "$d/miserc.toml" "$(field path "$out")" || return 1
   assert_eq "shared defines: names" "shared" "$(field names "$out")" || return 1
   assert_eq "shared defines: wired" "0" "$(field wired "$out")" || return 1
-  assert_eq "shared defines: no error" "" "$(field errreason "$out")"
+  assert_eq "shared defines: no error" "" "$(field errreason "$out")" || return 1
 
   rm -f "$d/miserc.toml"
   chmod 644 "$s/miserc.toml"
   out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
   assert_eq "system defines: rc" "0" "$(field rc "$out")" || return 1
   assert_eq "system defines: path" "$s/miserc.toml" "$(field path "$out")" || return 1
-  assert_eq "system defines: names" "system" "$(field names "$out")"
+  assert_eq "system defines: names" "system" "$(field names "$out")" || return 1
+  rm_tree "$h"
+}
+
+# The selector reads through the same scan, so a nested array before the
+# assignment must not change which list is adopted or which file is attributed.
+t_selector_nested_containers() {
+  local h d s out
+  h=$(setup_home); d="$h/mise"; s="$h/sys"
+  mkdir -p "$d" "$s"
+  write_file "$d/miserc.local.toml" 'items = [
+  [1, 2],
+]
+env = ["work", "pmsec"]'
+  out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
+  assert_eq "selector nested: rc" "0" "$(field rc "$out")" || return 1
+  assert_eq "selector nested: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
+  assert_eq "selector nested: names" "work|pmsec" "$(field names "$out")" || return 1
+  assert_eq "selector nested: wired" "1" "$(field wired "$out")" || return 1
   rm_tree "$h"
 }
 
@@ -1617,7 +1892,7 @@ t_selector_empty_array_stops_inheritance() {
   assert_eq "env = []: rc" "0" "$(field rc "$out")" || return 1
   assert_eq "env = []: path" "$d/miserc.local.toml" "$(field path "$out")" || return 1
   assert_eq "env = []: nenv" "0" "$(field nenv "$out")" || return 1
-  assert_eq "env = []: wired" "0" "$(field wired "$out")"
+  assert_eq "env = []: wired" "0" "$(field wired "$out")" || return 1
   rm_tree "$h"
 }
 
@@ -1629,7 +1904,7 @@ t_selector_no_definition() {
   assert_eq "no definition: rc" "0" "$(field rc "$out")" || return 1
   assert_eq "no definition: path is the local file" "$d/miserc.local.toml" "$(field path "$out")" || return 1
   assert_eq "no definition: nenv" "0" "$(field nenv "$out")" || return 1
-  assert_eq "no definition: wired" "0" "$(field wired "$out")"
+  assert_eq "no definition: wired" "0" "$(field wired "$out")" || return 1
   rm_tree "$h"
 }
 
@@ -1662,7 +1937,7 @@ t_selector_fails_closed() {
   rm -f "$d/miserc.local.toml"
   mkdir "$d/miserc.local.toml"
   out=$(miserc_selector MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
-  assert_eq "selector directory: reason" "cannot read file" "$(field errreason "$out")"
+  assert_eq "selector directory: reason" "cannot read file" "$(field errreason "$out")" || return 1
   rm_tree "$h"
 }
 
@@ -1674,7 +1949,7 @@ t_local_write_fresh() {
   assert_eq "write fresh: rc" "0" "$(field rc "$out")" || return 1
   assert_eq "write fresh: no error" "" "$(field errreason "$out")" || return 1
   assert_file_eq "write fresh: local file bytes" 'env = ["pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
-  assert_eq "write fresh: no .bak or scratch" "0" "$(count_scratch "$d")"
+  assert_eq "write fresh: no .bak or scratch" "0" "$(count_scratch "$d")" || return 1
   rm_tree "$h"
 }
 
@@ -1694,7 +1969,7 @@ t_local_write_inherits_shared() {
   assert_eq "write shared: rc" "0" "$(field rc "$out")" || return 1
   assert_file_eq "write shared: local inherits minus pmsec plus pmsec" \
     'env = ["work", "y", "pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
-  assert_file_eq "write shared: shared unchanged" "$expected_shared" "$d/miserc.toml"
+  assert_file_eq "write shared: shared unchanged" "$expected_shared" "$d/miserc.toml" || return 1
   rm_tree "$h"
 }
 
@@ -1710,7 +1985,7 @@ env = ["z"]
   assert_eq "write system: rc" "0" "$(field rc "$out")" || return 1
   assert_file_eq "write system: local inherits the system list" \
     'env = ["z", "pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
-  assert_file_eq "write system: system unchanged" "$expected_sys" "$s/miserc.toml"
+  assert_file_eq "write system: system unchanged" "$expected_sys" "$s/miserc.toml" || return 1
   rm_tree "$h"
 }
 
@@ -1733,7 +2008,7 @@ t_local_write_replaces_assignment() {
   write_file "$d/miserc.local.toml" 'env = ["work"]'
   out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
   assert_eq "write local: double-quoted rc" "0" "$(field rc "$out")" || return 1
-  assert_file_eq "write local: double-quoted token stays" 'env = ["work", "pmsec"]' "$d/miserc.local.toml"
+  assert_file_eq "write local: double-quoted token stays" 'env = ["work", "pmsec"]' "$d/miserc.local.toml" || return 1
   rm_tree "$h"
 }
 
@@ -1758,7 +2033,7 @@ x = 1
 env = ["work", "pmsec"]
 [tool]
 x = 1
-' "$d/miserc.local.toml"
+' "$d/miserc.local.toml" || return 1
   rm_tree "$h"
 }
 
@@ -1775,7 +2050,7 @@ t_local_write_ignores_mise_env() {
   write_file "$d/miserc.toml" 'env = ["y"]'
   out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s" MISE_ENV="a,b")
   assert_eq "write ignores MISE_ENV: shared rc" "0" "$(field rc "$out")" || return 1
-  assert_file_eq "write ignores MISE_ENV: shared list wins" 'env = ["y", "pmsec"]'$'\n' "$d/miserc.local.toml"
+  assert_file_eq "write ignores MISE_ENV: shared list wins" 'env = ["y", "pmsec"]'$'\n' "$d/miserc.local.toml" || return 1
   rm_tree "$h"
 }
 
@@ -1787,7 +2062,9 @@ t_local_write_local_empty_array() {
   write_file "$d/miserc.toml" 'env = ["shared"]'
   out=$(miserc_local_write MISE_CONFIG_DIR="$d" MISE_SYSTEM_CONFIG_DIR="$s")
   assert_eq "write local []: rc" "0" "$(field rc "$out")" || return 1
-  assert_file_eq "write local []: becomes pmsec only" 'env = ["pmsec"]'$'\n' "$d/miserc.local.toml"
+  # The fixture has no final newline (write_file writes none) and the writer
+  # keeps it that way, so the expectation must not invent one either.
+  assert_file_eq "write local []: becomes pmsec only" 'env = ["pmsec"]' "$d/miserc.local.toml" || return 1
   rm_tree "$h"
 }
 
@@ -1837,7 +2114,7 @@ x = 1
   assert_eq "write fail unreadable: reason" "cannot read file" "$(field errreason "$out")" || return 1
   assert_eq "write fail unreadable: path" "$d/miserc.toml" "$(field errpath "$out")" || return 1
   assert_file_eq "write fail unreadable: local untouched" "$original" "$d/miserc.local.toml" || return 1
-  assert_eq "write fail unreadable: no .bak or scratch" "0" "$(count_scratch "$d")"
+  assert_eq "write fail unreadable: no .bak or scratch" "0" "$(count_scratch "$d")" || return 1
   rm_tree "$h"
 }
 
@@ -1870,6 +2147,8 @@ T "miserc parse: no top-level env reads as not defined" t_miserc_parse_absent
 T "miserc parse: accepted array shapes and tokens" t_miserc_parse_shapes
 T "miserc parse: START/END byte offsets splice back exactly" t_miserc_parse_splice_offsets
 T "miserc parse: strings and comments stay opaque" t_miserc_parse_ignores_strings_and_comments
+T "miserc parse: nested arrays and inline tables stay opaque" t_miserc_parse_nested_containers
+T "miserc parse: escaped triple quotes in a basic string" t_miserc_parse_multiline_escape_closer
 T "miserc parse: one-line strings end with their line" t_miserc_parse_line_terminated_strings
 T "miserc parse: quoted env key rejected" t_miserc_parse_reject_quoted_key
 T "miserc parse: duplicate top-level env rejected" t_miserc_parse_reject_duplicate
@@ -1878,6 +2157,8 @@ T "miserc parse: non-string array elements rejected" t_miserc_parse_reject_eleme
 T "miserc parse: escapes and multiline elements rejected" t_miserc_parse_reject_escapes_and_multiline_elements
 T "miserc parse: unterminated assignments rejected" t_miserc_parse_reject_unterminated
 T "miserc parse: malformed env key rejected" t_miserc_parse_reject_malformed_key
+T "miserc parse: comments and newlines before the equals sign" t_miserc_parse_trivia_before_equals
+T "miserc parse: bare env at EOF rejected" t_miserc_parse_bare_env_at_eof
 T "miserc parse: malformed array separators rejected" t_miserc_parse_reject_separators
 T "miserc parse: trailing junk after the array rejected" t_miserc_parse_reject_trailing_junk
 T "miserc parse: unterminated unrelated string rejected" t_miserc_parse_reject_unterminated_file_string
@@ -1887,6 +2168,8 @@ T "miserc write: pmsec last and once" t_miserc_write_pmsec_last_once
 T "miserc write: multiline array collapsed" t_miserc_write_collapses_multiline
 T "miserc write: surrounding bytes preserved" t_miserc_write_preserves_bytes
 T "miserc write: absent assignment inserted before the first table" t_miserc_write_inserts_before_first_table
+T "miserc write: nested containers never capture the new array" t_miserc_write_nested_containers
+T "miserc write: a value open at EOF inserts above its opening line" t_miserc_write_open_value_at_eof
 T "miserc write: existing tokens reused" t_miserc_write_reuses_local_tokens
 T "miserc write: canonical quoting for new names" t_miserc_write_canonical_quoting
 T "miserc write: unrepresentable names fail closed" t_miserc_write_rejects_unrepresentable
@@ -1897,6 +2180,7 @@ T "selector: MISE_ENV tokenization and exact membership" t_selector_mise_env_bra
 T "selector: MISE_ENV branch never touches the filesystem" t_selector_mise_env_no_filesystem
 T "selector: empty and unset MISE_ENV fall back to files" t_selector_mise_env_empty_falls_back
 T "selector: local / shared / system precedence" t_selector_file_precedence
+T "selector: nested containers do not change the adopted list" t_selector_nested_containers
 T "selector: env = [] stops inheritance" t_selector_empty_array_stops_inheritance
 T "selector: no definition attributes the local path" t_selector_no_definition
 T "selector: parse and read errors fail closed" t_selector_fails_closed

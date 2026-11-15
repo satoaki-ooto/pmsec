@@ -565,8 +565,15 @@ _ME_CONFLICT=0
 _ME_VALUES=()
 _ME_TOKENS=()
 _ME_TOKEN=""
-# Glob for "a byte that ends a plain run inside a line": quote or comment.
-_ME_STOP='["'"'"'#]'
+# Decoded first key segment of a header or key line, and the byte just past it
+# (see _miseconf_first_segment). _ME_KEY classifies a quoted key: "dotted" for
+# `"env".x`, "assignment" for `"env" = ...`, "" for anything else.
+_ME_SEG=""
+_ME_SEG_END=0
+_ME_KEY=""
+# Glob for "a byte that ends a plain run inside a line": quotes, comment, and
+# the brackets that open or close an array or an inline table.
+_ME_STOP='[]{}["'"'"'#]'
 
 _miseconf_fail() {
   MISEC_ERROR_PATH="$_ME_LABEL"
@@ -664,9 +671,22 @@ _miseconf_skip_ws_comments() {
 }
 
 # Look for $1 in the rest of the current line. When found the cursor lands just
-# past it; otherwise it lands at the end of the line.
+# past it; otherwise it lands at the end of the line. A basic (`"""`) block
+# honours `\`, so an escape pair is skipped whole: `\"""` is content, and only an
+# unescaped run of three quotes closes the block. A literal (`'''`) block has no
+# escapes at all, so there the first closer always wins (PR #5, finding A3).
 _miseconf_close_on_line() {
-  local tok="$1" seg skip
+  local tok="$1" seg skip i
+  if [ "$tok" = '"""' ]; then
+    i=$_ME_POS
+    while [ "$i" -lt "$_ME_LEN" ]; do
+      if [ "${_ME_LINE:i:1}" = '\' ]; then i=$((i+2)); continue; fi
+      if [ "${_ME_LINE:i:3}" = '"""' ]; then _ME_POS=$((i+3)); return 0; fi
+      i=$((i+1))
+    done
+    _ME_POS=$_ME_LEN
+    return 1
+  fi
   seg="${_ME_LINE:_ME_POS}"
   case "$seg" in
     *"$tok"*)
@@ -719,46 +739,97 @@ _miseconf_is_dotted() {
   return 1
 }
 
-# Is the quoted token at _ME_POS a top-level `"env" = ...` assignment?
-_miseconf_quoted_env_assignment() {
-  local j=$((_ME_POS+1)) q c out=""
-  q="${_ME_LINE:_ME_POS:1}"
-  case "$q" in '"'|"'") ;; *) return 1 ;; esac
-  # `"""`/`'''` open a multiline string, never a key.
-  [ "${_ME_LINE:_ME_POS:3}" = "$q$q$q" ] && return 1
-  while [ "$j" -lt "$_ME_LEN" ]; do
-    c="${_ME_LINE:j:1}"
-    if [ "$q" = '"' ] && [ "$c" = '\' ]; then j=$((j+2)); continue; fi
-    [ "$c" = "$q" ] && break
-    out="$out$c"
-    j=$((j+1))
-  done
-  [ "$j" -lt "$_ME_LEN" ] || return 1
-  [ "$out" = "env" ] || return 1
-  j=$((j+1))
-  while [ "$j" -lt "$_ME_LEN" ]; do
-    case "${_ME_LINE:j:1}" in
-      ' '|$'\t'|$'\r') j=$((j+1)) ;;
-      '=') return 0 ;;
-      *) return 1 ;;
-    esac
-  done
-  return 1
-}
-
-# Is the `[`/`[[` table header at _ME_POS one of the env table forms? `[env]`
-# and `[[env]]` describe the same key the array assignment owns.
-_miseconf_header_is_env() {
-  local j=$((_ME_POS+1)) c name="" len=0
-  [ "${_ME_LINE:j:1}" = "[" ] && j=$((j+1))
+# Decode the first `.`-separated key segment starting at byte $1 of the current
+# line into _ME_SEG, and record the byte just past it in _ME_SEG_END. A quoted
+# segment loses its quotes but keeps escapes undecoded, exactly like the other
+# three ports: no escaped spelling can decode to the plain name `env`, so
+# decoding escapes here would only create a way for the ports to disagree. A
+# bare segment ends at `.`, `]`, `#` or whitespace. Returns 1 for an unclosed
+# quote.
+_miseconf_first_segment() {
+  local j="$1" q c seg=""
+  case "${_ME_LINE:j:1}" in
+    '"'|"'")
+      q="${_ME_LINE:j:1}"
+      j=$((j+1))
+      while [ "$j" -lt "$_ME_LEN" ]; do
+        c="${_ME_LINE:j:1}"
+        if [ "$q" = '"' ] && [ "$c" = '\' ]; then
+          seg="$seg$c${_ME_LINE:j+1:1}"
+          j=$((j+2))
+          continue
+        fi
+        [ "$c" = "$q" ] && break
+        seg="$seg$c"
+        j=$((j+1))
+      done
+      [ "$j" -lt "$_ME_LEN" ] || return 1
+      _ME_SEG="$seg"
+      _ME_SEG_END=$((j+1))
+      return 0 ;;
+  esac
   while [ "$j" -lt "$_ME_LEN" ]; do
     c="${_ME_LINE:j:1}"
     case "$c" in
-      ']') [ "${name:0:len}" = "env" ] && return 0; return 1 ;;
-      ' '|$'\t'|$'\r') ;;
-      *) name="$name$c"; len=${#name} ;;
+      '.'|']'|'#'|' '|$'\t'|$'\r') break ;;
     esac
+    seg="$seg$c"
     j=$((j+1))
+  done
+  _ME_SEG="$seg"
+  _ME_SEG_END=$j
+  return 0
+}
+
+# Classify the quoted key at _ME_POS without moving the cursor. `"env".x`
+# defines the table the array would own, so it conflicts; a root-level
+# `"env" = ...` is a spelling the writer cannot rewrite in place; every other
+# quoted line (including a `"""`/`'''` string opener, which is never a key) is
+# unrelated. Result in _ME_KEY.
+_miseconf_quoted_key_kind() {
+  local j q
+  _ME_KEY=""
+  q="${_ME_LINE:_ME_POS:1}"
+  case "$q" in '"'|"'") ;; *) return 0 ;; esac
+  [ "${_ME_LINE:_ME_POS:3}" = "$q$q$q" ] && return 0
+  _miseconf_first_segment "$_ME_POS" || return 0
+  [ "$_ME_SEG" = "env" ] || return 0
+  j=$_ME_SEG_END
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:j:1}" in
+      ' '|$'\t'|$'\r') j=$((j+1)); continue ;;
+      '.') _ME_KEY="dotted" ;;
+      '=') _ME_KEY="assignment" ;;
+    esac
+    return 0
+  done
+  return 0
+}
+
+# Is the `[`/`[[` table header at _ME_POS a table whose first key segment is
+# `env`? `[env]`, `[[env]]`, `[ env ]`, `["env"]`, `['env']` and every dotted
+# form (`[env.foo]`, `["env".x]`, `[env."foo"]`) name the key the array owns;
+# `[envsub]` and `[x.env]` do not (PR #5, finding A2).
+_miseconf_header_is_env() {
+  local j=$((_ME_POS+1))
+  [ "${_ME_LINE:j:1}" = "[" ] && j=$((j+1))
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:j:1}" in
+      ' '|$'\t'|$'\r') j=$((j+1)) ;;
+      *) break ;;
+    esac
+  done
+  _miseconf_first_segment "$j" || return 1
+  [ "$_ME_SEG" = "env" ] || return 1
+  j=$_ME_SEG_END
+  # Only a dot (a deeper table) or the closing bracket may follow the first
+  # segment; anything else is not a header this subset knows how to read.
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:j:1}" in
+      ' '|$'\t'|$'\r') j=$((j+1)) ;;
+      '.'|']') return 0 ;;
+      *) return 1 ;;
+    esac
   done
   return 1
 }
@@ -800,8 +871,12 @@ _miseconf_parse_env_element() {
 _miseconf_parse_env_assignment() {
   local c need_element=1 close_end
   _ME_POS=$((_ME_POS+3))
-  _miseconf_skip_inline
-  if [ "$_ME_POS" -ge "$_ME_LEN" ] || [ "${_ME_LINE:_ME_POS:1}" != "=" ]; then
+  # Decision (PR #5, finding A4): comments and newlines are skipped between the
+  # key and `=` because node, python and powershell already accept them there.
+  # Strict TOML rejects `env # c<LF>= [...]`, but mise cannot read such a file
+  # either, so accepting it can never activate a value mise disagrees with.
+  _miseconf_skip_ws_comments || { _miseconf_fail "malformed env assignment"; return 1; }
+  if [ "${_ME_LINE:_ME_POS:1}" != "=" ]; then
     _miseconf_fail "malformed env assignment"; return 1
   fi
   _ME_POS=$((_ME_POS+1))
@@ -847,10 +922,16 @@ _miseconf_parse_env_assignment() {
 
 # One raw pass over the document. Fills MISEC_ENV_* when it returns 0, plus the
 # private _ME_ROOT_END / _ME_CONFLICT the writer needs. The root region runs
-# from the start (past a BOM) to the first line-start table header; an `env` key
-# after that belongs to a table and is not a top-level assignment anymore.
+# from the start (past a BOM) to the first line-start table header at bracket
+# depth 0; an `env` key after that belongs to a table and is not a top-level
+# assignment anymore. Depth tracking is what makes both halves true: inside an
+# open array or inline table a line-start `[` is a value, not a header, and a
+# line-start `env` is a table member, not the root key (PR #5, finding A1).
+# A file that ends with a value still open has no usable EOF boundary: the root
+# region stops on the line that opened the outermost open value, because a key
+# appended after it would be read as one more element of that value.
 _miseconf_scan() {
-  local c root_end=-1 ml="" seg skip save at_start=1
+  local c root_end=-1 ml="" seg skip save at_start=1 depth=0 open_start=-1
   _miseconf_split
   # A leading BOM is skipped, never removed: it stays part of every splice.
   if [ "$_ME_NLINES" -gt 0 ] && [ "${_ME_LINE:0:3}" = $'\xEF\xBB\xBF' ]; then
@@ -869,8 +950,10 @@ _miseconf_scan() {
         continue
       fi
     fi
-    # Line-start rules apply only at the first non-blank byte of a line.
-    if [ "$at_start" = "1" ]; then
+    # Line-start rules apply only at the first non-blank byte of a line, and
+    # only at depth 0: what looks like a header or a key inside an open array
+    # or inline table is just a value.
+    if [ "$at_start" = "1" ] && [ "$depth" -eq 0 ]; then
       while [ "$_ME_POS" -lt "$_ME_LEN" ]; do
         case "${_ME_LINE:_ME_POS:1}" in
           ' '|$'\t'|$'\r') _ME_POS=$((_ME_POS+1)) ;;
@@ -886,7 +969,10 @@ _miseconf_scan() {
           if _miseconf_header_is_env; then _ME_CONFLICT=1; fi
           _ME_POS=$_ME_LEN
         elif [ "$c" = '"' ] || [ "$c" = "'" ]; then
-          if [ "$root_end" -lt 0 ] && _miseconf_quoted_env_assignment; then
+          _miseconf_quoted_key_kind
+          if [ "$_ME_KEY" = "dotted" ]; then
+            _ME_CONFLICT=1
+          elif [ "$_ME_KEY" = "assignment" ] && [ "$root_end" -lt 0 ]; then
             _miseconf_fail "quoted env key is unsupported"; return 1
           fi
         elif [ "$c" = "e" ] && _miseconf_at_env_token; then
@@ -906,7 +992,8 @@ _miseconf_scan() {
       fi
     fi
     # Everything else on the line: track strings so their contents (and a `#`
-    # inside them) are never read as structure.
+    # inside them) are never read as structure, and track bracket depth so a
+    # nested array or inline table cannot hide the line it is opened on.
     while [ "$_ME_POS" -lt "$_ME_LEN" ]; do
       c="${_ME_LINE:_ME_POS:1}"
       if [ "$c" = "#" ]; then
@@ -924,6 +1011,22 @@ _miseconf_scan() {
           # `"""`/`'''` block that never closes (checked after this loop).
           _miseconf_skip_string "$c" || _ME_POS=$_ME_LEN
         fi
+      elif [ "$c" = "[" ] || [ "$c" = "{" ]; then
+        # The outermost value that opens at depth 0 owns every line up to its
+        # closer, so remember the line it began on: a file that ends inside it
+        # must get the new assignment above that line, never appended into the
+        # value as another element.
+        if [ "$depth" -eq 0 ]; then open_start=$((_ME_STARTS[_ME_LI])); fi
+        depth=$((depth+1))
+        _ME_POS=$((_ME_POS+1))
+      elif [ "$c" = "]" ] || [ "$c" = "}" ]; then
+        # A stray closer in an already-flat region must not drive the depth
+        # negative: that would make the next header look nested forever.
+        if [ "$depth" -gt 0 ]; then depth=$((depth-1)); fi
+        # Closed again, so nothing is open at EOF because of this value; a later
+        # opener records its own line.
+        if [ "$depth" -eq 0 ]; then open_start=-1; fi
+        _ME_POS=$((_ME_POS+1))
       else
         seg="${_ME_LINE:_ME_POS}"
         skip="${seg%%$_ME_STOP*}"
@@ -938,7 +1041,13 @@ _miseconf_scan() {
     at_start=1
   done
   if [ -n "$ml" ]; then _miseconf_fail "unterminated string in file"; return 1; fi
-  if [ "$root_end" -lt 0 ]; then root_end=$_ME_N; fi
+  # The root region ends at the first header; with no header it ends at EOF —
+  # unless the file stops inside an array or inline table, where it ends on the
+  # line that opened the outermost open value. A header always wins: it already
+  # fixed the boundary above any value that is still open later.
+  if [ "$root_end" -lt 0 ]; then
+    if [ "$open_start" -ge 0 ]; then root_end=$open_start; else root_end=$_ME_N; fi
+  fi
   _ME_ROOT_END=$root_end
   if [ "$_ME_FOUND" = "1" ]; then
     MISEC_ENV_FOUND=1
@@ -1047,8 +1156,9 @@ miserc_env_write_pmsec_text() {
     MISEC_ENV_OUTPUT="${text:0:MISEC_ENV_START}${line}${text:MISEC_ENV_END}"
     return 0
   fi
-  # No assignment yet: add one at the end of the root region, before the first
-  # real table header, with a leading newline only when the file needs one.
+  # No assignment yet: add one at the end of the root region — before the first
+  # real table header, before a value still open at EOF, or at EOF when every
+  # value closes — with a leading newline only when the file needs one.
   prefix="${text:0:_ME_ROOT_END}"
   suffix="${text:_ME_ROOT_END}"
   case "$prefix" in
