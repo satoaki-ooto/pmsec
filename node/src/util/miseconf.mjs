@@ -5,11 +5,13 @@
 //
 // The "root region" is everything from the start of the file (after a leading
 // BOM, which is skipped but preserved) to the first line whose first
-// non-whitespace character is `[` outside a string or a comment. Only a bare,
+// non-whitespace character is `[` outside a string, a comment, or an open
+// array/inline table (string- and comment-aware bracket depth). Only a bare,
 // case-sensitive `env` key there is a target; every other byte is untouched.
 // Nothing here validates TOML in general: the scanner only tracks enough
-// structure (basic/literal strings, `"""`/`'''` blocks, comments) to keep
-// env-like text and table headers inside them from being misparsed.
+// structure (basic/literal strings, `"""`/`'''` blocks, comments, value
+// brackets) to keep env-like text and table headers inside them from being
+// misparsed.
 
 const BOM = "\uFEFF";
 
@@ -183,13 +185,32 @@ function unquote(s) {
   return /^(".*"|'.*')$/s.test(s) ? s.slice(1, -1) : s;
 }
 
-function normalizeHeader(name) {
-  return name.split(".").map(part => unquote(part.trim())).join(".");
+// A table header names an absolute key path, so its FIRST segment alone decides
+// whether it owns the key pmsec writes: `[env]`, `[env.foo]`, `[ "env" ]`, and
+// `["env".x]` all define something under the root `env` table, while `[x.env]`
+// and `[envsub]` do not. Segments may be quoted and whitespace may surround the
+// dots, so decode the first segment the way TOML would.
+//
+// deliberate: Issue-#194 subset only; splitting on the first dot is enough
+// because only that segment is compared, and a quoted segment keeps its opening
+// quote, so a dot inside a quoted key (`["env.foo"]`) can never decode to `env`.
+function headerFirstSegment(name) {
+  return unquote(name.split(".")[0].trim());
+}
+
+// Horizontal whitespace only: a dotted key cannot cross a line, so the forms
+// that are tolerated before `=` stay bare-key decisions instead of dotted ones.
+function skipBlanks(text, i, n) {
+  while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === "\r")) i++;
+  return i;
 }
 
 // Classifies one line-start token. `bare` is the exact token `env` followed by
-// whitespace/`=`/end-of-line; `dotted` is `env.` (a dotted key, never the
-// array); `quoted` is `"env"`/`'env'` used as a key, which is out of subset.
+// whitespace/`=`/end-of-file; `dotted` is `env` as the first segment of a
+// dotted key (`env.foo`, `env . foo`, `"env".foo`), which defines the env table
+// rather than the array; `quoted` is `"env"`/`'env'` used as a key, which is out
+// of subset. A bare `env` at end-of-file is still `bare`: the empty sentinel
+// means the assignment is cut short, never that the key is unrelated.
 function classifyKey(text, i, n) {
   const c = text[i];
   if (c === '"' || c === "'") {
@@ -207,27 +228,40 @@ function classifyKey(text, i, n) {
       j++;
     }
     if (j >= n || raw !== "env") return null;
-    if (text[j + 1] === ".") return null;
+    if (text[skipBlanks(text, j + 1, n)] === ".") return { kind: "dotted" };
     let k = j + 1;
     while (k < n && (text[k] === " " || text[k] === "\t" || text[k] === "\r" || text[k] === "\n")) k++;
     return text[k] === "=" ? { kind: "quoted" } : null;
   }
   if (text.startsWith("env", i)) {
     const next = i + 3 < n ? text[i + 3] : "";
-    if (next === ".") return { kind: "dotted" };
-    if (BARE_KEY_END.has(next)) return { kind: "bare" };
+    if (text[skipBlanks(text, i + 3, n)] === ".") return { kind: "dotted" };
+    if (next === "" || BARE_KEY_END.has(next)) return { kind: "bare" };
   }
   return null;
 }
 
-// One pass over the whole file. Tracks strings and comments so their contents
-// are never read as structure, and records every offset the caller needs:
-//   rootEnd    - line start of the first table header (-1 when there is none)
+// One pass over the whole file. Tracks strings, comments, and value-bracket
+// depth so their contents are never read as structure, and records every offset
+// the caller needs:
+//   rootEnd    - line start of the first depth-0 table header (-1 when there is none)
 //   bareEnv    - root-region offsets of bare `env` keys, in file order
 //   quotedEnv  - first root-region `"env"`/`'env'` key, or -1
-//   dottedEnv  - first `env.` key anywhere, or -1
-//   envTable   - first `[env]`/`[[env]]` header anywhere, or -1
+//   dottedEnv  - first `env.` key anywhere, or -1 (fail closed: the subset
+//                does not model table scoping, so a nested one is rejected too)
+//   envTable   - first `[env...]` header anywhere, or -1
+//   openValue  - line start where an array/inline table still open at EOF began, or -1
 //   unterminated - a `"""`/`'''` block that never closes
+//
+// A line start only offers a header or a key at depth 0: inside `key = [` ... `]`
+// or `key = {` ... `}` the line is value data, and reading a nested `[` there as
+// a header would cut the root region short and point the writer's insertion
+// inside the array. Brackets inside strings and comments never move the depth
+// because those bytes are consumed in their own states.
+//
+// deliberate: Issue-#194 subset only; the depth is one counter over both bracket
+// kinds. It answers "is a value open", not "does this file nest legally", which
+// is the only question the root region and the insertion point ask.
 function lex(text) {
   const n = text.length;
   let i = text.startsWith(BOM) ? 1 : 0;
@@ -239,6 +273,8 @@ function lex(text) {
   let quotedEnv = -1;
   let dottedEnv = -1;
   let envTable = -1;
+  let depth = 0;
+  let openValue = -1;
   const bareEnv = [];
 
   while (i < n) {
@@ -317,16 +353,26 @@ function lex(text) {
     }
     if (atLineStart) {
       atLineStart = false;
-      if (c === "[") {
+      // A line that starts inside a value continues that value: its first token
+      // is array/inline-table data, never a header and never a root key.
+      if (depth === 0 && c === "[") {
         const name = headerName(text, i);
         if (inRoot) {
           inRoot = false;
           rootEnd = lineStart;
         }
-        if (envTable < 0 && name !== null && normalizeHeader(name) === "env") envTable = i;
-      } else {
+        if (envTable < 0 && name !== null && headerFirstSegment(name) === "env") envTable = i;
+        // The header's own `[` opens no value context: consuming it keeps its
+        // matching `]` from being read as a nested closer.
+        i++;
+        continue;
+      }
+      if (depth === 0) {
         const key = classifyKey(text, i, n);
         if (key !== null && key.kind === "dotted") {
+          // Any `env.` dotted key is rejected, not only a root one: the subset
+          // does not model table scoping, so `env.foo` under a header is a
+          // shape pmsec cannot reason about and fails closed instead.
           if (dottedEnv < 0) dottedEnv = i;
         } else if (key !== null && inRoot) {
           if (key.kind === "quoted") {
@@ -336,6 +382,23 @@ function lex(text) {
           }
         }
       }
+    }
+    if (c === "[" || c === "{") {
+      // An array or inline table swallows every following line until its
+      // matching closer; remember where the outermost one began so a still-open
+      // value at EOF can never become the writer's insertion point.
+      if (depth === 0) openValue = lineStart;
+      depth++;
+      i++;
+      continue;
+    }
+    if (c === "]" || c === "}") {
+      // Floored: a header's closing `]` arrives here without a matching open,
+      // and a stray closer must not unbalance the lines that follow.
+      if (depth > 0) depth--;
+      if (depth === 0) openValue = -1;
+      i++;
+      continue;
     }
     if (c === '"') {
       if (text.startsWith('"""', i)) {
@@ -366,6 +429,7 @@ function lex(text) {
     quotedEnv,
     dottedEnv,
     envTable,
+    openValue,
     unterminated: state === "ml-basic" || state === "ml-literal",
   };
 }
@@ -388,6 +452,7 @@ function analyze(text, path) {
   return {
     assignment,
     rootEnd: lx.rootEnd,
+    openValue: lx.openValue,
     envTable: lx.envTable,
     dottedEnv: lx.dottedEnv,
   };
@@ -419,7 +484,7 @@ export function readEnv(text, source = "<memory>") {
  */
 export function writePmsecEnv(text, inherited, source = "<memory>") {
   if (!Array.isArray(inherited)) throw new TypeError("inherited must be an array of strings");
-  const { assignment, rootEnd, envTable, dottedEnv } = analyze(text, source);
+  const { assignment, rootEnd, openValue, envTable, dottedEnv } = analyze(text, source);
   // Validate before touching the text: a conflicting shape must never be
   // rewritten, since a later mise would then see two sources for `env`.
   if (envTable >= 0 || dottedEnv >= 0) fail(source, "env table conflicts with the env array");
@@ -435,7 +500,11 @@ export function writePmsecEnv(text, inherited, source = "<memory>") {
   if (assignment !== null) {
     return text.slice(0, assignment.keyStart) + line + text.slice(assignment.end);
   }
-  const at = rootEnd < 0 ? text.length : rootEnd;
+  // The end of the root region: before the first depth-0 header, otherwise at
+  // EOF. A value still open at EOF (a truncated file) ends the region where it
+  // began; the file is broken TOML either way, but the new key must not become
+  // an element of that value.
+  const at = rootEnd >= 0 ? rootEnd : openValue >= 0 ? openValue : text.length;
   const before = text.slice(0, at);
   const separator = before.length > 0 && !before.endsWith("\n") ? "\n" : "";
   return `${before}${separator}${line}\n${text.slice(at)}`;

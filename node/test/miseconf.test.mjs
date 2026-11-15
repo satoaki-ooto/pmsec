@@ -32,11 +32,20 @@ test("read: an [env] table alone is not a top-level env assignment", () => {
 
 test("read: bare env.foo dotted keys alone are not a top-level env assignment", () => {
   assert.equal(readEnv('env.foo = "bar"\nenv.baz = "qux"\n'), null);
+  // Dotted keys are TOML, not env-array syntax, and the whitespace/quoted forms
+  // are the same key: `env . foo` must not fall back to "malformed" (it used to
+  // be classed as a bare key because the dot was not adjacent).
+  for (const key of ["env . foo = 1", '"env".foo = 1', "'env'.foo = 1", 'env."foo" = 1', 'env . "foo" = 1']) {
+    assert.equal(readEnv(`${key}\n`), null, key);
+  }
 });
 
-test("read: envelope is an unrelated key", () => {
+test("read: envelope and envsub are unrelated keys, including at EOF", () => {
   assert.equal(readEnv("envelope = true\n"), null);
   assert.equal(readEnv('envelope = ["a"]\n'), null);
+  assert.equal(readEnv("envelope"), null);
+  assert.equal(readEnv("envsub = 1\n"), null);
+  assert.equal(readEnv("envsub"), null);
 });
 
 test("read: empty array", () => {
@@ -142,6 +151,22 @@ test("read: an env key inside a table body is not top-level", () => {
   assert.equal(readEnv('[tool]\nenv = ["nested"]\n'), null);
 });
 
+test("read: a line-start bracket inside an open array is value data, not a header", () => {
+  // The nested `[1, 2],` used to be read as a table header, which ended the
+  // root region early and hid the real assignment below it.
+  assert.deepEqual(readEnv('items = [\n  [1, 2],\n]\nenv = ["work"]\n'), ["work"]);
+  assert.deepEqual(readEnv('items = [\n  ["env"],\n]\nenv = ["work"]\n'), ["work"]);
+});
+
+test("read: a line-start key inside an open inline table is value data", () => {
+  assert.deepEqual(readEnv('x = { a = 1,\n  b = 2 }\nenv = ["work"]\n'), ["work"]);
+  assert.deepEqual(readEnv('x = { a = [1],\n  b = 2 }\nenv = ["work"]\n'), ["work"]);
+});
+
+test("read: a header after a nested array still ends the root region", () => {
+  assert.equal(readEnv('items = [\n  [1, 2],\n]\n[t]\nenv = ["nested"]\n'), null);
+});
+
 test("read: a leading BOM is skipped", () => {
   assert.deepEqual(readEnv('\uFEFFenv = ["a"]\n'), ["a"]);
 });
@@ -207,6 +232,11 @@ test("reject: malformed env assignment", () => {
   assert.equal(reasonOf(() => readEnv('env ["a"]\n')), "malformed env assignment");
   assert.equal(reasonOf(() => readEnv("env\n")), "malformed env assignment");
   assert.equal(reasonOf(() => readEnv("env\nkey = 1\n")), "malformed env assignment");
+  // A file that ends with the bare key has no `=` at all: the empty sentinel is
+  // end-of-key, never evidence of an unrelated token, so it fails closed too.
+  assert.equal(reasonOf(() => readEnv("env")), "malformed env assignment");
+  assert.equal(reasonOf(() => readEnv("env   ")), "malformed env assignment");
+  assert.equal(reasonOf(() => readEnv("# note\nenv")), "malformed env assignment");
 });
 
 test("reject: malformed env array separator", () => {
@@ -297,6 +327,43 @@ test("write: an absent assignment is appended when there is no table", () => {
   assert.equal(writePmsecEnv("a = 1\n", []), 'a = 1\nenv = ["pmsec"]\n');
 });
 
+test("write: a nested array before the assignment is never touched", () => {
+  const text = 'items = [\n  [1, 2],\n]\nenv = ["work"]\n';
+  // Only the real assignment moves: the insertion used to land inside the open
+  // array, which both corrupted the array and left the old env line behind.
+  assert.equal(writePmsecEnv(text, ["work"]), 'items = [\n  [1, 2],\n]\nenv = ["work", "pmsec"]\n');
+});
+
+test("write: a nested array after the assignment stays byte-identical", () => {
+  const text = 'env = ["work"]\nitems = [\n  [1, 2],\n]\n';
+  assert.equal(writePmsecEnv(text, ["work"]), 'env = ["work", "pmsec"]\nitems = [\n  [1, 2],\n]\n');
+});
+
+test("write: an inline table before the insertion point does not move it", () => {
+  assert.equal(
+    writePmsecEnv("x = { a = 1 }\n[t]\nx = 1\n", []),
+    'x = { a = 1 }\nenv = ["pmsec"]\n[t]\nx = 1\n',
+  );
+  assert.equal(
+    writePmsecEnv('x = { a = 1 }\nenv = ["work"]\n', ["work"]),
+    'x = { a = 1 }\nenv = ["work", "pmsec"]\n',
+  );
+});
+
+test("write: a header that follows a nested array is still the root end", () => {
+  assert.equal(
+    writePmsecEnv('items = [\n  [1, 2],\n]\n[t]\nx = 1\n', []),
+    'items = [\n  [1, 2],\n]\nenv = ["pmsec"]\n[t]\nx = 1\n',
+  );
+});
+
+test("write: a value still open at EOF keeps the insertion outside it", () => {
+  // A truncated file is broken TOML either way, but the value's own line start
+  // is the last point still in root scope, so the key cannot become an element.
+  assert.equal(writePmsecEnv("a = 1\nx = [\n  1,\n", []), 'a = 1\nenv = ["pmsec"]\nx = [\n  1,\n');
+  assert.equal(writePmsecEnv("a = 1\nx = { b = 1\n", []), 'a = 1\nenv = ["pmsec"]\nx = { b = 1\n');
+});
+
 test("write: the original single-quoted token is reused", () => {
   assert.equal(writePmsecEnv("env = ['work']\n", ["work"]), "env = ['work', \"pmsec\"]\n");
 });
@@ -332,8 +399,74 @@ test("write: an [env] table conflicts with the array", () => {
   assert.equal(reasonOf(() => writePmsecEnv(text, ["a"])), "env table conflicts with the env array");
 });
 
+test("write: every header whose first segment decodes to env conflicts", () => {
+  // A header names an absolute path, so the first segment alone decides: these
+  // all declare keys under the root env table that the array would collide with.
+  for (const header of [
+    "[env]",
+    "[env.foo]",
+    "[ env ]",
+    '["env"]',
+    "['env']",
+    '[ "env" ]',
+    '["env".x]',
+    '[ "env" . "x" ]',
+    '[env."foo"]',
+    "[[env]]",
+    "[[env.foo]]",
+  ]) {
+    assert.equal(
+      reasonOf(() => writePmsecEnv(`${header}\n_.path = ["/bin"]\n`, [])),
+      "env table conflicts with the env array",
+      header,
+    );
+  }
+});
+
+test("write: a header whose first segment is not env does not conflict", () => {
+  // `["env.foo"]` is one quoted key that merely spells a dot, not the env table.
+  for (const header of ["[x.env]", "[envsub]", "[tool.env]", "[envs]", "['x.env']", '["env.foo"]']) {
+    assert.equal(writePmsecEnv(`${header}\n`, []), `env = ["pmsec"]\n${header}\n`, header);
+  }
+});
+
 test("write: a bare env.foo dotted key conflicts with the array", () => {
   assert.equal(reasonOf(() => writePmsecEnv('env.foo = "bar"\n', [])), "env table conflicts with the env array");
+});
+
+test("write: every root dotted env key conflicts, spaced or quoted included", () => {
+  for (const key of [
+    "env.foo = 1",
+    "env . foo = 1",
+    '"env".foo = 1',
+    "'env'.foo = 1",
+    'env."foo" = 1',
+    'env . "foo" = 1',
+    '"env" . "foo" = 1',
+  ]) {
+    assert.equal(reasonOf(() => writePmsecEnv(`${key}\n`, [])), "env table conflicts with the env array", key);
+  }
+});
+
+test("write: a dotted env key under a table header still fails closed", () => {
+  // The subset does not model table scoping, so this line would mean
+  // `tool.env.foo` in mise and not collide with the array -- but a shape pmsec
+  // cannot place is rejected rather than guessed at, matching the other ports.
+  assert.equal(reasonOf(() => writePmsecEnv("[tool]\nenv.foo = 1\n", [])), "env table conflicts with the env array");
+  assert.equal(readEnv("[tool]\nenv.foo = 1\n"), null);
+});
+
+test("write: env matching is case-sensitive, so [ENV] and Env stay unrelated", () => {
+  assert.equal(writePmsecEnv("[ENV]\n", []), 'env = ["pmsec"]\n[ENV]\n');
+  assert.equal(writePmsecEnv('Env = ["a"]\n', []), 'Env = ["a"]\nenv = ["pmsec"]\n');
+  assert.equal(writePmsecEnv('"ENV" = ["a"]\n', []), '"ENV" = ["a"]\nenv = ["pmsec"]\n');
+  assert.equal(readEnv('"ENV" = ["a"]\n'), null);
+  assert.equal(readEnv('Env = ["a"]\n'), null);
+});
+
+test("write: a truncated bare env at EOF fails closed", () => {
+  assert.equal(reasonOf(() => writePmsecEnv("env", [])), "malformed env assignment");
+  assert.equal(reasonOf(() => writePmsecEnv("# note\nenv", [])), "malformed env assignment");
 });
 
 test("write: writing the same inherited list twice is byte-identical", () => {

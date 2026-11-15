@@ -53,7 +53,14 @@ async function sandbox(t) {
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, text, "utf8");
     },
+    // Raw bytes, for inputs a utf-8 string cannot carry (invalid sequences, a
+    // byte-exact BOM); assertions compare bytes so a substitution cannot hide.
+    async putBytes(path, bytes) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, bytes);
+    },
     read: path => readFile(path, "utf8"),
+    readBytes: path => readFile(path),
     // A real EACCES for a non-root user; the mode is restored in cleanup.
     async close(path) {
       await chmod(path, 0o000);
@@ -171,6 +178,19 @@ test("env = [] is a definition that stops inheritance", async (t) => {
   assert.deepEqual(readSelector(...box.args()), { path: box.local, env: [], wired: false });
 });
 
+test("a nested array before env = [] is value data and still stops inheritance", async (t) => {
+  const box = await sandbox(t);
+  const local = 'items = [\n  [1, 2],\n]\nenv = []\n';
+  await box.put(box.local, local);
+  await box.put(box.shared, 'env = ["shared"]\n');
+  // The nested array used to look like a header, so the local file defined
+  // nothing and the shared list leaked through.
+  assert.deepEqual(readSelector(...box.args()), { path: box.local, env: [], wired: false });
+  await writeLocalSelector(...box.args());
+  assert.equal(await box.read(box.local), 'items = [\n  [1, 2],\n]\nenv = ["pmsec"]\n');
+  assert.equal(await box.read(box.shared), 'env = ["shared"]\n');
+});
+
 test("no file defines env: the empty default is reported against localMiserc", async (t) => {
   const box = await sandbox(t);
   await box.put(box.local, "key = 1\n");
@@ -207,6 +227,55 @@ test("an unreadable file fails closed as \"cannot read file\"", async (t) => {
   const blockedError = await rejectionOf(() => readSelector(...blocked.args()));
   assert.equal(blockedError.reason, "cannot read file");
   assert.equal(blockedError.path, blocked.local);
+});
+
+test("undecodable local bytes fail closed and are never rewritten", async (t) => {
+  const box = await sandbox(t);
+  // 0xff cannot appear in UTF-8. Decoding it as U+FFFD would let the writer
+  // persist the substitution over the original bytes, so the read must fail.
+  const original = Buffer.concat([
+    Buffer.from("# note: "),
+    Buffer.from([0xff]),
+    Buffer.from('\nenv = ["work"]\n'),
+  ]);
+  await box.putBytes(box.local, original);
+  const error = await rejectionOf(() => readSelector(...box.args()));
+  assert.equal(error.reason, "cannot read file");
+  assert.equal(error.path, box.local);
+  const writeError = await rejectionOf(() => writeLocalSelector(...box.args()));
+  assert.equal(writeError.reason, "cannot read file");
+  assert.equal(writeError.path, box.local);
+  assert.deepEqual(await box.readBytes(box.local), original);
+  assert.equal(existsSync(box.local + ".bak"), false);
+  assert.deepEqual(await box.leftovers(box.local), []);
+});
+
+test("undecodable shared bytes abort before the local file is touched", async (t) => {
+  const box = await sandbox(t);
+  const localText = "key = 1\n";
+  const sharedBytes = Buffer.concat([Buffer.from([0xff]), Buffer.from('\nenv = ["y"]\n')]);
+  await box.put(box.local, localText);
+  await box.putBytes(box.shared, sharedBytes);
+  const error = await rejectionOf(() => writeLocalSelector(...box.args()));
+  assert.equal(error.reason, "cannot read file");
+  assert.equal(error.path, box.shared);
+  assert.equal(await box.read(box.local), localText);
+  assert.deepEqual(await box.readBytes(box.shared), sharedBytes);
+  assert.equal(existsSync(box.local + ".bak"), false);
+});
+
+test("a leading BOM survives a read and a write byte for byte", async (t) => {
+  const box = await sandbox(t);
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  await box.putBytes(box.local, Buffer.concat([bom, Buffer.from('env = ["work"]\n')]));
+  // The decoder keeps U+FEFF instead of stripping it, so the parsed string and
+  // the rewritten file both retain exactly one BOM.
+  assert.deepEqual(readSelector(...box.args()), { path: box.local, env: ["work"], wired: false });
+  await writeLocalSelector(...box.args());
+  assert.deepEqual(
+    await box.readBytes(box.local),
+    Buffer.concat([bom, Buffer.from('env = ["work", "pmsec"]\n')]),
+  );
 });
 
 test("a simulated win32 host resolves every layer through misePaths", async (t) => {

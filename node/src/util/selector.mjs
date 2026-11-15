@@ -31,13 +31,30 @@ function isWired(list) {
 }
 
 // Absence is the only outcome that may fall through to the next layer. Every
-// other failure (EACCES, EISDIR, ...) leaves the effective selection unknown,
-// so it fails closed instead of guessing a lower-precedence source.
+// other failure (EACCES, EISDIR, undecodable bytes, ...) leaves the effective
+// selection unknown, so it fails closed instead of guessing a lower-precedence
+// source.
+//
+// fatal+ignoreBOM is the portable equivalent of Python's raw utf-8 open and
+// PowerShell's UTF8Encoding($false, $true): an invalid byte sequence is an
+// error, never U+FFFD, and a leading BOM stays in the string. `readFileSync`
+// with an encoding would substitute the bad bytes and then let the writer
+// persist that substitution over the original file.
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
 function readTextOrNull(path) {
+  let bytes;
   try {
-    return readFileSync(path, "utf8");
+    bytes = readFileSync(path);
   } catch (error) {
     if (error.code === "ENOENT") return null;
+    throw new MiseEnvError("cannot read file", path);
+  }
+  // A decode failure is a read failure: the content is unknown, so no lower
+  // layer may be consulted and no byte may be planned or written.
+  try {
+    return UTF8.decode(bytes);
+  } catch {
     throw new MiseEnvError("cannot read file", path);
   }
 }
