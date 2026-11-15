@@ -17,8 +17,6 @@
 # accepts unique prefixes, so `pmsec -V` would bind to `-Verbose` instead of
 # reaching us as the `--version` short flag. Reading $args directly bypasses
 # parameter binding entirely.
-$Argv = $args
-
 $ErrorActionPreference = 'Stop'
 $script:PmsecVersion = '2026.11.8'
 # Default cooldown for the hardening bundle. Override per-invocation with
@@ -32,21 +30,38 @@ $script:Tools = @('npm','pnpm','yarn','bun','cargo','mise','uv','bundler','aube'
 # Windows host) or 'linux' (a WSL distribution accessed via UNC path).
 # CmdEnable / CmdCheck / CmdDisable iterate scopes and assign $script:Scope
 # so the path/IO helpers below resolve against the active scope.
+#
+# Scope records also carry the mise-layering fields the per-scope seams need
+# (see the "mise layering" section): Fake ($true for PMSEC_FAKE_SCOPES test
+# scopes), Distro + WslRoot (real WSL scopes only), FakeState (per-scope
+# PMSEC_FAKE_SCOPE_DATA, parsed lazily), and the lazy Environment / MiseContext
+# caches. None of them reach CLI output.
 $script:Scope = $null
 
-function Get-PmsecPlatform {
-  if ($script:Scope) { return $script:Scope.Platform }
+# Scope-record accessors that take the record explicitly. Helpers that must work
+# for a scope other than $script:Scope (the test-only seams, and anything called
+# while enumerating scopes) go through these instead of the ambient variable.
+function Get-ScopePlatform($Scope) {
+  if ($null -ne $Scope) { return $Scope['Platform'] }
   return 'win32'
+}
+
+function Get-PmsecPlatform {
+  return (Get-ScopePlatform $script:Scope)
+}
+
+function Get-ScopeHome($Scope) {
+  if ($null -ne $Scope) { return $Scope['Home'] }
+  if ($env:PMSEC_HOME) { return $env:PMSEC_HOME }
+  if ($env:USERPROFILE) { return $env:USERPROFILE }
+  return $HOME
 }
 
 # Pmsec ignores PowerShell's session-static $HOME so tests can override paths
 # via $env:USERPROFILE / $env:PMSEC_HOME at runtime. Honored only outside an
 # active scope (i.e., for raw helpers, not for per-scope file operations).
 function Get-PmsecHome {
-  if ($script:Scope) { return $script:Scope.Home }
-  if ($env:PMSEC_HOME) { return $env:PMSEC_HOME }
-  if ($env:USERPROFILE) { return $env:USERPROFILE }
-  return $HOME
+  return (Get-ScopeHome $script:Scope)
 }
 
 # Env-var overrides for tool config paths only apply when writing to the
@@ -122,12 +137,7 @@ function Get-CargoPath {
   return (PathJoin (Get-PmsecHome) '.cargo' 'config.toml')
 }
 function Get-MisePath {
-  if ((Get-PmsecPlatform) -eq 'win32') {
-    if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
-    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-PmsecHome) 'AppData' 'Local' }
-    return (PathJoin $base 'mise' 'config.toml')
-  }
-  return (PathJoin (Get-PmsecHome) '.config' 'mise' 'config.toml')
+  return (Get-MisePathForScope $script:Scope)
 }
 # Bundler's global config. BUNDLE_USER_CONFIG points at the file directly;
 # BUNDLE_USER_HOME points at the home dir (config = <home>/config). Both
@@ -166,6 +176,19 @@ function Get-ComposerPath {
 
 # ---------- scope discovery ----------
 
+# One shape for every scope record, including the mise-layering fields. Fake
+# marks the PMSEC_FAKE_SCOPES stand-ins: they must never spawn a host binary or
+# wsl.exe, and their environment paths are host paths (no UNC translation).
+# Distro/WslRoot stay empty for the Windows host and are filled in for real WSL
+# scopes by Get-WslDistros.
+function New-ScopeRecord([string]$Label, [string]$ScopeHome, [string]$Platform, [bool]$Fake) {
+  return @{
+    Label = $Label; Home = $ScopeHome; Platform = $Platform
+    Fake = $Fake; Distro = $null; WslRoot = $null
+    FakeState = $null; Environment = $null; MiseContext = $null
+  }
+}
+
 # Build the list of scopes pmsec writes to:
 #   1. The Windows host (always present).
 #   2. Each installed WSL distribution, accessed via the `\\wsl$\<distro>\...`
@@ -181,7 +204,7 @@ function Get-PmsecScopes([bool]$IncludeWsl) {
       if ([string]::IsNullOrWhiteSpace($spec)) { continue }
       $parts = $spec -split '\|', 3
       if ($parts.Count -lt 3) { continue }
-      $entry = @{ Label = $parts[0]; Home = $parts[1]; Platform = $parts[2] }
+      $entry = New-ScopeRecord $parts[0] $parts[1] $parts[2] $true
       # Treat any non-win32 fake scope as a stand-in for a WSL distro so
       # --no-wsl / PMSEC_NO_WSL=1 has the same effect under test.
       if (-not $IncludeWsl -and $entry.Platform -ne 'win32') { continue }
@@ -191,7 +214,7 @@ function Get-PmsecScopes([bool]$IncludeWsl) {
   }
   $hostHome = if ($env:PMSEC_HOME) { $env:PMSEC_HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
   $list = New-Object System.Collections.Generic.List[hashtable]
-  $list.Add(@{ Label = 'windows'; Home = $hostHome; Platform = 'win32' })
+  $list.Add((New-ScopeRecord 'windows' $hostHome 'win32' $false))
   if ($IncludeWsl) {
     foreach ($d in (Get-WslDistros)) { $list.Add($d) }
   }
@@ -227,9 +250,1365 @@ function Get-WslDistros {
     $wslHome = ([string]$wslHome).Trim() -replace "`0",''
     if ($wslHome -eq '' -or -not $wslHome.StartsWith('/')) { continue }
     $unc = '\\wsl$\' + $name + ($wslHome -replace '/', '\')
-    $list.Add(@{ Label = "wsl-$name"; Home = $unc; Platform = 'linux' })
+    # Home stays the exact UNC string pmsec has always written through; the
+    # distro name and root are kept separately so the mise seams can probe the
+    # same distro and translate POSIX paths back into this scope's filesystem.
+    $entry = New-ScopeRecord "wsl-$name" $unc 'linux' $false
+    $entry.Distro = $name
+    $entry.WslRoot = '\\wsl$\' + $name
+    $list.Add($entry)
   }
   return ,$list.ToArray()
+}
+
+# ---------- mise layering (Issue #194) ----------
+# mise >= 2026.11 can host pmsec's settings in a dedicated `config.pmsec.toml`
+# layer that a `pmsec` selector in miserc.local.toml wires in. This section is
+# the phase-2 substrate only: the new path family, a per-scope environment
+# source, and the mode gate. No CLI flow consumes it yet.
+#
+# The one intentional, human-approved behavior change in this phase lives here
+# too: a non-win32 scope resolves its *legacy* mise config from its own
+# environment (Get-MisePathForScope) instead of always <home>/.config/mise.
+# Without that, a WSL-scope MISE_GLOBAL_CONFIG_FILE would gate legacy mode while
+# pmsec wrote the default path.
+#
+# Every seam below takes a scope record instead of reading $script:Scope: the
+# Windows host and each WSL distro can see a different mise version and a
+# different environment. Version/environment probes may spawn wsl.exe, so their
+# results are memoized on the scope record (one probe per scope per invocation).
+
+# The mise variables a scope can override. Empty means unset (Phase-1 frozen
+# answer 3), so every reader below treats '' as absent.
+$script:MiseEnvKeys = @(
+  'MISE_GLOBAL_CONFIG_FILE',
+  'MISE_CONFIG_DIR',
+  'XDG_CONFIG_HOME',
+  'MISE_SYSTEM_CONFIG_DIR',
+  'MISE_ENV'
+)
+# First mise release whose config layering pmsec can use. Deliberately separate
+# from the 2026.4.22 cooldown-key floor in ToolPreflight: they gate different
+# things and must not drift into each other.
+$script:MiseNewModeFloor = @(2026, 11, 0)
+
+# Fixed probe that reads the scoped environment from inside a distro. The
+# command text is built from the constant key list above (never from scope or
+# filesystem data), and the distro name is passed as an argv element, so nothing
+# untrusted reaches a shell. Fields are separated by \002 and the whole run is
+# wrapped in \001B ... \001E (octal escapes that both dash and bash printf
+# understand) so a corrupted pipe can be detected instead of misparsed.
+$script:WslEnvProbeParts = New-Object System.Collections.Generic.List[string]
+$script:WslEnvProbeParts.Add('printf "\001B"')
+foreach ($envKey in $script:MiseEnvKeys) {
+  $script:WslEnvProbeParts.Add('printf "\002"')
+  $script:WslEnvProbeParts.Add("printenv $envKey")
+}
+$script:WslEnvProbeParts.Add('printf "\001E"')
+$script:WslEnvProbe = ($script:WslEnvProbeParts -join '; ')
+
+function Test-ScopeFake($Scope) {
+  if ($null -eq $Scope) { return $false }
+  return [bool]$Scope['Fake']
+}
+
+# A real WSL scope is the only kind whose environment paths live inside another
+# filesystem (and therefore need the \\wsl$\<distro>\... translation).
+function Test-RealWslScope($Scope) {
+  if ($null -eq $Scope) { return $false }
+  if (Test-ScopeFake $Scope) { return $false }
+  return -not [string]::IsNullOrEmpty($Scope['WslRoot'])
+}
+
+# New-mode paths describe where mise will look, so joins follow the scope's
+# platform rather than the host PowerShell happens to run on: simulated win32
+# and WSL scopes must produce the same bytes on a Linux test runner as on
+# Windows. Legacy resolvers keep PathJoin (host-shaped) to stay byte-identical.
+function Get-ScopePathSeparator($Scope) {
+  if (Test-RealWslScope $Scope) { return '\' }
+  if ((Get-ScopePlatform $Scope) -eq 'win32') { return '\' }
+  return '/'
+}
+
+function Join-ScopePath($Scope, [string]$Base, [string[]]$Parts) {
+  $sep = Get-ScopePathSeparator $Scope
+  $result = [string]$Base
+  foreach ($p in $Parts) {
+    if ([string]::IsNullOrEmpty($p)) { continue }
+    if ($result -eq '') { $result = $p; continue }
+    if ($result.EndsWith($sep)) { $result = $result + $p } else { $result = $result + $sep + $p }
+  }
+  return $result
+}
+
+# ---- scoped environment ----
+
+function Get-MiseProcessValues {
+  $values = @{}
+  foreach ($k in $script:MiseEnvKeys) {
+    $v = [Environment]::GetEnvironmentVariable($k, 'Process')
+    if (-not [string]::IsNullOrEmpty($v)) { $values[$k] = $v }
+  }
+  return $values
+}
+
+# JSON -> nested hashtables, because ConvertFrom-Json hands back PSCustomObject
+# on 5.1 as well as on 7. $null means "ignore": PMSEC_FAKE_SCOPE_DATA is
+# test-only data, so malformed content must never throw into a CLI flow.
+function ConvertFrom-PmsecJsonMap([string]$Text) {
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+  try { $obj = ConvertFrom-Json -InputObject $Text -ErrorAction Stop } catch { return $null }
+  return (ConvertTo-PmsecMap $obj)
+}
+
+function ConvertTo-PmsecMap($Value) {
+  if ($null -eq $Value) { return $null }
+  if ($Value -is [string]) { return $Value }
+  if ($Value -is [System.Collections.IDictionary]) {
+    $out = @{}
+    foreach ($k in $Value.Keys) { $out[[string]$k] = ConvertTo-PmsecMap $Value[$k] }
+    return $out
+  }
+  if ($Value -is [System.Management.Automation.PSCustomObject]) {
+    $out = @{}
+    foreach ($p in $Value.PSObject.Properties) { $out[$p.Name] = ConvertTo-PmsecMap $p.Value }
+    return $out
+  }
+  return $Value
+}
+
+# Per-scope injection for fake scopes, keyed by label:
+#   { "<label>": { "Version": "2026.11.0", "Env": { "MISE_ENV": "work" } } }
+# Parsed once per scope per invocation and cached in FakeState.
+function Get-FakeScopeData($Scope) {
+  $state = $Scope['FakeState']
+  if ($null -eq $state) {
+    $state = @{ Loaded = $false; Version = $null; Env = @{} }
+    $Scope['FakeState'] = $state
+  }
+  if ($state['Loaded']) { return $state }
+  $state['Loaded'] = $true
+  $raw = [Environment]::GetEnvironmentVariable('PMSEC_FAKE_SCOPE_DATA', 'Process')
+  $map = ConvertFrom-PmsecJsonMap ([string]$raw)
+  if ($map -isnot [System.Collections.IDictionary]) { return $state }
+  $entry = $map[[string]$Scope['Label']]
+  if ($entry -isnot [System.Collections.IDictionary]) { return $state }
+  $version = $entry['Version']
+  if ($version -is [string] -and $version -ne '') { $state['Version'] = $version }
+  $envMap = $entry['Env']
+  if ($envMap -is [System.Collections.IDictionary]) { $state['Env'] = $envMap }
+  return $state
+}
+
+# Fake scopes read the process environment so existing conformance/CLI overrides
+# keep reaching the default fake scope, then take the per-scope injections.
+# Only the five mise variables are overlaid; everything else stays process-level.
+function Get-FakeScopeEnvironment($Scope) {
+  $values = Get-MiseProcessValues
+  $injected = (Get-FakeScopeData $Scope)['Env']
+  foreach ($k in $script:MiseEnvKeys) {
+    if (-not $injected.Contains($k)) { continue }
+    $v = $injected[$k]
+    if ($v -isnot [string]) { continue }
+    if ($v -eq '') { [void]$values.Remove($k) } else { $values[$k] = $v }
+  }
+  return $values
+}
+
+# Fixed-output parser for $script:WslEnvProbe: returns the value map, or $null
+# when the stream lost its sentinels / field count, or when a value arrived with
+# an embedded newline or control byte. Callers turn $null into a fail-safe
+# legacy context.
+function ConvertFrom-WslEnvProbe([string]$Text) {
+  $begin = [string][char]1 + 'B'
+  $end = [string][char]1 + 'E'
+  if ([string]::IsNullOrEmpty($Text)) { return $null }
+  $start = $Text.IndexOf($begin, [StringComparison]::Ordinal)
+  if ($start -lt 0) { return $null }
+  $stop = $Text.IndexOf($end, $start + $begin.Length, [StringComparison]::Ordinal)
+  if ($stop -lt 0) { return $null }
+  $body = $Text.Substring($start + $begin.Length, $stop - ($start + $begin.Length))
+  $parts = $body.Split([char]2)
+  if ($parts.Count -ne ($script:MiseEnvKeys.Count + 1)) { return $null }
+  if ($parts[0] -ne '') { return $null }
+  $values = @{}
+  for ($i = 0; $i -lt $script:MiseEnvKeys.Count; $i++) {
+    $seg = [string]$parts[$i + 1]
+    if ($seg.EndsWith("`n")) { $seg = $seg.Substring(0, $seg.Length - 1) }
+    if ($seg -match '[\x00-\x1F]') { return $null }
+    if ($seg -eq '') { continue }
+    $values[$script:MiseEnvKeys[$i]] = $seg
+  }
+  return $values
+}
+
+function Read-WslScopeEnvironment($Scope) {
+  $label = [string]$Scope['Label']
+  $distro = [string]$Scope['Distro']
+  if ([string]::IsNullOrEmpty($distro) -or $distro -match '[\s\\/]') {
+    return @{ Values = @{}; Error = "wsl scope '$label' has no usable distro name" }
+  }
+  if (-not (Get-Command wsl.exe -ErrorAction Ignore)) {
+    return @{ Values = @{}; Error = "wsl.exe is not available for scope '$label'" }
+  }
+  $text = ''
+  try {
+    $lines = @(& wsl.exe -d $distro -- sh -c $script:WslEnvProbe 2>$null)
+    $text = ($lines | ForEach-Object { [string]$_ }) -join "`n"
+  } catch {
+    return @{ Values = @{}; Error = "mise environment probe failed in '$distro': $($_.Exception.Message)" }
+  }
+  $values = ConvertFrom-WslEnvProbe $text
+  if ($null -eq $values) {
+    return @{ Values = @{}; Error = "unreadable mise environment in '$distro'" }
+  }
+  return @{ Values = $values; Error = $null }
+}
+
+# The mise environment for one scope: @{ Values; Error }. Real Windows and fake
+# scopes read the process environment (fake scopes with per-scope injections),
+# real WSL asks its own distro. Memoized on the scope record.
+function Get-MiseScopeEnvironment($Scope) {
+  if ($null -ne $Scope) {
+    $cached = $Scope['Environment']
+    if ($null -ne $cached) { return $cached }
+  }
+  $info = $null
+  try {
+    if ($null -eq $Scope) {
+      $info = @{ Values = (Get-MiseProcessValues); Error = $null }
+    } elseif (Test-ScopeFake $Scope) {
+      $info = @{ Values = (Get-FakeScopeEnvironment $Scope); Error = $null }
+    } elseif ((Get-ScopePlatform $Scope) -eq 'win32') {
+      $info = @{ Values = (Get-MiseProcessValues); Error = $null }
+    } else {
+      $info = Read-WslScopeEnvironment $Scope
+    }
+  } catch {
+    $info = @{ Values = @{}; Error = "mise environment unavailable: $($_.Exception.Message)" }
+  }
+  if ($null -eq $info) { $info = @{ Values = @{}; Error = 'mise environment unavailable' } }
+  if ($null -ne $Scope) { $Scope['Environment'] = $info }
+  return $info
+}
+
+# Translates an absolute POSIX path reported from inside a WSL distro into the
+# \\wsl$\<distro>\... form pmsec can address from Windows. Anything else -
+# relative paths, drive-qualified or UNC input, backslashes, NUL/control bytes,
+# and '.'/'..' traversal segments - yields $null so callers fail safe instead of
+# writing a path mise never reads. The result is only ever used as text.
+function Convert-WslPosixPath($Scope, [string]$PosixPath) {
+  if (-not (Test-RealWslScope $Scope)) { return $null }
+  $root = [string]$Scope['WslRoot']
+  if ($root -notmatch '^\\\\wsl\$\\[^\\/]+$') { return $null }
+  if ([string]::IsNullOrEmpty($PosixPath)) { return $null }
+  if ($PosixPath -match '[\x00-\x1F]') { return $null }
+  if ($PosixPath.Contains('\')) { return $null }
+  if (-not $PosixPath.StartsWith('/')) { return $null }
+  if ($PosixPath.StartsWith('//')) { return $null }
+  $segments = New-Object System.Collections.Generic.List[string]
+  foreach ($seg in ($PosixPath -split '/')) {
+    if ($seg -eq '') { continue }
+    if ($seg -eq '.' -or $seg -eq '..') { return $null }
+    $segments.Add($seg)
+  }
+  if ($segments.Count -eq 0) { return $root }
+  return ($root + '\' + ($segments.ToArray() -join '\'))
+}
+
+# Maps a scoped environment path onto something this host can address: real WSL
+# scopes report POSIX paths (translated to UNC), fake scopes carry host test
+# paths (kept verbatim so conformance temp dirs keep working). $null means the
+# value cannot be addressed, and every caller fails safe on it.
+function Convert-ScopePathForWrite($Scope, [string]$Value) {
+  if ([string]::IsNullOrEmpty($Value)) { return $null }
+  if ($Value -match '[\x00-\x1F]') { return $null }
+  if (-not (Test-RealWslScope $Scope)) { return $Value }
+  return (Convert-WslPosixPath $Scope $Value)
+}
+
+function New-ScopePathError($Scope, [string]$Name, [string]$Value) {
+  $label = ''
+  if ($null -ne $Scope) { $label = [string]$Scope['Label'] }
+  $shown = $Value -replace '[\x00-\x1F]', '?'
+  return ("unusable $Name for scope '$label': $shown")
+}
+
+# ---- legacy path, now scope-aware ----
+
+# The single global config file mise reads today. Windows resolution is
+# unchanged byte for byte. A non-win32 scope (WSL or fake) now resolves from its
+# own environment - nonempty MISE_GLOBAL_CONFIG_FILE, else nonempty
+# XDG_CONFIG_HOME/mise, else <home>/.config/mise - which is the phase-2
+# intentional fix. Joins stay host-shaped (PathJoin) so existing output does not
+# move; real-WSL values arrive as POSIX paths and are translated to UNC first.
+function Get-MisePathForScope($Scope) {
+  if ((Get-ScopePlatform $Scope) -eq 'win32') {
+    if ($env:MISE_GLOBAL_CONFIG_FILE) { return $env:MISE_GLOBAL_CONFIG_FILE }
+    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { PathJoin (Get-ScopeHome $Scope) 'AppData' 'Local' }
+    return (PathJoin $base 'mise' 'config.toml')
+  }
+  $values = (Get-MiseScopeEnvironment $Scope)['Values']
+  if ($null -ne $values) {
+    $global = $values['MISE_GLOBAL_CONFIG_FILE']
+    if (-not [string]::IsNullOrEmpty($global)) {
+      $mapped = Convert-ScopePathForWrite $Scope $global
+      if (-not [string]::IsNullOrEmpty($mapped)) { return $mapped }
+    }
+    $xdg = $values['XDG_CONFIG_HOME']
+    if (-not [string]::IsNullOrEmpty($xdg)) {
+      $mapped = Convert-ScopePathForWrite $Scope $xdg
+      if (-not [string]::IsNullOrEmpty($mapped)) {
+        # A real WSL value is a \\wsl$\... UNC path, which Join-Path cannot
+        # resolve off-drive; the scope separator yields the same bytes Windows
+        # produces and stays testable on a non-Windows host.
+        if (Test-RealWslScope $Scope) { return (Join-ScopePath $Scope $mapped @('mise', 'config.toml')) }
+        return (PathJoin $mapped 'mise' 'config.toml')
+      }
+    }
+  }
+  return (PathJoin (Get-ScopeHome $Scope) '.config' 'mise' 'config.toml')
+}
+
+# ---- new path family ----
+
+# Where mise's system-wide config lives. Windows: under the *current* drive root
+# ($DriveRoot is injected for tests; production derives it from the working
+# location, since a D:-only host must not read C:). WSL: /etc/mise inside the
+# distro, expressed as a UNC path under this scope.
+function Get-DefaultSystemMiserc($Scope, [string]$DriveRoot) {
+  if (Test-RealWslScope $Scope) {
+    $unc = Convert-WslPosixPath $Scope '/etc/mise/miserc.toml'
+    if (-not [string]::IsNullOrEmpty($unc)) { return $unc }
+    return '/etc/mise/miserc.toml'
+  }
+  if ((Get-ScopePlatform $Scope) -eq 'win32') {
+    $root = [string]$DriveRoot
+    if (-not [string]::IsNullOrEmpty($root)) { $root = $root.TrimEnd([char[]]@('\', '/')) }
+    if ([string]::IsNullOrEmpty($root)) { return '\etc\mise\miserc.toml' }
+    return ($root + '\etc\mise\miserc.toml')
+  }
+  return '/etc/mise/miserc.toml'
+}
+
+# Production drive root for the win32 system miserc default.
+function Get-CurrentDriveRoot {
+  $path = $null
+  try { $path = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath } catch { $path = $null }
+  if ([string]::IsNullOrEmpty($path)) {
+    try { $path = (Get-Location).Path } catch { $path = $null }
+  }
+  if ([string]::IsNullOrEmpty($path)) { return '' }
+  try { return [string][System.IO.Path]::GetPathRoot($path) } catch { return '' }
+}
+
+# The whole layered path family for one scope. Pure: no filesystem access, no
+# probe, no throw. `MiseDir` never falls back to %LOCALAPPDATA% - it is
+# ~/.config/mise on every OS unless MISE_CONFIG_DIR / XDG_CONFIG_HOME say
+# otherwise. `Error` is non-empty when a scoped override could not be addressed
+# (a relative WSL path, a traversal segment, ...), in which case that field fell
+# back to the next candidate and the mode gate must refuse the new layout.
+function Resolve-MiseNewPaths($Scope, $Environment, [string]$DriveRoot) {
+  if ($null -eq $Environment) { $Environment = @{} }
+  $pathError = $null
+
+  $miseDir = $null
+  $rawDir = $Environment['MISE_CONFIG_DIR']
+  if (-not [string]::IsNullOrEmpty($rawDir)) {
+    $miseDir = Convert-ScopePathForWrite $Scope $rawDir
+    if ([string]::IsNullOrEmpty($miseDir)) { $pathError = New-ScopePathError $Scope 'MISE_CONFIG_DIR' $rawDir }
+  }
+  if ([string]::IsNullOrEmpty($miseDir)) {
+    $rawXdg = $Environment['XDG_CONFIG_HOME']
+    if (-not [string]::IsNullOrEmpty($rawXdg)) {
+      $xdg = Convert-ScopePathForWrite $Scope $rawXdg
+      if ([string]::IsNullOrEmpty($xdg)) {
+        if ([string]::IsNullOrEmpty($pathError)) { $pathError = New-ScopePathError $Scope 'XDG_CONFIG_HOME' $rawXdg }
+      } else {
+        $miseDir = Join-ScopePath $Scope $xdg @('mise')
+      }
+    }
+  }
+  if ([string]::IsNullOrEmpty($miseDir)) { $miseDir = Join-ScopePath $Scope (Get-ScopeHome $Scope) @('.config', 'mise') }
+
+  $systemMiserc = $null
+  $rawSystem = $Environment['MISE_SYSTEM_CONFIG_DIR']
+  if (-not [string]::IsNullOrEmpty($rawSystem)) {
+    $systemDir = Convert-ScopePathForWrite $Scope $rawSystem
+    if ([string]::IsNullOrEmpty($systemDir)) {
+      if ([string]::IsNullOrEmpty($pathError)) { $pathError = New-ScopePathError $Scope 'MISE_SYSTEM_CONFIG_DIR' $rawSystem }
+    } else {
+      $systemMiserc = Join-ScopePath $Scope $systemDir @('miserc.toml')
+    }
+  }
+  if ([string]::IsNullOrEmpty($systemMiserc)) { $systemMiserc = Get-DefaultSystemMiserc $Scope $DriveRoot }
+
+  return @{
+    MiseDir = $miseDir
+    BaseConfig = (Join-ScopePath $Scope $miseDir @('config.toml'))
+    PmsecConfig = (Join-ScopePath $Scope $miseDir @('config.pmsec.toml'))
+    LocalMiserc = (Join-ScopePath $Scope $miseDir @('miserc.local.toml'))
+    SharedMiserc = (Join-ScopePath $Scope $miseDir @('miserc.toml'))
+    SystemMiserc = $systemMiserc
+    Error = $pathError
+  }
+}
+
+# ---- version + mode gate ----
+
+# Parses the first X.Y.Z triple in $Text into the shape VersionGte expects. The
+# same regex as VersionDetect, so the mode gate and the cooldown preflight floor
+# can never disagree about what a version string means.
+function Parse-VersionText([string]$Text) {
+  if ([string]::IsNullOrEmpty($Text)) { return $null }
+  if ($Text -notmatch '(\d+)\.(\d+)\.(\d+)') { return $null }
+  return @{ Major = [int]$Matches[1]; Minor = [int]$Matches[2]; Patch = [int]$Matches[3]; Raw = $Matches[0] }
+}
+
+# PMSEC_MISE_VERSION applies to every scope (it is the deterministic test/CI
+# pin). Set=$false mirrors VersionDetect: a value that carries no version falls
+# through to real detection rather than being treated as a pin.
+function Get-MiseVersionOverride {
+  $raw = [Environment]::GetEnvironmentVariable('PMSEC_MISE_VERSION', 'Process')
+  if ([string]::IsNullOrEmpty($raw)) { return @{ Set = $false; Version = $null } }
+  if ($raw -eq 'none') { return @{ Set = $true; Version = $null } }
+  $v = Parse-VersionText $raw
+  if ($null -ne $v) { return @{ Set = $true; Version = $v } }
+  return @{ Set = $false; Version = $null }
+}
+
+function Get-WslMiseVersion($Scope) {
+  $distro = [string]$Scope['Distro']
+  if ([string]::IsNullOrEmpty($distro) -or $distro -match '[\s\\/]') { return $null }
+  if (-not (Get-Command wsl.exe -ErrorAction Ignore)) { return $null }
+  $text = ''
+  try {
+    $lines = @(& wsl.exe -d $distro -- mise --version 2>$null)
+    $text = ($lines | ForEach-Object { [string]$_ }) -join "`n"
+  } catch { return $null }
+  return (Parse-VersionText $text)
+}
+
+# The mise version as seen inside the scope: injected fake value -> global
+# PMSEC_MISE_VERSION -> real detection (host for Windows, the distro's own mise
+# for WSL). Fake scopes never spawn a host binary or wsl.exe, so anything they
+# cannot resolve stays unknown and the gate keeps them on legacy.
+function Get-ScopedMiseVersion($Scope) {
+  if (Test-ScopeFake $Scope) {
+    $data = Get-FakeScopeData $Scope
+    $injected = [string]$data['Version']
+    if ($injected -ne '') {
+      if ($injected -eq 'none') { return $null }
+      return (Parse-VersionText $injected)
+    }
+    $ovr = Get-MiseVersionOverride
+    if ($ovr['Set']) { return $ovr['Version'] }
+    return $null
+  }
+  if ((Get-ScopePlatform $Scope) -eq 'win32') { return (VersionDetect 'mise') }
+  $ovr = Get-MiseVersionOverride
+  if ($ovr['Set']) { return $ovr['Version'] }
+  return (Get-WslMiseVersion $Scope)
+}
+
+# One context per scope per invocation:
+#   Version          detected (or injected) mise version, $null when unknown
+#   Environment      the five mise variables as this scope sees them
+#   Paths            the new path family plus LegacyConfig
+#   SupportsNewMode  version >= 2026.11.0, no MISE_GLOBAL_CONFIG_FILE, probes ok
+#   Error            probe / path problems, '' when everything resolved
+# Failures never throw: a failed WSL probe or an unusable scoped path degrades
+# to legacy mode with Error populated.
+function New-MiseScopeContext($Scope) {
+  $envInfo = Get-MiseScopeEnvironment $Scope
+  $values = $envInfo['Values']
+  if ($null -eq $values) { $values = @{} }
+  $ctxError = $envInfo['Error']
+  if ($null -eq $ctxError) { $ctxError = '' }
+  $envFailed = ($ctxError -ne '')
+
+  $version = $null
+  try { $version = Get-ScopedMiseVersion $Scope } catch { $version = $null }
+
+  $paths = $null
+  try { $paths = Resolve-MiseNewPaths $Scope $values (Get-CurrentDriveRoot) } catch { $paths = $null }
+  if ($null -eq $paths) {
+    $paths = @{
+      MiseDir = ''; BaseConfig = ''; PmsecConfig = ''
+      LocalMiserc = ''; SharedMiserc = ''; SystemMiserc = ''
+      Error = 'mise path resolution failed'
+    }
+  }
+  $paths['LegacyConfig'] = ''
+  try {
+    $paths['LegacyConfig'] = [string](Get-MisePathForScope $Scope)
+  } catch {
+    # Legacy resolution is host-shaped (PathJoin) and can fail on a synthetic
+    # scope whose home belongs to another OS; keep the rest of the family and
+    # report it instead of losing the whole context.
+    if ([string]::IsNullOrEmpty($paths['Error'])) { $paths['Error'] = 'legacy mise path unavailable: ' + $_.Exception.Message }
+  }
+  $pathError = $paths['Error']
+  if ($null -eq $pathError) { $pathError = '' }
+  if ($pathError -ne '') {
+    if ($envFailed) { $ctxError = $ctxError + '; ' + $pathError } else { $ctxError = $pathError }
+  }
+
+  $supports = $true
+  if ($envFailed) { $supports = $false }
+  if ($null -eq $version) { $supports = $false }
+  elseif (-not (VersionGte $version $script:MiseNewModeFloor)) { $supports = $false }
+  if (-not [string]::IsNullOrEmpty($values['MISE_GLOBAL_CONFIG_FILE'])) { $supports = $false }
+  if ($pathError -ne '') { $supports = $false }
+
+  return @{
+    Version = $version
+    Environment = $values
+    Paths = $paths
+    SupportsNewMode = $supports
+    Error = $ctxError
+  }
+}
+
+# Cached per scope: callers repeat this for every tool, and a real WSL scope
+# pays for two wsl.exe calls to build it. A context is never reused across CLI
+# invocations because scope records are rebuilt per invocation.
+function Get-MiseScopeContext($Scope) {
+  if ($null -eq $Scope) { return (New-MiseScopeContext $null) }
+  $cached = $Scope['MiseContext']
+  if ($null -ne $cached) { return $cached }
+  $ctx = $null
+  try {
+    $ctx = New-MiseScopeContext $Scope
+  } catch {
+    $message = 'mise context unavailable'
+    try { if ($_.Exception.Message) { $message = 'mise context unavailable: ' + $_.Exception.Message } } catch { }
+    $ctx = @{
+      Version = $null; Environment = @{}
+      Paths = @{
+        MiseDir = ''; BaseConfig = ''; PmsecConfig = ''; LocalMiserc = ''
+        SharedMiserc = ''; SystemMiserc = ''; LegacyConfig = ''
+        Error = $message
+      }
+      SupportsNewMode = $false; Error = $message
+    }
+  }
+  $Scope['MiseContext'] = $ctx
+  return $ctx
+}
+
+# ---- narrow miserc env helper ----
+
+# The only multi-line shape pmsec needs out of a miserc file: a bare top-level
+# `env = [...]` array of one-line quoted strings. These helpers are pure text
+# transformations - no filesystem access, no throw at the public boundary - so a
+# caller can validate, report, and only then write. Read-MisercEnv returns the
+# decoded names plus the exact character range the writer replaces; everything
+# outside that range is preserved byte for byte.
+#
+# The "root region" is everything from the start of the text (after a leading
+# BOM, which is skipped but preserved) to the first line whose first
+# non-whitespace character is `[` outside a string, a comment, or an open
+# array/inline table (string- and comment-aware bracket depth). Only a bare,
+# case-sensitive `env` key there is a target; every other character is
+# untouched. The scanner tracks enough structure (basic/literal strings,
+# `"""`/`'''` blocks, comments, value brackets) to keep env-like text and table
+# headers inside them from being misparsed; it does not validate TOML in
+# general.
+#
+# deliberate: Issue-#194 TOML subset only; unsupported forms fail closed. Upgrade path: extend this parser per port behind the same contract.
+#
+# node/src/util/miseconf.mjs and python/src/pmsec/util/miseconf.py implement the
+# same contract. The Reason strings are frozen across ports and must stay
+# identical: they are the diagnostic a later phase surfaces verbatim.
+#
+# Offsets are UTF-16 code-unit indices (PowerShell strings are UTF-16), which is
+# also what Substring takes, so splicing is exact. Unicode names pass through
+# opaque: only ASCII boundaries are ever compared or cut on.
+
+# A bare `env` token only counts when followed by one of these, so `envelope`
+# and `envoy` stay unrelated keys.
+$script:MisercBareKeyEnd = [char[]]@(' ', "`t", "`r", "`n", [char]12, [char]11, '=')
+
+# Internal failure signal. PowerShell wraps a thrown exception differently
+# between 5.1 and 7, so the reason rides inside the message behind a fixed
+# marker that only this file produces; the public helpers catch it and turn it
+# into the structured result. Unexpected exceptions are rethrown instead of
+# being reported as a parse reason.
+$script:MisercReasonMarker = 'pmsec miserc env: '
+
+function Stop-MisercParse([string]$Reason) {
+  throw ($script:MisercReasonMarker + $Reason)
+}
+
+function Get-MisercCaughtReason($ErrorRecord) {
+  $message = ''
+  try { $message = [string]$ErrorRecord.Exception.Message } catch { $message = '' }
+  if ([string]::IsNullOrEmpty($message)) { return $null }
+  $at = $message.IndexOf($script:MisercReasonMarker, [StringComparison]::Ordinal)
+  if ($at -lt 0) { return $null }
+  return $message.Substring($at + $script:MisercReasonMarker.Length)
+}
+
+# `invalid env in <path>: <reason>` - the one envelope every port prints.
+function Get-MisercErrorText([string]$Path, [string]$Reason) {
+  return ('invalid env in ' + $Path + ': ' + $Reason)
+}
+
+# Reads the top-level `env` array of a miserc file.
+#   Success: @{ Ok = $true; Defined = $true; Env = <string[]>; Start; End; Reason = '' }
+#            Start is the offset of the bare `env` key, End one past the closing
+#            `]`; with no top-level assignment Defined = $false and Start = End = -1.
+#   Failure: @{ Ok = $false; Defined = $false; Env = @(); Start = -1; End = -1; Reason = <reason> }
+# -Path is part of the API so callers can hand the same pair to
+# Get-MisercErrorText; the result carries the bare reason.
+function Read-MisercEnv([string]$Text, [string]$Path) {
+  if ($null -eq $Text) { $Text = '' }
+  $analysis = $null
+  try {
+    $analysis = Get-MisercAnalysis $Text
+  } catch {
+    $reason = Get-MisercCaughtReason $_
+    if ($null -eq $reason) { throw }
+    return @{ Ok = $false; Defined = $false; Env = @(); Start = -1; End = -1; Reason = $reason }
+  }
+  $assignment = $analysis['Assignment']
+  if ($null -eq $assignment) {
+    return @{ Ok = $true; Defined = $false; Env = @(); Start = -1; End = -1; Reason = '' }
+  }
+  $names = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($element in $assignment['Elements']) { $names.Add([string]$element['Value']) }
+  return @{
+    Ok = $true; Defined = $true; Env = $names.ToArray()
+    Start = [int]$assignment['KeyStart']; End = [int]$assignment['End']; Reason = ''
+  }
+}
+
+# Rewrites the top-level `env` array so it holds -Inherited (every exact `pmsec`
+# removed) plus one `pmsec` last, as a single canonical line. An existing
+# assignment is replaced from its bare key through its closing `]`, reusing the
+# local quoting of names that are already present (leftmost token wins); every
+# other byte - BOM, CRLF, comments, unrelated tables, a missing final newline -
+# is preserved. Without an assignment, one line is inserted at the end of the
+# root region: before the first real table header, before a value still open at
+# the end of the text, or at the end of the text. The result is byte-identical
+# when applied twice.
+#   Success: @{ Ok = $true; Text = <string>; Reason = '' }
+#   Failure: @{ Ok = $false; Text = $null; Reason = <reason> }
+function Update-MisercEnvText([string]$Text, [string[]]$Inherited, [string]$Path) {
+  if ($null -eq $Text) { $Text = '' }
+  if ($null -eq $Inherited) { $Inherited = @() }
+  $output = $null
+  try {
+    $analysis = Get-MisercAnalysis $Text
+    # Validate before touching the text: a conflicting shape must never be
+    # rewritten, since a later mise would then see two sources for `env`.
+    if ($analysis['EnvTable'] -ge 0 -or $analysis['DottedEnv'] -ge 0) {
+      Stop-MisercParse 'env table conflicts with the env array'
+    }
+    $assignment = $analysis['Assignment']
+    $local = @()
+    if ($null -ne $assignment) { $local = $assignment['Elements'] }
+
+    $names = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in $Inherited) {
+      if ($null -eq $name) { continue }
+      if ([string]$name -ceq 'pmsec') { continue }
+      $names.Add([string]$name)
+    }
+    $names.Add('pmsec')
+
+    $tokens = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in $names) {
+      $token = $null
+      foreach ($element in $local) {
+        if ([string]$element['Value'] -ceq $name) { $token = [string]$element['Token']; break }
+      }
+      if ($null -eq $token) { $tokens.Add((ConvertTo-MisercEnvToken $name)) } else { $tokens.Add($token) }
+    }
+    $line = 'env = []'
+    if ($tokens.Count -gt 0) { $line = 'env = [' + ($tokens -join ', ') + ']' }
+
+    if ($null -ne $assignment) {
+      $start = [int]$assignment['KeyStart']
+      $end = [int]$assignment['End']
+      $output = $Text.Substring(0, $start) + $line + $Text.Substring($end)
+    } else {
+      # Absent assignment: land on the last line of the root region, i.e. just
+      # before the first real table header. With no header, a value still open
+      # at the end of the text ends the region where it began: the file is broken
+      # TOML either way, but the new key must not become an element of that
+      # value. Everything closed leaves the boundary at the end of the text.
+      $at = $Text.Length
+      if ([int]$analysis['RootEnd'] -ge 0) {
+        $at = [int]$analysis['RootEnd']
+      } elseif ([int]$analysis['OpenValue'] -ge 0) {
+        $at = [int]$analysis['OpenValue']
+      }
+      $before = $Text.Substring(0, $at)
+      $separator = ''
+      if ($before.Length -gt 0 -and -not $before.EndsWith("`n")) { $separator = "`n" }
+      $output = $before + $separator + $line + "`n" + $Text.Substring($at)
+    }
+  } catch {
+    $reason = Get-MisercCaughtReason $_
+    if ($null -eq $reason) { throw }
+    return @{ Ok = $false; Text = $null; Reason = $reason }
+  }
+  return @{ Ok = $true; Text = $output; Reason = '' }
+}
+
+# ---- narrow miserc env helper: scanner ----
+
+# Ordinal prefix test that tolerates a truncated tail: PowerShell 5.1's .NET has
+# no StartsWith(string, int) overload, and CompareOrdinal throws out of range.
+function Test-MisercAt([string]$Text, [int]$Index, [string]$Token) {
+  if (([string]::IsNullOrEmpty($Token))) { return $true }
+  if ($Index -lt 0) { return $false }
+  if ($Index + $Token.Length -gt $Text.Length) { return $false }
+  return ([string]::CompareOrdinal($Text, $Index, $Token, 0, $Token.Length) -eq 0)
+}
+
+function Test-MisercSpace([char]$Char) {
+  return ($Char -eq ' ' -or $Char -eq "`t" -or $Char -eq "`r" -or $Char -eq "`n")
+}
+
+# TOML lets a multiline string end with up to two quotes that belong to its
+# content (`"""a""""`), so consume the whole run instead of stopping short.
+function Get-MisercQuoteRun([string]$Text, [int]$Index) {
+  $quote = $Text[$Index]
+  $j = $Index
+  while ($j -lt $Text.Length -and $Text[$j] -eq $quote -and ($j - $Index) -lt 5) { $j++ }
+  return ($j - $Index)
+}
+
+# Horizontal whitespace only: a dotted key cannot cross a line, so the forms
+# that are tolerated before `=` stay bare-key decisions instead of dotted ones.
+function Skip-MisercBlanks([string]$Text, [int]$Index, [int]$End) {
+  $i = $Index
+  while ($i -lt $End) {
+    $c = $Text[$i]
+    if ($c -ne ' ' -and $c -ne "`t" -and $c -ne "`r") { break }
+    $i++
+  }
+  return $i
+}
+
+# Decodes the first dot-separated key segment at $Index, the way every port
+# does: a quoted segment loses its quotes but keeps escapes undecoded, a bare
+# one runs to whitespace, `.`, `=`, a comment or a closing bracket. Returns
+# @{ Text; End } - Text is the decoded segment, End the offset just past it - or
+# $null when it is empty or its quote never closes before $End. $End is the line
+# end, so a header cut short can never borrow a segment from the line below it.
+#
+# deliberate: Issue-#194 subset only; quotes are stripped, never decoded, so no
+# escaped spelling can collapse onto the plain name `env`.
+function Get-MisercKeySegment([string]$Text, [int]$Index, [int]$End) {
+  if ($Index -lt 0 -or $Index -ge $End) { return $null }
+  $quote = $Text[$Index]
+  if ($quote -eq '"' -or $quote -eq "'") {
+    $raw = New-Object System.Text.StringBuilder
+    $j = $Index + 1
+    while ($j -lt $End) {
+      if ($Text[$j] -eq $quote) { return @{ Text = $raw.ToString(); End = $j + 1 } }
+      if ($quote -eq '"' -and $Text[$j] -eq '\') {
+        # The pair is copied verbatim and never decoded, so an escaped spelling
+        # cannot match the plain name every port compares against.
+        if ($j + 1 -lt $End) { [void]$raw.Append($Text.Substring($j, 2)) } else { [void]$raw.Append([string]$Text[$j]) }
+        $j = $j + 2
+        continue
+      }
+      [void]$raw.Append([string]$Text[$j])
+      $j++
+    }
+    return $null
+  }
+  $j = $Index
+  while ($j -lt $End) {
+    $c = $Text[$j]
+    if ($c -eq ' ' -or $c -eq "`t" -or $c -eq "`r" -or $c -eq '.' -or $c -eq '=' -or $c -eq ']' -or $c -eq '}') { break }
+    $j++
+  }
+  if ($j -eq $Index) { return $null }
+  return @{ Text = $Text.Substring($Index, $j - $Index); End = $j }
+}
+
+# A depth-0 line-start `[` opens a table header. It owns the key pmsec writes
+# when its first decoded segment is exactly `env` and that segment is followed
+# by `.` (a deeper table) or `]` (the table itself): `[env]`, `[env.foo]`,
+# `[ "env" ]`, `["env".x]`, and a header cut short (`[env.`, `[env.[`,
+# `[[env.`) all conflict. Termination is irrelevant, because a broken header is
+# a file mise never loads and the key it names still collides with the array.
+# `[x.env]`, `[envsub]`, `["env.foo"]` (one quoted key that spells a dot) and a
+# bare `[env` with nothing after its segment do not conflict. Every comparison
+# is ordinal, so `[ENV]` is a different table.
+function Test-MisercHeaderOwnsEnv([string]$Text, [int]$Index, [int]$End) {
+  $after = $Index + 1
+  if ($after -lt $End -and $Text[$after] -eq '[') { $after++ }
+  $segment = Get-MisercKeySegment $Text (Skip-MisercBlanks $Text $after $End) $End
+  if ($null -eq $segment) { return $false }
+  if ([string]$segment['Text'] -cne 'env') { return $false }
+  $rest = Skip-MisercBlanks $Text ([int]$segment['End']) $End
+  if ($rest -ge $End) { return $false }
+  return ($Text[$rest] -eq '.' -or $Text[$rest] -eq ']')
+}
+
+# Classifies one line-start token. `bare` is the exact token `env` followed by
+# whitespace/`=`/end-of-file; `dotted` is `env` as the first segment of a dotted
+# key (`env.foo`, `env . foo`, `"env".foo`), which defines the env table rather
+# than the array; `quoted` is `"env"`/`'env'` used as a key, which is outside the
+# subset. $null means "unrelated", which is the answer for nearly every line. A
+# bare `env` at end-of-file is still `bare`: the empty sentinel means the
+# assignment is cut short, never that the key is unrelated.
+function Get-MisercKeyKind([string]$Text, [int]$Index, [int]$Len) {
+  $c = $Text[$Index]
+  if ($c -eq '"' -or $c -eq "'") {
+    $quote = [string]$c
+    if (Test-MisercAt $Text $Index ($quote + $quote + $quote)) { return $null }
+    # The segment is bounded by the line end: a quoted key never spans a line.
+    $end = $Len
+    $nl = $Text.IndexOf("`n", $Index)
+    if ($nl -ge 0 -and $nl -lt $Len) { $end = $nl }
+    $segment = Get-MisercKeySegment $Text $Index $end
+    if ($null -eq $segment) { return $null }
+    # Ordinal: `"ENV" = 1` is an unrelated quoted key, not the env array.
+    if ([string]$segment['Text'] -cne 'env') { return $null }
+    $after = [int]$segment['End']
+    $rest = Skip-MisercBlanks $Text $after $end
+    if ($rest -lt $end -and $Text[$rest] -eq '.') { return 'dotted' }
+    # `env` followed by `=` may carry a comment or a newline before it, so this
+    # trivia skip spans lines while the dotted decision above stays on this one.
+    $k = $after
+    while ($k -lt $Len -and (Test-MisercSpace $Text[$k])) { $k++ }
+    if ($k -lt $Len -and $Text[$k] -eq '=') { return 'quoted' }
+    return $null
+  }
+  if (Test-MisercAt $Text $Index 'env') {
+    # A bare key may end the file; that still counts, so the assignment parser
+    # can report the missing `=`.
+    if ($Index + 3 -ge $Len) { return 'bare' }
+    # TOML allows whitespace around the dots of a dotted key, so it is "dotted"
+    # whether or not a blank sits between `env` and the dot.
+    $dot = Skip-MisercBlanks $Text ($Index + 3) $Len
+    if ($dot -lt $Len -and $Text[$dot] -eq '.') { return 'dotted' }
+    $next = $Text[$Index + 3]
+    if ($script:MisercBareKeyEnd -contains $next) { return 'bare' }
+  }
+  return $null
+}
+
+# One pass over the whole text. Tracks strings, comments, and value-bracket
+# depth so their contents are never read as structure, and records every offset
+# the callers need:
+#   RootEnd     - line start of the first depth-0 table header (-1 when there is none)
+#   BareEnv     - root-region offsets of bare `env` keys, in text order
+#   QuotedEnv   - first root-region `"env"`/`'env'` key, or -1
+#   DottedEnv   - first `env.` key anywhere, or -1 (fail closed: the subset does
+#                 not model table scoping, so a nested one is rejected too)
+#   EnvTable    - first header whose first segment decodes to `env`, or -1
+#   OpenValue   - line start where an array or inline table still open at the end
+#                 of the text began, or -1
+#   Unterminated- a `"""`/`'''` block that never closes
+#
+# A line start only offers a header or a key at depth 0: inside `key = [` ... `]`
+# or `key = {` ... `}` the line is value data, and reading a nested `[` there as
+# a header would cut the root region short and point the writer's insertion
+# inside the array. Brackets inside strings and comments never move the depth
+# because those characters are consumed in their own states.
+#
+# deliberate: Issue-#194 subset only; the depth is one counter over both bracket
+# kinds. It answers "is a value open", not "does this file nest legally", which
+# is the only question the root region and the insertion point ask.
+function Get-MisercLex([string]$Text) {
+  $n = $Text.Length
+  $i = 0
+  if ($n -gt 0 -and $Text[0] -eq [char]0xFEFF) { $i = 1 }
+  $state = 'code'
+  $atLineStart = $true
+  $lineStart = $i
+  $inRoot = $true
+  $rootEnd = -1
+  $quotedEnv = -1
+  $dottedEnv = -1
+  $envTable = -1
+  $depth = 0
+  $openValue = -1
+  $bareEnv = New-Object 'System.Collections.Generic.List[int]'
+
+  while ($i -lt $n) {
+    $c = $Text[$i]
+    if ($state -eq 'comment') {
+      if ($c -eq "`n") { $state = 'code'; $atLineStart = $true; $lineStart = $i + 1 }
+      $i++
+      continue
+    }
+    if ($state -eq 'ml-basic' -or $state -eq 'ml-literal') {
+      # A basic block processes escapes, so a backslash consumes the character
+      # after it and `\"""` carries no closing delimiter; a literal block has no
+      # escapes at all, so there the first `'''` always closes.
+      if ($state -eq 'ml-basic' -and $c -eq '\') { $i = $i + 2; $atLineStart = $false; continue }
+      $delim = '"""'
+      if ($state -eq 'ml-literal') { $delim = "'''" }
+      if (Test-MisercAt $Text $i $delim) {
+        $state = 'code'
+        $i = $i + (Get-MisercQuoteRun $Text $i)
+        $atLineStart = $false
+        continue
+      }
+      $atLineStart = ($c -eq "`n")
+      if ($atLineStart) { $lineStart = $i + 1 }
+      $i++
+      continue
+    }
+    if ($state -eq 'basic' -or $state -eq 'literal') {
+      if ($state -eq 'basic' -and $c -eq '\') {
+        # A one-line string ends with its line, so an escape pair may not reach
+        # past the newline: a trailing `\` is content like any other character
+        # and the newline closes the string. Only a `"""`/`'''` block that never
+        # closes is `unterminated string in file`.
+        if ($i + 1 -ge $n -or $Text[$i + 1] -eq "`n") { $state = 'code'; $i++; continue }
+        $i = $i + 2
+        continue
+      }
+      $quote = "'"
+      if ($state -eq 'basic') { $quote = '"' }
+      if ([string]$c -eq $quote) { $state = 'code'; $i++; continue }
+      # A one-line string cannot span a newline; the subset does not try to
+      # validate that, so the line simply ends it.
+      if ($c -eq "`n") { $state = 'code'; $atLineStart = $true; $lineStart = $i + 1 }
+      $i++
+      continue
+    }
+    # state -eq 'code'
+    if ($c -eq "`n") { $atLineStart = $true; $lineStart = $i + 1; $i++; continue }
+    if ($c -eq ' ' -or $c -eq "`t" -or $c -eq "`r" -or $c -eq [char]12 -or $c -eq [char]11) { $i++; continue }
+    if ($c -eq '#') { $state = 'comment'; $i++; continue }
+    if ($atLineStart) {
+      $atLineStart = $false
+      # A line that starts inside a value continues that value: its first token
+      # is array/inline-table data, never a header and never a root key.
+      if ($depth -eq 0 -and $c -eq '[') {
+        if ($inRoot) { $inRoot = $false; $rootEnd = $lineStart }
+        # Bounded by the line end: a header cut short (`[env.` at the end of the
+        # text, or `[env.[`) still names the env table, but must not borrow a
+        # segment from the line below it.
+        if ($envTable -lt 0) {
+          $lineEnd = $n
+          $nl = $Text.IndexOf("`n", $i)
+          if ($nl -ge 0) { $lineEnd = $nl }
+          if (Test-MisercHeaderOwnsEnv $Text $i $lineEnd) { $envTable = $i }
+        }
+        # The header's own `[` opens no value context: consuming it keeps its
+        # matching `]` from being read as a nested closer.
+        $i++
+        continue
+      }
+      if ($depth -eq 0) {
+        $kind = Get-MisercKeyKind $Text $i $n
+        if ($null -ne $kind) {
+          if ($kind -eq 'dotted') {
+            # Any `env.` dotted key is rejected, not only a root one: the subset
+            # does not model table scoping, so `env.foo` under a header is a
+            # shape pmsec cannot reason about and fails closed instead.
+            if ($dottedEnv -lt 0) { $dottedEnv = $i }
+          } elseif ($inRoot) {
+            if ($kind -eq 'quoted') {
+              if ($quotedEnv -lt 0) { $quotedEnv = $i }
+            } else {
+              $bareEnv.Add($i)
+            }
+          }
+        }
+      }
+    }
+    if ($c -eq '[' -or $c -eq '{') {
+      # An array or inline table swallows every following line until its
+      # matching closer; remember where the outermost one began so a value still
+      # open at the end of the text can never become the writer's insertion
+      # point.
+      if ($depth -eq 0) { $openValue = $lineStart }
+      $depth++
+      $i++
+      continue
+    }
+    if ($c -eq ']' -or $c -eq '}') {
+      # Floored: a header's closing `]` arrives here without a matching open,
+      # and a stray closer must not unbalance the lines that follow.
+      if ($depth -gt 0) { $depth-- }
+      if ($depth -eq 0) { $openValue = -1 }
+      $i++
+      continue
+    }
+    if ($c -eq '"') {
+      if (Test-MisercAt $Text $i '"""') { $state = 'ml-basic'; $i = $i + 3 } else { $state = 'basic'; $i++ }
+      continue
+    }
+    if ($c -eq "'") {
+      if (Test-MisercAt $Text $i "'''") { $state = 'ml-literal'; $i = $i + 3 } else { $state = 'literal'; $i++ }
+      continue
+    }
+    $i++
+  }
+
+  return @{
+    RootEnd = $rootEnd
+    BareEnv = $bareEnv
+    QuotedEnv = $quotedEnv
+    DottedEnv = $dottedEnv
+    EnvTable = $envTable
+    OpenValue = $openValue
+    Unterminated = ($state -eq 'ml-basic' -or $state -eq 'ml-literal')
+  }
+}
+
+# Skips spaces, tabs, CRs, newlines, and `#` comments. Used between every token
+# of an assignment, so an array may be spread over any number of lines.
+function Skip-MisercTrivia([string]$Text, [int]$Index) {
+  $n = $Text.Length
+  $i = $Index
+  while ($true) {
+    while ($i -lt $n -and (Test-MisercSpace $Text[$i])) { $i++ }
+    if ($i -lt $n -and $Text[$i] -eq '#') {
+      while ($i -lt $n -and $Text[$i] -ne "`n") { $i++ }
+      continue
+    }
+    return $i
+  }
+}
+
+# Scans a one-line basic string starting at the opening `"` and returns the
+# offset of the closing quote. The subset carries no escapes, so a backslash is
+# fatal rather than decoded.
+function Read-MisercBasicString([string]$Text, [int]$Index) {
+  if (Test-MisercAt $Text $Index '"""') { Stop-MisercParse 'multiline strings are unsupported' }
+  $j = $Index + 1
+  while ($true) {
+    if ($j -ge $Text.Length -or $Text[$j] -eq "`n") { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$j] -eq '\') { Stop-MisercParse 'escape sequences are unsupported' }
+    if ($Text[$j] -eq '"') { return $j }
+    $j++
+  }
+}
+
+# Scans a one-line literal string starting at the opening `'`. Backslashes are
+# ordinary content here, which is why `['say\hi']` is accepted verbatim.
+function Read-MisercLiteralString([string]$Text, [int]$Index) {
+  if (Test-MisercAt $Text $Index "'''") { Stop-MisercParse 'multiline strings are unsupported' }
+  $j = $Index + 1
+  while ($true) {
+    if ($j -ge $Text.Length -or $Text[$j] -eq "`n") { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$j] -eq "'") { return $j }
+    $j++
+  }
+}
+
+# Parses the array that must follow `env =`. $Start is the offset of `[`.
+# Returns the offset just past the closing `]` plus every element's original
+# token and decoded value.
+function Read-MisercArray([string]$Text, [int]$Start) {
+  $n = $Text.Length
+  $elements = New-Object 'System.Collections.Generic.List[hashtable]'
+  $i = $Start + 1
+  while ($true) {
+    $i = Skip-MisercTrivia $Text $i
+    if ($i -ge $n) { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$i] -eq ']') { $i++; break }
+    # A comma where an element is expected is leading or doubled.
+    if ($Text[$i] -eq ',') { Stop-MisercParse 'malformed env array separator' }
+    $at = $i
+    $close = -1
+    if ($Text[$i] -eq '"') {
+      $close = Read-MisercBasicString $Text $i
+    } elseif ($Text[$i] -eq "'") {
+      $close = Read-MisercLiteralString $Text $i
+    } else {
+      Stop-MisercParse 'env array elements must be single-line quoted strings'
+    }
+    $elements.Add(@{
+      Token = $Text.Substring($at, $close + 1 - $at)
+      Value = $Text.Substring($at + 1, $close - $at - 1)
+    })
+    $i = Skip-MisercTrivia $Text ($close + 1)
+    if ($i -ge $n) { Stop-MisercParse 'unterminated env assignment' }
+    if ($Text[$i] -eq ',') { $i++; continue }
+    if ($Text[$i] -eq ']') { $i++; break }
+    Stop-MisercParse 'malformed env array separator'
+  }
+  $end = $i
+  # Only whitespace and a trailing comment may follow the closing bracket.
+  $j = $i
+  while ($j -lt $n -and ($Text[$j] -eq ' ' -or $Text[$j] -eq "`t" -or $Text[$j] -eq "`r")) { $j++ }
+  if ($j -lt $n -and $Text[$j] -eq '#') { while ($j -lt $n -and $Text[$j] -ne "`n") { $j++ } }
+  if ($j -lt $n -and $Text[$j] -ne "`n") { Stop-MisercParse 'unexpected content after env array' }
+  return @{ End = $end; Elements = $elements }
+}
+
+# Parses one top-level `env` key occurrence. $KeyStart is the offset of the
+# `env` token; the returned range spans the key through the closing `]` so the
+# writer can replace exactly those characters.
+function Read-MisercAssignment([string]$Text, [int]$KeyStart) {
+  $n = $Text.Length
+  $i = Skip-MisercTrivia $Text ($KeyStart + 3)
+  if ($i -ge $n -or $Text[$i] -ne '=') { Stop-MisercParse 'malformed env assignment' }
+  $i = Skip-MisercTrivia $Text ($i + 1)
+  if ($i -ge $n) { Stop-MisercParse 'unterminated env assignment' }
+  # Any scalar is the wrong shape; a string is still scanned first so an
+  # unterminated or escaped one reports its own cause.
+  if ($Text[$i] -eq '"') {
+    [void](Read-MisercBasicString $Text $i)
+    Stop-MisercParse 'env must be an array'
+  }
+  if ($Text[$i] -eq "'") {
+    [void](Read-MisercLiteralString $Text $i)
+    Stop-MisercParse 'env must be an array'
+  }
+  if ($Text[$i] -ne '[') { Stop-MisercParse 'env must be an array' }
+  $array = Read-MisercArray $Text $i
+  return @{ KeyStart = $KeyStart; End = [int]$array['End']; Elements = $array['Elements'] }
+}
+
+# Validates everything before a caller can act on the result: a rejected file
+# must report one structured reason and never a partial reading.
+function Get-MisercAnalysis([string]$Text) {
+  $lex = Get-MisercLex $Text
+  if ([int]$lex['QuotedEnv'] -ge 0) { Stop-MisercParse 'quoted env key is unsupported' }
+  # Keep scanning past the first assignment so a second top-level `env` key is
+  # reported as a duplicate instead of the first one being returned silently.
+  $assignment = $null
+  foreach ($offset in $lex['BareEnv']) {
+    if ($null -ne $assignment) { Stop-MisercParse 'duplicate top-level env assignment' }
+    $assignment = Read-MisercAssignment $Text $offset
+  }
+  if ($lex['Unterminated']) { Stop-MisercParse 'unterminated string in file' }
+  return @{
+    Assignment = $assignment
+    RootEnd = [int]$lex['RootEnd']
+    EnvTable = [int]$lex['EnvTable']
+    DottedEnv = [int]$lex['DottedEnv']
+    OpenValue = [int]$lex['OpenValue']
+  }
+}
+
+# Serializes a name the subset can express without escapes: double quotes by
+# default, single quotes when the value holds `"` or a backslash, and a hard
+# failure when neither form can carry it (both quote kinds, or a control
+# character that a one-line string cannot hold).
+function ConvertTo-MisercEnvToken([string]$Value) {
+  if ($Value -match '[\x00-\x1F\x7F]') { Stop-MisercParse 'env name cannot be represented without escapes' }
+  $needsLiteral = $false
+  if ($Value.Contains('"')) { $needsLiteral = $true }
+  if ($Value.Contains('\')) { $needsLiteral = $true }
+  if (-not $needsLiteral) { return ('"' + $Value + '"') }
+  if ($Value.Contains("'")) { Stop-MisercParse 'env name cannot be represented without escapes' }
+  return ("'" + $Value + "'")
+}
+
+# ---- mise selector + local writer ----
+
+# What mise 2026.11 would use as the effective top-level `env` list for one
+# scope, and the only place pmsec writes that list.
+#
+# deliberate: Issue-#194 selector subset only; mise semantics outside this contract are not modelled. Upgrade path: extend this region per port behind the same contract rather than growing a second selector elsewhere.
+#
+# node/src/util/selector.mjs, python/src/pmsec/util/selector.py and the bash
+# `mise_selector_*` helpers implement the same contract:
+#   * a non-empty scoped MISE_ENV replaces the files entirely: split on commas,
+#     drop empty elements, trim nothing. That branch opens no miserc file, so
+#     it succeeds even where every layer is unreadable or not a file at all.
+#     MISE_ENV="" is the settled "unset" spelling and falls through to files.
+#   * otherwise local -> shared -> system, and the first file that *defines* a
+#     top-level `env` wins wholesale: no merge across layers, no `env_sets`
+#     expansion, and `env = []` is a definition that stops inheritance. No
+#     lower layer is opened once a higher one defined the list.
+#   * `wired` is exact, case-sensitive `pmsec` membership anywhere in the list:
+#     no last-position rule, no trimming, `Pmsec` is a different env name.
+#   * the writer inherits the file-based list only - MISE_ENV describes one
+#     shell invocation and must never be frozen into a file - and writes the
+#     local miserc only, never the shared or the system file.
+#
+# Both helpers take a scope record and resolve everything through
+# Get-MiseScopeContext, so the Windows host, each WSL distro and each fake
+# scope use their own environment, their own injected values and their own
+# (UNC-translated) paths. mise version detection is deliberately absent: the
+# mode gate is a separate decision and neither helper may spawn a probe.
+#
+# Failures are MiseEnvError-shaped: the message is the frozen
+# `invalid env in <path>: <reason>` envelope, and path/reason ride in
+# Exception.Data so a caller can report the pair without parsing text. Parser
+# reasons come verbatim from Read-MisercEnv / Update-MisercEnvText;
+# `cannot read file` is the only reason this region adds. Nothing is swallowed:
+# an unreadable or malformed higher layer aborts instead of falling through to
+# a lower one.
+
+$script:MiseEnvErrorPathKey = 'pmsec.mise.env.path'
+$script:MiseEnvErrorReasonKey = 'pmsec.mise.env.reason'
+# mise's own precedence order; reading stops at the first file that defines
+# `env`, so nothing later in this list may be opened once a definition exists.
+$script:MiseSelectorSources = @('LocalMiserc', 'SharedMiserc', 'SystemMiserc')
+# UTF-8 with no BOM detection and no silent replacement. File.ReadAllText would
+# strip a leading BOM (StreamReader detects and consumes it), while the writer
+# has to reproduce every byte outside the rewritten assignment; passing the raw
+# bytes through this decoder keeps the BOM and turns undecodable input into the
+# same read failure the python port reports instead of a replacement character.
+$script:MiseUtf8Raw = [System.Text.UTF8Encoding]::new($false, $true)
+
+# Builds the structured failure both helpers throw. An Exception with Data is
+# used instead of a `class` because this script is dot-sourced (twice, by the
+# tests) and a type cannot be defined twice in one session.
+function New-MiseEnvError([string]$Path, [string]$Reason) {
+  $failure = [System.Exception]::new((Get-MisercErrorText -Path $Path -Reason $Reason))
+  $failure.Data[$script:MiseEnvErrorPathKey] = $Path
+  $failure.Data[$script:MiseEnvErrorReasonKey] = $Reason
+  return $failure
+}
+
+# Reads one field of a selector failure, or $null when $ErrorRecord (an
+# ErrorRecord or an exception) did not come from this region.
+function Get-MiseEnvErrorField($ErrorRecord, [string]$Key) {
+  if ($null -eq $ErrorRecord) { return $null }
+  $exception = $null
+  try { $exception = $ErrorRecord.Exception } catch { $exception = $null }
+  if ($null -eq $exception) { $exception = $ErrorRecord }
+  $data = $null
+  try { $data = $exception.Data } catch { return $null }
+  if ($null -eq $data) { return $null }
+  try {
+    if (-not $data.Contains($Key)) { return $null }
+    return [string]$data[$Key]
+  } catch { return $null }
+}
+
+function Get-MiseEnvErrorPath($ErrorRecord) {
+  return (Get-MiseEnvErrorField $ErrorRecord $script:MiseEnvErrorPathKey)
+}
+
+function Get-MiseEnvErrorReason($ErrorRecord) {
+  return (Get-MiseEnvErrorField $ErrorRecord $script:MiseEnvErrorReasonKey)
+}
+
+# Raw text of one miserc file, exactly as stored: a leading BOM stays in the
+# string and CRLF stays CRLF (nothing here normalizes newlines). A missing file
+# answers Exists = $false; every other outcome throws - a directory, a
+# permission problem or undecodable bytes are read failures, never "absent", so
+# a broken higher layer can never masquerade as a missing one. A dangling link
+# counts as missing, matching ENOENT in the other ports.
+function Read-MiseRawMiserc([string]$Path) {
+  if (-not [System.IO.File]::Exists($Path)) {
+    if ([System.IO.Directory]::Exists($Path)) { throw (New-MiseEnvError $Path 'cannot read file') }
+    return @{ Exists = $false; Text = '' }
+  }
+  $bytes = $null
+  try {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+  } catch {
+    throw (New-MiseEnvError $Path 'cannot read file')
+  }
+  if ($null -eq $bytes -or $bytes.Length -eq 0) { return @{ Exists = $true; Text = '' } }
+  try {
+    return @{ Exists = $true; Text = $script:MiseUtf8Raw.GetString($bytes) }
+  } catch {
+    throw (New-MiseEnvError $Path 'cannot read file')
+  }
+}
+
+# mise tokenization of MISE_ENV: commas separate, empty elements vanish, nothing
+# is trimmed (`"a, b"` selects `a` and ` b`, `",,"` selects nothing). Trimming
+# would silently select a different env than mise does.
+function Split-MiseEnvValue([string]$Value) {
+  $names = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($token in $Value.Split([char[]]@(','))) {
+    if ($token -eq '') { continue }
+    $names.Add($token)
+  }
+  return ,$names.ToArray()
+}
+
+# Exact, ordinal `pmsec` membership. `-contains` cannot be used: it is
+# case-insensitive, and `Pmsec` is a distinct mise env name.
+function Test-MiseListWired([string[]]$Names) {
+  foreach ($name in $Names) {
+    if ([string]$name -ceq 'pmsec') { return $true }
+  }
+  return $false
+}
+
+# One shape for both branches: which list is effective, where it came from, and
+# whether pmsec is in it. `Env` stays a string[] (empty, never $null) so callers
+# can count and join it without null checks.
+function New-MiseSelectorResult([string]$Path, [string[]]$Names) {
+  if ($null -eq $Names) { $Names = [string[]]@() }
+  return [pscustomobject]@{ Path = $Path; Env = $Names; Wired = (Test-MiseListWired $Names) }
+}
+
+# The file-based half of the selector, shared by the reader and the writer on
+# purpose: the writer must inherit exactly what mise applies to the local file,
+# and MISE_ENV is an invocation-time override that must never be frozen into a
+# file. Answers @{ Path; Env } for the first layer that defines `env`, or the
+# local path with an empty list when no layer does. The first unreadable or
+# malformed layer throws where it is found.
+function Get-MiseFileSelector($Paths) {
+  $local = [string]$Paths['LocalMiserc']
+  foreach ($source in $script:MiseSelectorSources) {
+    $file = [string]$Paths[$source]
+    # An unresolvable slot is not "absent": inheriting from a lower layer here
+    # would let a broken path family silently change the effective list.
+    if ([string]::IsNullOrEmpty($file)) { throw (New-MiseEnvError $file 'cannot read file') }
+    $raw = Read-MiseRawMiserc $file
+    if (-not $raw['Exists']) { continue }
+    # The parser reports path + reason; promote both to the throw so a malformed
+    # higher layer never degrades into a lower one.
+    $parsed = Read-MisercEnv -Text $raw['Text'] -Path $file
+    if (-not $parsed['Ok']) { throw (New-MiseEnvError $file ([string]$parsed['Reason'])) }
+    # Stop at the first definition, `env = []` included: an empty array is how a
+    # higher layer stops inheritance, and the lower layers are then not part of
+    # the effective selection at all.
+    if ($parsed['Defined']) { return @{ Path = $file; Env = [string[]]$parsed['Env'] } }
+  }
+  # No file defines: the local path is the attribution, because that is the file
+  # the writer would create.
+  return @{ Path = $local; Env = [string[]]@() }
+}
+
+# The effective `env` list for $Scope: { Path; Env; Wired }. `Path` is
+# "MISE_ENV" for a non-empty override, otherwise the miserc file that defines
+# the list - or the scoped local miserc when nothing defines it. Throws the
+# structured selector error when the selection cannot be determined, so a
+# caller never mistakes "unknown" for "empty".
+function Get-MiseSelector($Scope) {
+  $context = Get-MiseScopeContext $Scope
+  $values = $context['Environment']
+  if ($null -eq $values) { $values = @{} }
+  # A non-empty MISE_ENV decides on its own and is answered before any file is
+  # named, so this branch cannot fail because a miserc slot is unusable.
+  $override = $values['MISE_ENV']
+  if ($override -is [string] -and $override -ne '') {
+    return (New-MiseSelectorResult 'MISE_ENV' (Split-MiseEnvValue $override))
+  }
+  # MISE_ENV="" is defined as unset, so it falls through to the files.
+  $adopted = Get-MiseFileSelector $context['Paths']
+  return (New-MiseSelectorResult ([string]$adopted['Path']) ([string[]]$adopted['Env']))
+}
+
+# Wires pmsec into the scoped local miserc and returns that path. The inherited
+# list is file-based even when MISE_ENV is set: the variable is a per-invocation
+# choice, not configuration to persist. Nothing is written, backed up or mkdir'd
+# until every source has been read and parsed and the replacement text is fully
+# planned, so a rejected run leaves the target, its .bak and any scratch file
+# exactly as they were and creates no directory. The single write goes through
+# WriteAtomic, whose labeled `WriteAtomic <step>` failures propagate untouched.
+function Write-MisePmsecEnv($Scope) {
+  $context = Get-MiseScopeContext $Scope
+  $paths = $context['Paths']
+  # Inheritance first: an unreadable or malformed source must abort before a
+  # single byte of the replacement is planned.
+  $inherited = Get-MiseFileSelector $paths
+  $local = [string]$paths['LocalMiserc']
+  # Raw text of the target, BOM and CRLF included.
+  $current = Read-MiseRawMiserc $local
+  $plan = Update-MisercEnvText -Text ([string]$current['Text']) -Inherited ([string[]]$inherited['Env']) -Path $local
+  if (-not $plan['Ok']) { throw (New-MiseEnvError $local ([string]$plan['Reason'])) }
+  WriteAtomic $local ([string]$plan['Text'])
+  return $local
 }
 
 # ---------- line buffer ----------
@@ -1787,38 +3166,46 @@ function CmdDoctor($Targets, [bool]$Json, [array]$Scopes) {
 }
 
 # ---------- entry ----------
+# Dot-sourcing (`. ./pmsec.ps1`) only defines the functions above so tests and
+# operators can call them in-process; it must not parse argv, write files, or
+# exit. `$MyInvocation.InvocationName` is exactly '.' when the script was
+# dot-sourced, and stays the script path for `pwsh -File pmsec.ps1` / `.\pmsec.ps1`,
+# so the guarded block below runs byte-for-byte as it always has.
+if ($MyInvocation.InvocationName -ne '.') {
+  $Argv = $args
 
-try {
-  $opts = ParseArgs $Argv
-} catch {
-  StdErr "pmsec: $_"
-  exit 2
-}
-
-if ($opts.Version) { Write-Output "pmsec $($script:PmsecVersion)"; exit 0 }
-if ($opts.Help) { PrintUsage; exit 0 }
-
-try {
-  $targets = SelectTools $opts.Only
-} catch {
-  StdErr "pmsec: $_"
-  exit 2
-}
-
-$scopes = Get-PmsecScopes (-not $opts.NoWsl)
-if ($scopes.Count -eq 0) {
-  StdErr 'pmsec: no scopes resolved (PMSEC_FAKE_SCOPES set but empty?)'
-  exit 2
-}
-
-try {
-  switch ($opts.Mode) {
-    'check'   { exit (CmdCheck $targets $opts.Json $opts.Days $scopes) }
-    'disable' { exit (CmdDisable $targets $opts.Json $scopes) }
-    'doctor'  { exit (CmdDoctor $targets $opts.Json $scopes) }
-    default   { exit (CmdEnable $targets $opts.Json $opts.Days $opts.Force $scopes) }
+  try {
+    $opts = ParseArgs $Argv
+  } catch {
+    StdErr "pmsec: $_"
+    exit 2
   }
-} catch {
-  StdErr "pmsec: $_"
-  exit 1
+
+  if ($opts.Version) { Write-Output "pmsec $($script:PmsecVersion)"; exit 0 }
+  if ($opts.Help) { PrintUsage; exit 0 }
+
+  try {
+    $targets = SelectTools $opts.Only
+  } catch {
+    StdErr "pmsec: $_"
+    exit 2
+  }
+
+  $scopes = Get-PmsecScopes (-not $opts.NoWsl)
+  if ($scopes.Count -eq 0) {
+    StdErr 'pmsec: no scopes resolved (PMSEC_FAKE_SCOPES set but empty?)'
+    exit 2
+  }
+
+  try {
+    switch ($opts.Mode) {
+      'check'   { exit (CmdCheck $targets $opts.Json $opts.Days $scopes) }
+      'disable' { exit (CmdDisable $targets $opts.Json $scopes) }
+      'doctor'  { exit (CmdDoctor $targets $opts.Json $scopes) }
+      default   { exit (CmdEnable $targets $opts.Json $opts.Days $opts.Force $scopes) }
+    }
+  } catch {
+    StdErr "pmsec: $_"
+    exit 1
+  }
 }

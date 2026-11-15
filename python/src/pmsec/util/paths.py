@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ntpath
 import os
+import posixpath
 import sys
 from pathlib import Path
 
@@ -71,13 +73,62 @@ def bundle_config_path(env: dict[str, str], home: Path) -> Path:
 
 
 def mise_config_path(env: dict[str, str], home: Path, platform: str) -> Path:
-    if "MISE_GLOBAL_CONFIG_FILE" in env:
+    # Empty means unset, matching the shell and Node ports: an exported but
+    # empty MISE_GLOBAL_CONFIG_FILE must not resolve to Path("").
+    if env.get("MISE_GLOBAL_CONFIG_FILE"):
         return Path(env["MISE_GLOBAL_CONFIG_FILE"])
     if platform == "win32":
         base = Path(env["LOCALAPPDATA"]) if "LOCALAPPDATA" in env else home / "AppData" / "Local"
         return base / "mise" / "config.toml"
     base = Path(env["XDG_CONFIG_HOME"]) if "XDG_CONFIG_HOME" in env else home / ".config"
     return base / "mise" / "config.toml"
+
+
+def mise_paths(env: dict[str, str], home: Path, platform: str, cwd: str | None = None) -> dict[str, str]:
+    """Every mise file pmsec works with, legacy and layered.
+
+    `legacyConfig` is the single global config file mise reads today and stays
+    delegated to `mise_config_path`. The rest describe the 2026.11 layering:
+    `config.pmsec.toml` and the two miserc files live next to `config.toml` in
+    `miseDir`, while `systemMiserc` is machine-wide.
+
+    Values are plain strings. On `win32` the new fields are built with `ntpath`
+    so a simulated Windows host yields real Windows shapes (drive letters,
+    backslashes, `<drive>\\etc\\mise\\miserc.toml`) instead of `pathlib`'s
+    host-dependent `/` joining. `legacyConfig` is `str()` of the existing
+    `Path`-returning resolver, so it prints exactly what the CLI prints today.
+    Pure: no filesystem access. `cwd` only supplies the drive for win32's
+    system miserc; a missing or drive-less `cwd` leaves it drive-root-relative.
+    """
+    windows = platform == "win32"
+    join = ntpath.join if windows else posixpath.join
+
+    mise_dir = env.get("MISE_CONFIG_DIR") or ""
+    if not mise_dir:
+        xdg = env.get("XDG_CONFIG_HOME") or ""
+        mise_dir = join(xdg, "mise") if xdg else join(str(home), ".config", "mise")
+
+    system_dir = env.get("MISE_SYSTEM_CONFIG_DIR") or ""
+    if system_dir:
+        system_miserc = join(system_dir, "miserc.toml")
+    elif windows:
+        # mise reads its system config from the current drive's root; neither
+        # home nor SystemDrive participates. Without a drive the `\etc\...`
+        # path stays anchored at whichever drive happens to be current.
+        drive = ntpath.splitdrive(str(cwd))[0] if cwd else ""
+        system_miserc = ntpath.join(drive + "\\", "etc", "mise", "miserc.toml")
+    else:
+        system_miserc = "/etc/mise/miserc.toml"
+
+    return {
+        "legacyConfig": str(mise_config_path(env, home, platform)),
+        "miseDir": mise_dir,
+        "baseConfig": join(mise_dir, "config.toml"),
+        "pmsecConfig": join(mise_dir, "config.pmsec.toml"),
+        "localMiserc": join(mise_dir, "miserc.local.toml"),
+        "sharedMiserc": join(mise_dir, "miserc.toml"),
+        "systemMiserc": system_miserc,
+    }
 
 
 def uv_config_path(env: dict[str, str], home: Path, platform: str) -> Path:

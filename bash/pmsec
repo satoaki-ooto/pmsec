@@ -103,6 +103,75 @@ path_mise() {
   fi
   printf '%s/mise/config.toml' "${XDG_CONFIG_HOME:-$home/.config}"
 }
+
+# ---------- mise config layer: new-mode path family ----------
+# Substrate for the mise config layer. Nothing here is wired into the CLI yet:
+# `path_mise` / `tool_path` above keep resolving the legacy file, so behavior
+# is unchanged. Every helper below is pure — no filesystem access, exactly one
+# path on stdout, always status 0. An empty override means "unset", matching
+# the phase-1 contract.
+
+# MISE_CONFIG_DIR wins, then XDG_CONFIG_HOME/mise, then ~/.config/mise on every
+# OS. win32 deliberately shares the POSIX default: mise's config dir lives under
+# %USERPROFILE%\.config\mise there too — only the *legacy* resolver above reads
+# LOCALAPPDATA, this family never does.
+path_mise_dir() {
+  local home; home=$(_pmsec_home)
+  if [ -n "${MISE_CONFIG_DIR:-}" ]; then printf '%s' "$MISE_CONFIG_DIR"; return 0; fi
+  if [ -n "${XDG_CONFIG_HOME:-}" ]; then printf '%s/mise' "$XDG_CONFIG_HOME"; return 0; fi
+  printf '%s/.config/mise' "$home"
+}
+
+# Everything mise reads now hangs off path_mise_dir, so these stay one-liners:
+# a change to the directory resolution propagates to all four at once.
+path_mise_base_config() { printf '%s/config.toml' "$(path_mise_dir)"; }
+path_mise_pmsec_config() { printf '%s/config.pmsec.toml' "$(path_mise_dir)"; }
+path_mise_local_miserc() { printf '%s/miserc.local.toml' "$(path_mise_dir)"; }
+path_mise_shared_miserc() { printf '%s/miserc.toml' "$(path_mise_dir)"; }
+
+# Drive root of the current directory on win32 ("C:/work" -> "C:/"). `pwd -W`
+# is an MSYS/Git-Bash builtin; real bash (Linux, macOS) rejects -W, so this
+# stays empty there and the POSIX default wins. UNC paths have no drive root.
+_mise_current_drive_root() {
+  local pwd_w
+  pwd_w=$(pwd -W 2>/dev/null) || pwd_w=""
+  case "$pwd_w" in
+    [[:alpha:]]:/*) printf '%s:/' "${pwd_w%%:*}" ;;
+    *) printf '' ;;
+  esac
+}
+
+# Fold a drive root into the `D:\` form the win32 default is built from, so a
+# test can inject "D:/" or "D:\\" instead of probing a Windows host.
+_mise_drive_root_prefix() {
+  case "$1" in
+    [[:alpha:]]:[\\/]) printf '%s:\\' "${1%%:*}" ;;
+    [[:alpha:]]:)      printf '%s:\\' "${1%%:*}" ;;
+    *[\\/])            printf '%s' "$1" ;;
+    *)                 printf '%s\\' "$1" ;;
+  esac
+}
+
+# MISE_SYSTEM_CONFIG_DIR wins ("/"-joined like the other overrides, on every
+# OS), then on win32 the current drive root (<drive>\etc\mise\miserc.toml),
+# then /etc/mise/miserc.toml. The optional first argument injects the drive
+# root for tests; it overrides detection and is ignored off win32. SYSTEMDRIVE
+# is never consulted: it names the boot volume, not the one mise is running on.
+path_mise_system_miserc() {
+  if [ -n "${MISE_SYSTEM_CONFIG_DIR:-}" ]; then
+    printf '%s/miserc.toml' "$MISE_SYSTEM_CONFIG_DIR"; return 0
+  fi
+  if [ "${PMSEC_PLATFORM:-}" = "win32" ]; then
+    local root="${1-}"
+    [ -n "$root" ] || root=$(_mise_current_drive_root)
+    if [ -n "$root" ]; then
+      printf '%s%s' "$(_mise_drive_root_prefix "$root")" 'etc\mise\miserc.toml'
+      return 0
+    fi
+  fi
+  printf '/etc/mise/miserc.toml'
+}
+
 path_aube() {
   local home; home=$(_pmsec_home)
   if [ -n "${AUBE_CONFIG_FILE:-}" ]; then printf '%s' "$AUBE_CONFIG_FILE"; return; fi
@@ -443,6 +512,898 @@ lines_remove_key() {
   n=${#LINES_BUF[@]}
   if [ "$idx" -lt "$n" ] && [ -z "${LINES_BUF[idx]}" ]; then
     _lines_splice_out "$idx" 1
+  fi
+  return 0
+}
+
+# ---------- mise config layer: narrow miserc `env` reader/writer ----------
+# deliberate: Issue-#194 TOML subset only; unsupported forms fail closed. Upgrade path: extend this parser per port behind the same contract.
+#
+# Exactly one shape is understood: a bare, top-level `env = [...]` array of
+# one-line quoted strings. Everything else in the file is opaque and survives a
+# rewrite byte for byte. This scans the raw text instead of going through the
+# line buffer above, because lines_load/lines_dump drop a BOM, normalize CRLF,
+# and add a final newline — exactly the three things a write must preserve.
+#
+# Offsets are byte offsets: the scan pins LC_ALL=C so `${text:off:len}`, which
+# is character-oriented in a multibyte locale, splices bytes. Every splice point
+# is an ASCII boundary, so multibyte names pass through untouched.
+#
+# Speed matters more than it looks here: `${s:off:len}` costs O(off) in bash, so
+# a per-byte cursor over the whole document is quadratic. The cursor below is
+# line-based instead — one O(len) slice per line, then byte access inside a
+# short line — and jumps over uninteresting runs with pattern matching.
+#
+# The `_ME_*` globals and `_miseconf_*` helpers are private to this section
+# (bash 3.2 has no namerefs, so the cursor is shared instead of passed).
+
+MISEC_ERROR_PATH=""
+MISEC_ERROR_REASON=""
+MISEC_ENV_FOUND=0
+MISEC_ENV_VALUES=()
+MISEC_ENV_TOKENS=()
+MISEC_ENV_START=0
+MISEC_ENV_END=0
+
+_ME_TEXT=""
+_ME_N=0
+_ME_LINES=()
+_ME_STARTS=()
+_ME_NLINES=0
+_ME_LAST_TERM=0
+_ME_LI=0
+_ME_LINE=""
+_ME_LEN=0
+_ME_POS=0
+_ME_TERM=0
+_ME_LABEL=""
+_ME_ROOT_END=0
+_ME_FOUND=0
+_ME_START=0
+_ME_END=0
+_ME_CONFLICT=0
+_ME_VALUES=()
+_ME_TOKENS=()
+_ME_TOKEN=""
+# Decoded first key segment of a header or key line, and the byte just past it
+# (see _miseconf_first_segment). _ME_KEY classifies a quoted key: "dotted" for
+# `"env".x`, "assignment" for `"env" = ...`, "" for anything else.
+_ME_SEG=""
+_ME_SEG_END=0
+_ME_KEY=""
+# Glob for "a byte that ends a plain run inside a line": quotes, comment, and
+# the brackets that open or close an array or an inline table.
+_ME_STOP='[]{}["'"'"'#]'
+
+_miseconf_fail() {
+  MISEC_ERROR_PATH="$_ME_LABEL"
+  MISEC_ERROR_REASON="$1"
+  return 1
+}
+
+# Split the raw text into lines, remembering each line's byte offset. A line
+# here never includes its newline; _ME_LAST_TERM records whether the text ended
+# with one, so "line is followed by a newline" is exact for every line.
+_miseconf_split() {
+  local rest="$_ME_TEXT" line off=0 term=0
+  _ME_LINES=()
+  _ME_STARTS=()
+  _ME_NLINES=0
+  _ME_LAST_TERM=0
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *$'\n'*)
+        line="${rest%%$'\n'*}"
+        rest="${rest#*$'\n'}"
+        term=1 ;;
+      *)
+        line="$rest"
+        rest=""
+        term=0 ;;
+    esac
+    _ME_LINES[$_ME_NLINES]="$line"
+    _ME_STARTS[$_ME_NLINES]=$off
+    _ME_NLINES=$((_ME_NLINES+1))
+    off=$((off + ${#line}))
+    [ "$term" = "1" ] && off=$((off+1))
+  done
+  _ME_LAST_TERM=$term
+  _ME_LI=0
+  _ME_LINE=""
+  _ME_LEN=0
+  _ME_POS=0
+  _ME_TERM=0
+  [ "$_ME_NLINES" -gt 0 ] && _miseconf_load_line
+  return 0
+}
+
+# Point the cursor at the start of line _ME_LI and note whether a newline
+# follows it.
+_miseconf_load_line() {
+  _ME_LINE="${_ME_LINES[_ME_LI]}"
+  _ME_LEN=${#_ME_LINE}
+  _ME_POS=0
+  if [ "$_ME_LI" -lt "$((_ME_NLINES - 1))" ] || [ "$_ME_LAST_TERM" = "1" ]; then
+    _ME_TERM=1
+  else
+    _ME_TERM=0
+  fi
+  return 0
+}
+
+# Move to the next line, or fail when the cursor is already past the last one.
+_miseconf_next_line() {
+  _ME_LI=$((_ME_LI+1))
+  if [ "$_ME_LI" -ge "$_ME_NLINES" ]; then
+    _ME_LINE=""
+    _ME_LEN=0
+    _ME_POS=0
+    _ME_TERM=0
+    return 1
+  fi
+  _miseconf_load_line
+  return 0
+}
+
+# Skip spaces, tabs and CRs inside the current line; never crosses a newline so
+# a caller can tell "end of line" from "end of file".
+_miseconf_skip_inline() {
+  while [ "$_ME_POS" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:_ME_POS:1}" in
+      ' '|$'\t'|$'\r') _ME_POS=$((_ME_POS+1)) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 0
+}
+
+# Skip whitespace (newlines included) and `#` comments — what an array may
+# carry between tokens. Returns 1 at the end of the text.
+_miseconf_skip_ws_comments() {
+  while :; do
+    _miseconf_skip_inline
+    if [ "$_ME_POS" -lt "$_ME_LEN" ]; then
+      if [ "${_ME_LINE:_ME_POS:1}" = "#" ]; then _ME_POS=$_ME_LEN; continue; fi
+      return 0
+    fi
+    _miseconf_next_line || return 1
+  done
+}
+
+# Look for $1 in the rest of the current line. When found the cursor lands just
+# past it; otherwise it lands at the end of the line. A basic (`"""`) block
+# honours `\`, so an escape pair is skipped whole: `\"""` is content, and only an
+# unescaped run of three quotes closes the block. A literal (`'''`) block has no
+# escapes at all, so there the first closer always wins (PR #5, finding A3).
+#
+# The closer is a RUN of quotes, never exactly three: TOML lets the last one or
+# two quotes before the delimiter belong to the content (`"""a""""`), so the
+# whole run is consumed, like node's quoteRun and PowerShell's
+# Get-MisercQuoteRun. Consuming three there would leave a stray quote behind,
+# and that quote would open a one-line string which swallows the rest of the
+# line — hiding the `]` of the array the block sits in (PR #5, Devin follow-up).
+# The run is capped at five quotes because that is what those two ports commit
+# to: a longer run closes after five, and the leftover quotes re-enter the
+# scanner as ordinary quoting. Diverging on runs of six or more would show up as
+# a read/write difference long before it caused a visible problem, so the cap is
+# copied rather than "improved".
+_miseconf_close_on_line() {
+  local tok="$1" seg skip i end q n
+  if [ "$tok" = '"""' ]; then
+    i=$_ME_POS
+    while [ "$i" -lt "$_ME_LEN" ]; do
+      if [ "${_ME_LINE:i:1}" = '\' ]; then i=$((i+2)); continue; fi
+      if [ "${_ME_LINE:i:3}" = '"""' ]; then
+        end=$i
+        while [ $((end-i)) -lt 5 ] && [ "$end" -lt "$_ME_LEN" ] \
+              && [ "${_ME_LINE:end:1}" = '"' ]; do
+          end=$((end+1))
+        done
+        _ME_POS=$end
+        return 0
+      fi
+      i=$((i+1))
+    done
+    _ME_POS=$_ME_LEN
+    return 1
+  fi
+  seg="${_ME_LINE:_ME_POS}"
+  case "$seg" in
+    *"$tok"*)
+      skip="${seg%%"$tok"*}"
+      i=$((_ME_POS + ${#skip}))
+      q="${_ME_LINE:i:1}"
+      end=$i
+      while [ $((end-i)) -lt 5 ] && [ "$end" -lt "$_ME_LEN" ] \
+            && [ "${_ME_LINE:end:1}" = "$q" ]; do
+        end=$((end+1))
+      done
+      _ME_POS=$end
+      return 0 ;;
+  esac
+  _ME_POS=$_ME_LEN
+  return 1
+}
+
+# Advance past a one-line quoted string whose opener is at _ME_POS. A backslash
+# only escapes inside a basic ("...") string; a literal ('...') keeps it.
+# Returns 1 when no closer is left on this line: a one-line string never spans a
+# newline, so the caller treats the rest of the line as string content. That is
+# not an error — only a `"""`/`'''` block that never closes is.
+_miseconf_skip_string() {
+  local q="$1" c
+  _ME_POS=$((_ME_POS+1))
+  while [ "$_ME_POS" -lt "$_ME_LEN" ]; do
+    c="${_ME_LINE:_ME_POS:1}"
+    if [ "$q" = '"' ] && [ "$c" = '\' ]; then _ME_POS=$((_ME_POS+2)); continue; fi
+    if [ "$c" = "$q" ]; then _ME_POS=$((_ME_POS+1)); return 0; fi
+    _ME_POS=$((_ME_POS+1))
+  done
+  return 1
+}
+
+# `env` is a bare key only when the token ends there: `envelope` is unrelated.
+_miseconf_at_env_token() {
+  local j=$((_ME_POS+3))
+  [ "${_ME_LINE:_ME_POS:3}" = "env" ] || return 1
+  [ "$j" -ge "$_ME_LEN" ] && return 0
+  case "${_ME_LINE:j:1}" in
+    ' '|$'\t'|$'\r'|'='|'.') return 0 ;;
+  esac
+  return 1
+}
+
+# Is the bare `env` token at _ME_POS really a dotted key (`env.foo`)?
+_miseconf_is_dotted() {
+  local j=$((_ME_POS+3))
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:j:1}" in
+      ' '|$'\t'|$'\r') j=$((j+1)) ;;
+      '.') return 0 ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
+
+# Decode the first `.`-separated key segment starting at byte $1 of the current
+# line into _ME_SEG, and record the byte just past it in _ME_SEG_END. A quoted
+# segment loses its quotes but keeps escapes undecoded, exactly like the other
+# three ports: no escaped spelling can decode to the plain name `env`, so
+# decoding escapes here would only create a way for the ports to disagree. A
+# bare segment ends at `.`, `]`, `#` or whitespace. Returns 1 for an unclosed
+# quote.
+_miseconf_first_segment() {
+  local j="$1" q c seg=""
+  case "${_ME_LINE:j:1}" in
+    '"'|"'")
+      q="${_ME_LINE:j:1}"
+      j=$((j+1))
+      while [ "$j" -lt "$_ME_LEN" ]; do
+        c="${_ME_LINE:j:1}"
+        if [ "$q" = '"' ] && [ "$c" = '\' ]; then
+          seg="$seg$c${_ME_LINE:j+1:1}"
+          j=$((j+2))
+          continue
+        fi
+        [ "$c" = "$q" ] && break
+        seg="$seg$c"
+        j=$((j+1))
+      done
+      [ "$j" -lt "$_ME_LEN" ] || return 1
+      _ME_SEG="$seg"
+      _ME_SEG_END=$((j+1))
+      return 0 ;;
+  esac
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    c="${_ME_LINE:j:1}"
+    case "$c" in
+      '.'|']'|'#'|' '|$'\t'|$'\r') break ;;
+    esac
+    seg="$seg$c"
+    j=$((j+1))
+  done
+  _ME_SEG="$seg"
+  _ME_SEG_END=$j
+  return 0
+}
+
+# Classify the quoted key at _ME_POS without moving the cursor. `"env".x`
+# defines the table the array would own, so it conflicts; a root-level
+# `"env" = ...` is a spelling the writer cannot rewrite in place; every other
+# quoted line (including a `"""`/`'''` string opener, which is never a key) is
+# unrelated. Result in _ME_KEY.
+_miseconf_quoted_key_kind() {
+  local j q
+  _ME_KEY=""
+  q="${_ME_LINE:_ME_POS:1}"
+  case "$q" in '"'|"'") ;; *) return 0 ;; esac
+  [ "${_ME_LINE:_ME_POS:3}" = "$q$q$q" ] && return 0
+  _miseconf_first_segment "$_ME_POS" || return 0
+  [ "$_ME_SEG" = "env" ] || return 0
+  j=$_ME_SEG_END
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:j:1}" in
+      ' '|$'\t'|$'\r') j=$((j+1)); continue ;;
+      '.') _ME_KEY="dotted" ;;
+      '=') _ME_KEY="assignment" ;;
+    esac
+    return 0
+  done
+  return 0
+}
+
+# Is the `[`/`[[` table header at _ME_POS a table whose first key segment is
+# `env`? `[env]`, `[[env]]`, `[ env ]`, `["env"]`, `['env']` and every dotted
+# form (`[env.foo]`, `["env".x]`, `[env."foo"]`) name the key the array owns;
+# `[envsub]` and `[x.env]` do not (PR #5, finding A2).
+_miseconf_header_is_env() {
+  local j=$((_ME_POS+1))
+  [ "${_ME_LINE:j:1}" = "[" ] && j=$((j+1))
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:j:1}" in
+      ' '|$'\t'|$'\r') j=$((j+1)) ;;
+      *) break ;;
+    esac
+  done
+  _miseconf_first_segment "$j" || return 1
+  [ "$_ME_SEG" = "env" ] || return 1
+  j=$_ME_SEG_END
+  # Only a dot (a deeper table) or the closing bracket may follow the first
+  # segment; anything else is not a header this subset knows how to read.
+  while [ "$j" -lt "$_ME_LEN" ]; do
+    case "${_ME_LINE:j:1}" in
+      ' '|$'\t'|$'\r') j=$((j+1)) ;;
+      '.'|']') return 0 ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
+
+# Parse one array element at _ME_POS: a one-line quoted string. Records both the
+# decoded name and the original token, so a rewrite can keep its quoting.
+_miseconf_parse_env_element() {
+  local q c val="" start=$_ME_POS tok
+  c="${_ME_LINE:_ME_POS:1}"
+  case "$c" in
+    '"'|"'") ;;
+    *) _miseconf_fail "env array elements must be single-line quoted strings"; return 1 ;;
+  esac
+  q="$c"
+  if [ "${_ME_LINE:_ME_POS:3}" = "$q$q$q" ]; then
+    _miseconf_fail "multiline strings are unsupported"; return 1
+  fi
+  _ME_POS=$((_ME_POS+1))
+  while [ "$_ME_POS" -lt "$_ME_LEN" ]; do
+    c="${_ME_LINE:_ME_POS:1}"
+    if [ "$q" = '"' ] && [ "$c" = '\' ]; then
+      _miseconf_fail "escape sequences are unsupported"; return 1
+    fi
+    if [ "$c" = "$q" ]; then
+      tok="${_ME_LINE:start:_ME_POS-start+1}"
+      _ME_POS=$((_ME_POS+1))
+      _ME_VALUES[${#_ME_VALUES[@]}]="$val"
+      _ME_TOKENS[${#_ME_TOKENS[@]}]="$tok"
+      return 0
+    fi
+    val="$val$c"
+    _ME_POS=$((_ME_POS+1))
+  done
+  _miseconf_fail "unterminated env assignment"
+}
+
+# Parse a top-level `env = [...]` whose key starts at _ME_POS. On success the
+# cursor sits one byte past the closing `]`.
+_miseconf_parse_env_assignment() {
+  local c need_element=1 close_end
+  _ME_POS=$((_ME_POS+3))
+  # Decision (PR #5, finding A4): comments and newlines are skipped between the
+  # key and `=` because node, python and powershell already accept them there.
+  # Strict TOML rejects `env # c<LF>= [...]`, but mise cannot read such a file
+  # either, so accepting it can never activate a value mise disagrees with.
+  _miseconf_skip_ws_comments || { _miseconf_fail "malformed env assignment"; return 1; }
+  if [ "${_ME_LINE:_ME_POS:1}" != "=" ]; then
+    _miseconf_fail "malformed env assignment"; return 1
+  fi
+  _ME_POS=$((_ME_POS+1))
+  _miseconf_skip_ws_comments || { _miseconf_fail "unterminated env assignment"; return 1; }
+  if [ "${_ME_LINE:_ME_POS:1}" != "[" ]; then
+    # A scalar is the wrong shape, but a quoted one is scanned first so a
+    # multiline, unterminated or escaped one reports its own cause, exactly
+    # like the array path.
+    case "${_ME_LINE:_ME_POS:1}" in
+      '"'|"'") _miseconf_parse_env_element || return 1 ;;
+    esac
+    _miseconf_fail "env must be an array"; return 1
+  fi
+  _ME_POS=$((_ME_POS+1))
+  while :; do
+    _miseconf_skip_ws_comments || { _miseconf_fail "unterminated env assignment"; return 1; }
+    c="${_ME_LINE:_ME_POS:1}"
+    if [ "$c" = "]" ]; then _ME_POS=$((_ME_POS+1)); break; fi
+    # A comma here is a leading or a doubled one: both malformed.
+    if [ "$c" = "," ] || [ "$need_element" = "0" ]; then
+      _miseconf_fail "malformed env array separator"; return 1
+    fi
+    _miseconf_parse_env_element || return 1
+    need_element=0
+    _miseconf_skip_ws_comments || { _miseconf_fail "unterminated env assignment"; return 1; }
+    case "${_ME_LINE:_ME_POS:1}" in
+      ',') _ME_POS=$((_ME_POS+1)); need_element=1 ;;
+      ']') _ME_POS=$((_ME_POS+1)); break ;;
+      *) _miseconf_fail "malformed env array separator"; return 1 ;;
+    esac
+  done
+  # Only whitespace or a comment may follow the closing bracket on this line.
+  # Stop at the bracket itself, though: END is the end of the assignment.
+  close_end=$_ME_POS
+  _miseconf_skip_inline
+  if [ "$_ME_POS" -lt "$_ME_LEN" ] && [ "${_ME_LINE:_ME_POS:1}" != "#" ]; then
+    _ME_POS=$close_end
+    _miseconf_fail "unexpected content after env array"; return 1
+  fi
+  _ME_POS=$close_end
+  return 0
+}
+
+# One raw pass over the document. Fills MISEC_ENV_* when it returns 0, plus the
+# private _ME_ROOT_END / _ME_CONFLICT the writer needs. The root region runs
+# from the start (past a BOM) to the first line-start table header at bracket
+# depth 0; an `env` key after that belongs to a table and is not a top-level
+# assignment anymore. Depth tracking is what makes both halves true: inside an
+# open array or inline table a line-start `[` is a value, not a header, and a
+# line-start `env` is a table member, not the root key (PR #5, finding A1).
+# A file that ends with a value still open has no usable EOF boundary: the root
+# region stops on the line that opened the outermost open value, because a key
+# appended after it would be read as one more element of that value.
+_miseconf_scan() {
+  local c root_end=-1 ml="" seg skip save at_start=1 depth=0 open_start=-1
+  _miseconf_split
+  # A leading BOM is skipped, never removed: it stays part of every splice.
+  if [ "$_ME_NLINES" -gt 0 ] && [ "${_ME_LINE:0:3}" = $'\xEF\xBB\xBF' ]; then
+    _ME_POS=3
+  fi
+  while [ "$_ME_LI" -lt "$_ME_NLINES" ]; do
+    # A multiline string opened on an earlier line swallows everything up to
+    # its closer, including `[table]` lines and env-like text.
+    if [ -n "$ml" ]; then
+      if _miseconf_close_on_line "$ml"; then
+        ml=""
+        at_start=0
+      else
+        _miseconf_next_line || break
+        at_start=1
+        continue
+      fi
+    fi
+    # Line-start rules apply only at the first non-blank byte of a line, and
+    # only at depth 0: what looks like a header or a key inside an open array
+    # or inline table is just a value.
+    if [ "$at_start" = "1" ] && [ "$depth" -eq 0 ]; then
+      while [ "$_ME_POS" -lt "$_ME_LEN" ]; do
+        case "${_ME_LINE:_ME_POS:1}" in
+          ' '|$'\t'|$'\r') _ME_POS=$((_ME_POS+1)) ;;
+          *) break ;;
+        esac
+      done
+      if [ "$_ME_POS" -lt "$_ME_LEN" ]; then
+        c="${_ME_LINE:_ME_POS:1}"
+        if [ "$c" = "#" ]; then
+          _ME_POS=$_ME_LEN
+        elif [ "$c" = "[" ]; then
+          if [ "$root_end" -lt 0 ]; then root_end=$((_ME_STARTS[_ME_LI] + _ME_POS)); fi
+          if _miseconf_header_is_env; then _ME_CONFLICT=1; fi
+          _ME_POS=$_ME_LEN
+        elif [ "$c" = '"' ] || [ "$c" = "'" ]; then
+          _miseconf_quoted_key_kind
+          if [ "$_ME_KEY" = "dotted" ]; then
+            _ME_CONFLICT=1
+          elif [ "$_ME_KEY" = "assignment" ] && [ "$root_end" -lt 0 ]; then
+            _miseconf_fail "quoted env key is unsupported"; return 1
+          fi
+        elif [ "$c" = "e" ] && _miseconf_at_env_token; then
+          if _miseconf_is_dotted; then
+            _ME_CONFLICT=1
+          elif [ "$root_end" -lt 0 ]; then
+            if [ "$_ME_FOUND" = "1" ]; then
+              _miseconf_fail "duplicate top-level env assignment"; return 1
+            fi
+            save=$((_ME_STARTS[_ME_LI] + _ME_POS))
+            _miseconf_parse_env_assignment || return 1
+            _ME_FOUND=1
+            _ME_START=$save
+            _ME_END=$((_ME_STARTS[_ME_LI] + _ME_POS))
+          fi
+        fi
+      fi
+    fi
+    # Everything else on the line: track strings so their contents (and a `#`
+    # inside them) are never read as structure, and track bracket depth so a
+    # nested array or inline table cannot hide the line it is opened on.
+    while [ "$_ME_POS" -lt "$_ME_LEN" ]; do
+      c="${_ME_LINE:_ME_POS:1}"
+      if [ "$c" = "#" ]; then
+        _ME_POS=$_ME_LEN
+      elif [ "$c" = '"' ] || [ "$c" = "'" ]; then
+        if [ "${_ME_LINE:_ME_POS:3}" = "$c$c$c" ]; then
+          _ME_POS=$((_ME_POS+3))
+          ml="$c$c$c"
+          _miseconf_close_on_line "$ml" && ml=""
+        else
+          # A one-line string with no closer on this line ends with the line:
+          # the subset does not validate general TOML, so the rest of the line
+          # is string content and scanning resumes on the next line. Treating it
+          # as `unterminated string in file` is reserved for an unrelated
+          # `"""`/`'''` block that never closes (checked after this loop).
+          _miseconf_skip_string "$c" || _ME_POS=$_ME_LEN
+        fi
+      elif [ "$c" = "[" ] || [ "$c" = "{" ]; then
+        # The outermost value that opens at depth 0 owns every line up to its
+        # closer, so remember the line it began on: a file that ends inside it
+        # must get the new assignment above that line, never appended into the
+        # value as another element.
+        if [ "$depth" -eq 0 ]; then open_start=$((_ME_STARTS[_ME_LI])); fi
+        depth=$((depth+1))
+        _ME_POS=$((_ME_POS+1))
+      elif [ "$c" = "]" ] || [ "$c" = "}" ]; then
+        # A stray closer in an already-flat region must not drive the depth
+        # negative: that would make the next header look nested forever.
+        if [ "$depth" -gt 0 ]; then depth=$((depth-1)); fi
+        # Closed again, so nothing is open at EOF because of this value; a later
+        # opener records its own line.
+        if [ "$depth" -eq 0 ]; then open_start=-1; fi
+        _ME_POS=$((_ME_POS+1))
+      else
+        seg="${_ME_LINE:_ME_POS}"
+        skip="${seg%%$_ME_STOP*}"
+        if [ "${#skip}" -eq "${#seg}" ]; then
+          _ME_POS=$_ME_LEN
+        else
+          _ME_POS=$((_ME_POS + ${#skip}))
+        fi
+      fi
+    done
+    _miseconf_next_line || break
+    at_start=1
+  done
+  if [ -n "$ml" ]; then _miseconf_fail "unterminated string in file"; return 1; fi
+  # The root region ends at the first header; with no header it ends at EOF —
+  # unless the file stops inside an array or inline table, where it ends on the
+  # line that opened the outermost open value. A header always wins: it already
+  # fixed the boundary above any value that is still open later.
+  if [ "$root_end" -lt 0 ]; then
+    if [ "$open_start" -ge 0 ]; then root_end=$open_start; else root_end=$_ME_N; fi
+  fi
+  _ME_ROOT_END=$root_end
+  if [ "$_ME_FOUND" = "1" ]; then
+    MISEC_ENV_FOUND=1
+    MISEC_ENV_START=$_ME_START
+    MISEC_ENV_END=$_ME_END
+    MISEC_ENV_VALUES=("${_ME_VALUES[@]}")
+    MISEC_ENV_TOKENS=("${_ME_TOKENS[@]}")
+  fi
+  return 0
+}
+
+# Read the narrow miserc subset. On success sets MISEC_ENV_FOUND (1 with the
+# decoded names, their original tokens and the [START, END) byte range of the
+# assignment). On failure sets the two error globals, prints nothing, and
+# returns nonzero.
+miserc_env_parse_text() {
+  local label="${1-}" text="${2-}"
+  # Byte semantics for the whole scan: lengths, offsets and splices below are
+  # byte-based, matching the other ports. `local` restores the caller's locale.
+  local LC_ALL=C
+  MISEC_ENV_FOUND=0
+  MISEC_ENV_VALUES=()
+  MISEC_ENV_TOKENS=()
+  MISEC_ENV_START=0
+  MISEC_ENV_END=0
+  MISEC_ERROR_PATH=""
+  MISEC_ERROR_REASON=""
+  _ME_LABEL="$label"
+  _ME_TEXT="$text"
+  _ME_N=${#text}
+  _ME_ROOT_END=0
+  _ME_FOUND=0
+  _ME_START=0
+  _ME_END=0
+  _ME_CONFLICT=0
+  _ME_VALUES=()
+  _ME_TOKENS=()
+  _miseconf_scan
+}
+
+# Pick the token for one name: an existing element with the same decoded value
+# keeps its original quoting, anything new is serialized canonically. A name
+# that would need an escape (a literal `'` next to a `"` or `\`, or any control
+# byte) fails closed instead of emitting something mise would read differently.
+_miseconf_serialize_name() {
+  local name="$1" i=0 dq=0 sq=0 bs=0
+  while [ "$i" -lt "${#_ME_VALUES[@]}" ]; do
+    if [ "${_ME_VALUES[i]}" = "$name" ]; then
+      _ME_TOKEN="${_ME_TOKENS[i]}"
+      return 0
+    fi
+    i=$((i+1))
+  done
+  case "$name" in
+    *[[:cntrl:]]*) _miseconf_fail "env name cannot be represented without escapes"; return 1 ;;
+  esac
+  case "$name" in *'"'*) dq=1 ;; esac
+  case "$name" in *"'"*) sq=1 ;; esac
+  case "$name" in *\\*) bs=1 ;; esac
+  if [ "$sq" = "1" ] && { [ "$dq" = "1" ] || [ "$bs" = "1" ]; }; then
+    _miseconf_fail "env name cannot be represented without escapes"; return 1
+  fi
+  if [ "$dq" = "1" ] || [ "$bs" = "1" ]; then
+    _ME_TOKEN="'$name'"
+  else
+    _ME_TOKEN="\"$name\""
+  fi
+  return 0
+}
+
+# Rewrite (or insert) the top-level env array so it lists the inherited names
+# plus `pmsec` last, exactly once. The whole text is validated before a single
+# byte of output exists, so a rejected file is never half-written. The result
+# lands in MISEC_ENV_OUTPUT rather than on stdout because command substitution
+# would eat its trailing newline.
+miserc_env_write_pmsec_text() {
+  local label="${1-}" text="${2-}"
+  local inherited want line sep i nm prefix suffix
+  local LC_ALL=C
+  unset MISEC_ENV_OUTPUT
+  inherited=()
+  want=()
+  line=""; sep=""; i=0
+  if [ "$#" -ge 2 ]; then shift 2; fi
+  inherited=("$@")
+  miserc_env_parse_text "$label" "$text" || return 1
+  _ME_LABEL="$label"
+  if [ "$_ME_CONFLICT" = "1" ]; then
+    _miseconf_fail "env table conflicts with the env array"
+    return 1
+  fi
+  for nm in "${inherited[@]}"; do
+    [ "$nm" = "pmsec" ] && continue
+    want[${#want[@]}]="$nm"
+  done
+  want[${#want[@]}]="pmsec"
+  i=0
+  while [ "$i" -lt "${#want[@]}" ]; do
+    _miseconf_serialize_name "${want[i]}" || return 1
+    line="$line$sep$_ME_TOKEN"
+    sep=", "
+    i=$((i+1))
+  done
+  line="env = [$line]"
+  if [ "$MISEC_ENV_FOUND" = "1" ]; then
+    MISEC_ENV_OUTPUT="${text:0:MISEC_ENV_START}${line}${text:MISEC_ENV_END}"
+    return 0
+  fi
+  # No assignment yet: add one at the end of the root region — before the first
+  # real table header, before a value still open at EOF, or at EOF when every
+  # value closes — with a leading newline only when the file needs one.
+  prefix="${text:0:_ME_ROOT_END}"
+  suffix="${text:_ME_ROOT_END}"
+  case "$prefix" in
+    ''|*$'\n') ;;
+    *) prefix="$prefix"$'\n' ;;
+  esac
+  MISEC_ENV_OUTPUT="$prefix$line"$'\n'"$suffix"
+  return 0
+}
+
+# One structured diagnostic line per failure, matching the other ports.
+miserc_error_text() {
+  printf 'invalid env in %s: %s\n' "$MISEC_ERROR_PATH" "$MISEC_ERROR_REASON"
+}
+
+# ---------- mise config layer: selector and local writer ----------
+# Effective env resolution shared by both helpers below: a non-empty MISE_ENV
+# decides alone and touches no file; otherwise local, shared and system miserc
+# are read in that order and the first one that defines a top-level `env` wins
+# outright — the whole list is adopted (never merged) and nothing lower is read
+# afterwards. No definition anywhere is an empty list attributed to the local
+# path, because that is the file the writer would create.
+#
+# The writer deliberately ignores MISE_ENV and inherits the file-based list
+# only: a one-off `MISE_ENV=ci pmsec enable` must not rewrite the local file
+# from a list the file chain never contained. Every read, parse and replacement
+# plan runs before write_atomic is called, so a rejected input leaves the
+# target, its .bak and any *.tmp exactly as they were.
+#
+# Direct-call convention, like the miserc text helpers above: these print
+# nothing, report through globals, and return nonzero on failure. The `_MS_*`
+# globals and the `_mise_*` / `_miserc_*` helpers are private to this section
+# (bash 3.2 has no namerefs, so the scan result is shared instead of returned).
+
+MISE_ERROR_PATH=""
+MISE_ERROR_REASON=""
+MISE_SELECTOR_PATH=""
+MISE_SELECTOR_ENV=()
+MISE_SELECTOR_WIRED=0
+
+# Shared scan result: the attributed path, the adopted decoded names, and the
+# last file body read. `_MS_TEXT` is a global because a second `$(...)` in a
+# caller would strip the trailing newlines the reader just preserved.
+_MS_PATH=""
+_MS_ENV=()
+_MS_TEXT=""
+
+# One failure shape for both helpers and both spellings: the miserc parse layer
+# reports MISEC_ERROR_*, the selector exposes MISE_ERROR_*. Keeping the pair in
+# sync means `miserc_error_text` stays usable on a selector failure and a
+# caller reads one credential-free path/reason pair whatever layer raised it.
+_mise_selector_fail() {
+  MISE_ERROR_REASON="$1"
+  MISE_ERROR_PATH="$2"
+  MISEC_ERROR_REASON="$1"
+  MISEC_ERROR_PATH="$2"
+  return 1
+}
+
+# Read a file byte-for-byte into _MS_TEXT. The sentinel byte guards the
+# trailing newlines `$(...)` would eat, and the result has to land in a global
+# rather than on stdout: a second command substitution in the caller would
+# strip them all over again. `&&` keeps cat's own failure visible, since a
+# partial read must never pass as a shorter file, and stderr is dropped so the
+# caller reports one structured reason instead of a raw coreutils message.
+_miserc_file_text() {
+  local t
+  _MS_TEXT=""
+  t=$(cat -- "$1" 2>/dev/null && printf x) || return 1
+  _MS_TEXT="${t%x}"
+  return 0
+}
+
+# Split $MISE_ENV the way mise 2026.11.0 does: commas separate, empty elements
+# are dropped, nothing is trimmed ("a, b" yields "a" and " b"). Result lands in
+# _MS_ENV so it can share the publishing path with a parsed file list.
+_mise_split_env_tokens() {
+  local rest="$1" elem
+  _MS_ENV=()
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *,*) elem="${rest%%,*}"; rest="${rest#*,}" ;;
+      *)   elem="$rest"; rest="" ;;
+    esac
+    if [ -n "$elem" ]; then _MS_ENV[${#_MS_ENV[@]}]="$elem"; fi
+  done
+  return 0
+}
+
+# Exact, case-sensitive `pmsec` membership. Last position is not required and
+# mise's env_sets are never expanded, so nothing else can make a list wired.
+_mise_list_has_pmsec() {
+  local name
+  for name in "$@"; do
+    if [ "$name" = "pmsec" ]; then return 0; fi
+  done
+  return 1
+}
+
+# Read local, shared, system in precedence order and stop at the first file
+# that defines a top-level env. A missing file is skipped; anything else that
+# cannot be read or parsed fails closed — never a silent skip and never a
+# fallback to a lower-precedence file, because a local typo must not quietly
+# change what the rest of the CLI believes. Sets _MS_PATH / _MS_ENV.
+_miserc_file_selector_read() {
+  local paths=() file text i=0 j=0
+  _MS_PATH=""
+  _MS_ENV=()
+  paths[0]=$(path_mise_local_miserc)
+  paths[1]=$(path_mise_shared_miserc)
+  paths[2]=$(path_mise_system_miserc)
+  while [ "$i" -lt "${#paths[@]}" ]; do
+    file="${paths[i]}"
+    i=$((i+1))
+    [ -e "$file" ] || continue
+    # Only a readable regular file is a candidate: a directory or FIFO would
+    # report EISDIR or block, and both are read errors, not "absent".
+    if [ ! -f "$file" ] || [ ! -r "$file" ] || ! _miserc_file_text "$file"; then
+      _mise_selector_fail "cannot read file" "$file"
+      return 1
+    fi
+    text="$_MS_TEXT"
+    # The parser's own path/reason propagate untouched, so a caller can point
+    # at the exact file and cause.
+    if ! miserc_env_parse_text "$file" "$text"; then
+      _mise_selector_fail "$MISEC_ERROR_REASON" "$MISEC_ERROR_PATH"
+      return 1
+    fi
+    # `env = []` counts as a definition: it adopts an empty list and stops the
+    # search, so a shared list can never reappear under an explicit local reset.
+    if [ "$MISEC_ENV_FOUND" = "1" ]; then
+      _MS_PATH="$file"
+      j=0
+      while [ "$j" -lt "${#MISEC_ENV_VALUES[@]}" ]; do
+        _MS_ENV[${#_MS_ENV[@]}]="${MISEC_ENV_VALUES[j]}"
+        j=$((j+1))
+      done
+      return 0
+    fi
+  done
+  # No file defines: the local path is still the attribution, because that is
+  # the file the writer would create.
+  _MS_PATH="${paths[0]}"
+  return 0
+}
+
+# Copy _MS_PATH / _MS_ENV into the public selector globals and derive `wired`
+# from the adopted list rather than the raw text, so both branches judge the
+# same way.
+_mise_publish_selector() {
+  local i=0
+  MISE_SELECTOR_PATH="$_MS_PATH"
+  MISE_SELECTOR_ENV=()
+  while [ "$i" -lt "${#_MS_ENV[@]}" ]; do
+    MISE_SELECTOR_ENV[${#MISE_SELECTOR_ENV[@]}]="${_MS_ENV[i]}"
+    i=$((i+1))
+  done
+  MISE_SELECTOR_WIRED=0
+  if _mise_list_has_pmsec "${_MS_ENV[@]}"; then MISE_SELECTOR_WIRED=1; fi
+  return 0
+}
+
+# Effective env for this invocation. On failure the selector globals stay empty
+# and MISE_ERROR_PATH/MISE_ERROR_REASON say what broke; stdout is never used.
+mise_selector_read() {
+  MISE_SELECTOR_PATH=""
+  MISE_SELECTOR_ENV=()
+  MISE_SELECTOR_WIRED=0
+  MISE_ERROR_PATH=""
+  MISE_ERROR_REASON=""
+  # Non-empty MISE_ENV short-circuits every filesystem access: this branch has
+  # to succeed even when the local miserc is unreadable or not a file at all.
+  if [ -n "${MISE_ENV-}" ]; then
+    _mise_split_env_tokens "$MISE_ENV"
+    _MS_PATH="MISE_ENV"
+    _mise_publish_selector
+    return 0
+  fi
+  _miserc_file_selector_read || return 1
+  _mise_publish_selector
+  return 0
+}
+
+# Write the local miserc so its env list is the inherited file-based list plus
+# exactly one trailing `pmsec`. Shared and system files are never written, and
+# nothing is touched until every read, parse and plan step has succeeded.
+miserc_env_write_pmsec() {
+  local target text
+  MISE_ERROR_PATH=""
+  MISE_ERROR_REASON=""
+  unset MISEC_ENV_OUTPUT
+  _miserc_file_selector_read || return 1
+  target=$(path_mise_local_miserc)
+  text=""
+  if [ -e "$target" ]; then
+    if [ ! -f "$target" ] || [ ! -r "$target" ] || ! _miserc_file_text "$target"; then
+      _mise_selector_fail "cannot read file" "$target"
+      return 1
+    fi
+    text="$_MS_TEXT"
+  fi
+  # Empty inherited list passes no names at all: an empty `"${_MS_ENV[@]}"` is
+  # zero words today, but spelling the two calls out keeps the text writer's
+  # `$@` contract obvious to the next reader.
+  if [ "${#_MS_ENV[@]}" -gt 0 ]; then
+    if ! miserc_env_write_pmsec_text "$target" "$text" "${_MS_ENV[@]}"; then
+      _mise_selector_fail "$MISEC_ERROR_REASON" "$MISEC_ERROR_PATH"
+      return 1
+    fi
+  elif ! miserc_env_write_pmsec_text "$target" "$text"; then
+    _mise_selector_fail "$MISEC_ERROR_REASON" "$MISEC_ERROR_PATH"
+    return 1
+  fi
+  if ! printf '%s' "$MISEC_ENV_OUTPUT" | write_atomic "$target"; then
+    # write_atomic already named the failing step on stderr; the globals still
+    # identify the file so a caller can report it without parsing stderr.
+    _mise_selector_fail "cannot write file" "$target"
+    return 1
   fi
   return 0
 }
@@ -894,6 +1855,32 @@ version_gte() {
   if [ "$1" -ne "$4" ]; then [ "$1" -gt "$4" ]; return; fi
   if [ "$2" -ne "$5" ]; then [ "$2" -gt "$5" ]; return; fi
   [ "$3" -ge "$6" ]
+}
+
+# mise config-layer mode gate: status only, prints nothing, and re-detects on
+# every call (no caching) so a caller that changes MISE_GLOBAL_CONFIG_FILE or
+# the mise on PATH between calls gets a fresh answer.
+#
+# New mode needs mise >= 2026.11.0 *and* no MISE_GLOBAL_CONFIG_FILE override —
+# the override is the legacy escape hatch, and an empty one counts as unset.
+# Undetected ("none"), old, or malformed versions stay in legacy mode. This is
+# a separate seam from the cooldown floor in tool_preflight (2026.4.22), which
+# is deliberately untouched.
+mise_supports_new_mode() {
+  local v major minor patch rest f
+  if [ -n "${MISE_GLOBAL_CONFIG_FILE:-}" ]; then return 1; fi
+  v=$(version_detect mise) || return 1
+  major=${v%% *}
+  rest=${v#* }
+  minor=${rest%% *}
+  rest=${rest#* }
+  patch=${rest%% *}
+  # version_gte compares with `[ -ne ]`, which would leak a diagnostic to
+  # stderr on a non-numeric field; refuse those before getting there.
+  for f in "$major" "$minor" "$patch"; do
+    case "$f" in ''|*[!0-9]*) return 1 ;; esac
+  done
+  version_gte "$major" "$minor" "$patch" 2026 11 0
 }
 
 # ---------- per-tool: metadata ----------
@@ -1953,4 +2940,11 @@ main() {
   esac
 }
 
-main "$@"
+# `source` this file to get the helpers (tests, tooling) without running the
+# CLI. Comparing BASH_SOURCE[0] with $0 keeps `bash pmsec …` and `./pmsec …`
+# byte-identical: both name the same file, main runs, and the `if` inherits
+# main's exit status. An unset BASH_SOURCE[0] is the `bash < pmsec` form, which
+# used to run main as well.
+if [ -z "${BASH_SOURCE[0]-}" ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

@@ -15,15 +15,16 @@ from pmsec.cli import main  # noqa: E402
 
 
 def env_for(home: Path, **overrides: str) -> dict[str, str]:
-    # Hide the host pnpm/bundler by default so version-aware behavior (pnpm 11
-    # default enforcement, bundler preflight warnings) doesn't depend on what's
-    # installed on the test machine.
+    # Hide the host toolchain by default so version-aware behavior (pnpm 11
+    # default enforcement, bundler preflight warnings, mise config mode)
+    # doesn't depend on what's installed on the test machine.
     base = {
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "PMSEC_PNPM_VERSION": "none",
         "PMSEC_BUNDLER_VERSION": "none",
         "PMSEC_COMPOSER_VERSION": "none",
+        "PMSEC_MISE_VERSION": "none",
     }
     base.update(overrides)
     return base

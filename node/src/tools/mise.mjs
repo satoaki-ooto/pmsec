@@ -2,7 +2,7 @@ import { miseConfigPath } from "../util/paths.mjs";
 import { readSafe, writeAtomic } from "../util/io.mjs";
 import { readKey, setKey, removeKey } from "../util/lines.mjs";
 import { readExtras, applyExtras, removeExtras } from "../util/extras.mjs";
-import { buildPreflight } from "../util/version.mjs";
+import { buildPreflight, detectVersion, gte } from "../util/version.mjs";
 export const name = "mise";
 export const key = "minimum_release_age";
 export const section = "settings";
@@ -32,6 +32,22 @@ export function path(ctx) { return miseConfigPath(ctx.env, ctx.home, ctx.platfor
 
 export const preflight = buildPreflight(name, minBin,
   "setting was named install_before before 2026.4.22 and minimum_release_age is silently ignored on older mise. Upgrade mise (`mise self-update`) to enforce the cooldown.");
+
+// First mise release that reads a pmsec-owned file from the mise config dir,
+// which is what makes the layered layout representable. Deliberately separate
+// from minBin: the cooldown setting works from 2026.4.22, the new mode does not.
+const NEW_MODE_MIN_BIN = [2026, 11, 0];
+
+// Mode is a property of the invocation, not of the process: probe on every call
+// so a long-lived process (and tests) observe PATH/env changes. An explicit
+// MISE_GLOBAL_CONFIG_FILE pins mise to one global file, which the layered layout
+// cannot represent, so it forces legacy regardless of version. Unknown versions
+// (no binary, `none`, unparsable output) stay legacy.
+export function supportsNewMode(ctx) {
+  const v = detectVersion(name, ["--version"], { env: ctx?.env, overrideKey: "PMSEC_MISE_VERSION" });
+  if (v === null || !gte(v, NEW_MODE_MIN_BIN)) return false;
+  return !ctx?.env?.MISE_GLOBAL_CONFIG_FILE;
+}
 
 function parseDays(value) {
   if (value === null) return null;
